@@ -2070,6 +2070,7 @@ pub async fn sandbox_exec_grpc(
         cols,
         rows,
         no_login_shell,
+        exec_mode: openshell_core::proto::ExecMode::LoginShell.into(),
     };
 
     let stdin_for_size_check = std::mem::take(&mut request.stdin);
@@ -2618,6 +2619,7 @@ async fn sandbox_exec_streaming_grpc(
             tty,
             cols,
             rows,
+            exec_mode: openshell_core::proto::ExecMode::LoginShell.into(),
         })),
     };
 

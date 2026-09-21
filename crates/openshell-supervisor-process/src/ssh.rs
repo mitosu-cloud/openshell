@@ -35,6 +35,15 @@ use tokio::net::UnixListener;
 use tracing::warn;
 
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
+const EXEC_MODE_ENV: &str = "OPENSHELL_EXEC_MODE";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SshExecMode {
+    #[default]
+    LoginShell,
+    Shell,
+    Direct,
+}
 const MAIN_DETACH_PREFIX: u8 = 0x10;
 const MAIN_DETACH_KEY: u8 = 0x11;
 const MAIN_DETACH_EOF: u8 = 0x04;
@@ -101,7 +110,9 @@ fn ssh_server_init(
     host_key: PrivateKey,
 ) -> Result<SshServerInit> {
     let mut config = russh::server::Config {
-        server_id: russh::SshId::Standard(Cow::Owned(format!("SSH-2.0-OpenShell_{VERSION}"))),
+        server_id: russh::SshId::Standard(Cow::Owned(format!(
+            "SSH-2.0-OpenShell_{VERSION} exec_direct"
+        ))),
         auth_rejection_time: Duration::from_secs(1),
         // Peer replies keep idle attachments alive without relying on shell I/O.
         keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
@@ -386,6 +397,7 @@ struct ChannelState {
     terminal: Option<Arc<openshell_sandbox_backend::BoundaryTerminal>>,
     pty_request: Option<PtyRequest>,
     no_login_shell: bool,
+    exec_mode: SshExecMode,
     main_input_owner: Option<u64>,
     main_attached: bool,
     main_read_only: bool,
@@ -911,6 +923,19 @@ impl russh::server::Handler for SshHandler {
             && let Some(state) = self.channels.get_mut(&channel)
         {
             state.no_login_shell = variable_value == NO_LOGIN_SHELL_ENV.1;
+            if state.no_login_shell && state.exec_mode == SshExecMode::LoginShell {
+                state.exec_mode = SshExecMode::Shell;
+            }
+        }
+        if variable_name == EXEC_MODE_ENV
+            && let Some(state) = self.channels.get_mut(&channel)
+        {
+            state.exec_mode = match variable_value {
+                "direct" => SshExecMode::Direct,
+                "shell" => SshExecMode::Shell,
+                "login_shell" => SshExecMode::LoginShell,
+                _ => state.exec_mode,
+            };
         }
         if variable_name == "OPENSHELL_MAIN_READ_ONLY"
             && variable_value == "1"
@@ -1224,30 +1249,44 @@ impl SshHandler {
             .channels
             .get_mut(&channel)
             .ok_or_else(|| anyhow::anyhow!("start_shell on unknown channel {channel:?}"))?;
-        let no_login_shell = state.no_login_shell;
+        let exec_mode = state.exec_mode;
         let pty = state.pty_request.take();
         let pty_requested = pty.is_some();
-        let env = pty
+        let term_env = pty
             .as_ref()
             .map(|request| vec![("TERM".to_string(), request.term.clone())])
             .unwrap_or_default();
-        self.start_exec_spec(
-            channel,
-            handle,
+        let spec = if exec_mode == SshExecMode::Direct {
+            let command =
+                command.ok_or_else(|| anyhow::anyhow!("DIRECT exec requires a command"))?;
+            let decoded = openshell_core::direct_exec::decode(&command)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let mut env = decoded.env;
+            env.extend(term_env);
+            openshell_isolation_interface::contract::ExecSpec {
+                program: decoded.program,
+                args: decoded.args,
+                shell: None,
+                runtime_helper: None,
+                env,
+                workdir: decoded.workdir,
+                pty: pty_requested,
+            }
+        } else {
             openshell_isolation_interface::contract::ExecSpec {
                 program: String::new(),
                 args: Vec::new(),
                 shell: Some(openshell_isolation_interface::contract::ShellSpec {
                     command,
-                    login: !no_login_shell,
+                    login: exec_mode == SshExecMode::LoginShell,
                 }),
                 runtime_helper: None,
-                env,
+                env: term_env,
                 workdir: None,
                 pty: pty_requested,
-            },
-        )
-        .await?;
+            }
+        };
+        self.start_exec_spec(channel, handle, spec).await?;
         if let (Some(pty), Some(terminal)) = (
             pty,
             self.channels
