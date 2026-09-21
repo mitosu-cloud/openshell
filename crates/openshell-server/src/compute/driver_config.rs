@@ -22,6 +22,12 @@ pub struct GuestTlsPaths {
 }
 
 impl GuestTlsPaths {
+    /// Construct guest TLS paths for an embedded gateway.
+    #[must_use]
+    pub fn new(ca: PathBuf, cert: PathBuf, key: PathBuf) -> Self {
+        Self { ca, cert, key }
+    }
+
     pub(crate) fn as_paths(&self) -> (&std::path::Path, &std::path::Path, &std::path::Path) {
         (&self.ca, &self.cert, &self.key)
     }
