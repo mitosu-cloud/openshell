@@ -96,10 +96,7 @@ impl PostgresStore {
         conn.ping().await.map_err(|e| map_db_error(&e))
     }
 
-    /// Test support only: close the underlying connection pool.
-    ///
-    /// Do not call from runtime code; this tears down the active pool.
-    #[cfg(any(test, feature = "test-support"))]
+    /// Close the underlying connection pool.
     pub async fn close(&self) {
         self.pool.close().await;
     }

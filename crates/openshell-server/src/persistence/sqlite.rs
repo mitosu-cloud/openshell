@@ -39,7 +39,6 @@ use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE}
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     in_memory_keepalive: Option<Arc<Mutex<Option<SqliteConnection>>>>,
 }
 
@@ -177,10 +176,7 @@ impl SqliteStore {
         conn.ping().await.map_err(|e| map_db_error(&e))
     }
 
-    /// Test support only: close the underlying connection pool.
-    ///
-    /// Do not call from runtime code; this tears down the active pool.
-    #[cfg(any(test, feature = "test-support"))]
+    /// Close the underlying connection pool.
     pub async fn close(&self) {
         self.pool.close().await;
         if let Some(keepalive) = &self.in_memory_keepalive {

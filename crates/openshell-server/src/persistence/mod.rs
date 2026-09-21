@@ -309,13 +309,10 @@ impl Store {
         store_dispatch!(self.ping())
     }
 
-    /// Test support only: close the underlying connection pool.
+    /// Close the underlying connection pool.
     ///
-    /// There is no runtime shutdown path yet. If we add graceful shutdown,
-    /// this API can be made public for that explicit shutdown flow.
-    ///
-    /// Do not call from runtime code today; this tears down the active pool.
-    #[cfg(any(test, feature = "test-support"))]
+    /// Called from gateway shutdown after background tasks have been joined
+    /// and compute-driver cleanup has finished.
     pub async fn close(&self) {
         store_dispatch!(self.close());
     }

@@ -18,7 +18,10 @@ use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tonic::{Code, Status};
 use tracing::{info, warn};
 
@@ -1906,7 +1909,11 @@ fn test_sts_endpoint_override(_state: &StoredProviderCredentialRefreshState) -> 
     None
 }
 
-pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval: Duration) {
+pub fn spawn_refresh_worker(
+    state: Arc<crate::ServerState>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
     info!(
         interval_seconds = interval.as_secs(),
         "provider credential refresh worker started"
@@ -1915,18 +1922,29 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
-            if let Err(err) = Box::pin(run_refresh_worker_tick(
-                state.store.as_ref(),
-                Some(&state.credentials),
-                Some(&state.compute),
-            ))
-            .await
-            {
-                warn!(error = %err, "provider credential refresh worker tick failed");
+            if *shutdown.borrow() {
+                break;
+            }
+            tokio::select! {
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    if let Err(err) = Box::pin(run_refresh_worker_tick(
+                        state.store.as_ref(),
+                        Some(&state.credentials),
+                        Some(&state.compute),
+                    ))
+                    .await
+                    {
+                        warn!(error = %err, "provider credential refresh worker tick failed");
+                    }
+                }
             }
         }
-    });
+    })
 }
 
 #[tracing::instrument(

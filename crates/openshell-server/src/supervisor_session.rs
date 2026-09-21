@@ -7,7 +7,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -674,13 +675,19 @@ impl SupervisorSessionRegistry {
 /// out. If neither happens — e.g., the supervisor crashed after acknowledging
 /// `RelayOpen` but before initiating `RelayStream` — the entry would otherwise
 /// sit in the map indefinitely. This sweeper bounds that leak.
-pub fn spawn_relay_reaper(state: Arc<ServerState>, interval: Duration) {
+pub fn spawn_relay_reaper(
+    state: Arc<ServerState>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
+            if !crate::wait_for_shutdown_or_sleep(&mut shutdown, interval).await {
+                break;
+            }
             state.supervisor_sessions.reap_expired_relays();
         }
-    });
+    })
 }
 
 async fn require_persisted_sandbox(
