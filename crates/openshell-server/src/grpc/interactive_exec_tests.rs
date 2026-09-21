@@ -206,7 +206,7 @@ async fn interactive_exec_drains_stdout_and_stderr_after_input_eof() {
         "test",
         ReceiverStream::new(input_rx),
         false,
-        false,
+        ExecMode::LoginShell,
         0,
         0,
         output_tx,
@@ -265,7 +265,7 @@ async fn interactive_exec_makes_progress_in_both_directions_before_eof() {
         "duplex",
         ReceiverStream::new(input_rx),
         false,
-        false,
+        ExecMode::LoginShell,
         0,
         0,
         output_tx,
@@ -355,8 +355,16 @@ async fn interactive_exec_ready_resize_stream_does_not_starve_output() {
     })
     .take(FRAMES);
     let (output_tx, mut output_rx) = mpsc::channel(2);
-    let exec =
-        run_interactive_exec_with_russh(fixture.port, "test", input, false, false, 0, 0, output_tx);
+    let exec = run_interactive_exec_with_russh(
+        fixture.port,
+        "test",
+        input,
+        false,
+        ExecMode::LoginShell,
+        0,
+        0,
+        output_tx,
+    );
     let reader = async {
         ready(&mut output_rx).await;
         assert!(
@@ -395,7 +403,7 @@ async fn interactive_exec_input_error_is_not_graceful_eof() {
             "test",
             ReceiverStream::new(input_rx),
             false,
-            false,
+            ExecMode::LoginShell,
             0,
             0,
             output_tx,
@@ -425,7 +433,7 @@ async fn interactive_exec_response_drop_cancels_idle_input() {
         "test",
         ReceiverStream::new(input_rx),
         false,
-        false,
+        ExecMode::LoginShell,
         0,
         0,
         output_tx,
@@ -454,7 +462,7 @@ async fn interactive_exec_parent_abort_drops_input_receiver() {
         "test",
         ReceiverStream::new(input_rx),
         false,
-        false,
+        ExecMode::LoginShell,
         0,
         0,
         output_tx,
@@ -481,7 +489,7 @@ async fn interactive_exec_response_drop_unblocks_full_output_queue() {
         "test",
         ReceiverStream::new(input_rx),
         false,
-        false,
+        ExecMode::LoginShell,
         0,
         0,
         output_tx,
@@ -524,7 +532,7 @@ async fn interactive_exec_early_exit_does_not_wait_for_stdin() {
             "early",
             ReceiverStream::new(input_rx),
             false,
-            false,
+            ExecMode::LoginShell,
             0,
             0,
             output_tx,

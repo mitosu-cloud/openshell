@@ -623,6 +623,7 @@ impl OpenShellClient {
             cols: 0,
             rows: 0,
             no_login_shell: opts.no_login_shell,
+            exec_mode: proto::ExecMode::LoginShell.into(),
         };
 
         // Open the stream under the same OIDC-aware auth policy as unary RPCs
@@ -1202,6 +1203,7 @@ impl WorkspaceScopedClient {
             cols: 0,
             rows: 0,
             no_login_shell: opts.no_login_shell,
+            exec_mode: proto::ExecMode::LoginShell.into(),
         };
 
         let mut stream = self
