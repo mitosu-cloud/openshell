@@ -10,9 +10,12 @@ use prost::Message;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::persistence::{ObjectCursor, ObjectType, Store};
+use crate::wait_for_shutdown_or_sleep;
 
 const SESSION_REAPER_PAGE_SIZE: u32 = 1000;
 
@@ -23,17 +26,21 @@ impl ObjectType for SshSession {
 }
 
 /// Spawn a background task that periodically reaps expired and revoked SSH sessions.
-pub fn spawn_session_reaper(store: Arc<Store>, interval: Duration) {
+pub fn spawn_session_reaper(
+    store: Arc<Store>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        tokio::time::sleep(interval).await;
-
         loop {
+            if !wait_for_shutdown_or_sleep(&mut shutdown, interval).await {
+                break;
+            }
             if let Err(e) = reap_expired_sessions(&store).await {
                 warn!(error = %e, "SSH session reaper sweep failed");
             }
-            tokio::time::sleep(interval).await;
         }
-    });
+    })
 }
 
 async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
@@ -284,5 +291,17 @@ mod tests {
             0,
             "the reaper must not leave an expired session behind"
         );
+    }
+
+    #[tokio::test]
+    async fn session_reaper_exits_on_shutdown() {
+        let store = Arc::new(test_store().await);
+        let (tx, rx) = watch::channel(false);
+        let handle = spawn_session_reaper(store, Duration::from_secs(60), rx);
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("session reaper should observe shutdown")
+            .expect("session reaper task");
     }
 }
