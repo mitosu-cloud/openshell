@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bollard::Docker;
-use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountTypeEnum, VolumeCreateRequest};
+use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType, VolumeCreateRequest};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, LogsOptions, RemoveContainerOptions,
     RemoveVolumeOptionsBuilder, StartContainerOptions, WaitContainerOptions,
@@ -336,7 +336,7 @@ async fn run_volume_container(
         mounts: Some(vec![Mount {
             target: Some("/vol".to_string()),
             source: Some(volume.name.clone()),
-            typ: Some(MountTypeEnum::VOLUME),
+            typ: Some(MountType::VOLUME),
             read_only: Some(read_only),
             ..Default::default()
         }]),

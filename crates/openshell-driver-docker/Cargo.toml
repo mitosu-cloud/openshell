@@ -33,7 +33,7 @@ bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 prost-types = { workspace = true }
-bollard = { version = "0.20" }
+bollard = { version = "0.21" }
 url = { workspace = true }
 clap = { workspace = true }
 miette = { workspace = true }

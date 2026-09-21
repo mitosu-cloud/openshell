@@ -215,7 +215,7 @@ required-features = ["e2e-gpu"]
 
 [dependencies]
 base64 = "0.22"
-bollard = "0.20"
+bollard = "0.21"
 bytes = "1"
 futures-util = "0.3"
 http-body-util = "0.1"
