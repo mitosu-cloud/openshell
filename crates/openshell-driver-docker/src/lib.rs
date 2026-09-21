@@ -13,7 +13,7 @@ use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary,
     ContainerSummaryStateEnum, ContainerWaitResponse, CreateImageInfo, DeviceRequest, HealthConfig,
-    HealthStatusEnum, HostConfig, Mount, MountTmpfsOptions, MountTypeEnum, MountVolumeOptions,
+    HealthStatusEnum, HostConfig, Mount, MountTmpfsOptions, MountType, MountVolumeOptions,
     ProgressDetail, SystemInfo, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
@@ -1300,8 +1300,8 @@ impl DockerComputeDriver {
             .and_then(|value| serde_json::from_str(value).ok())
             .unwrap_or_default();
         for mount in container.mounts.as_deref().unwrap_or_default() {
-            match mount.typ {
-                Some(bollard::models::MountPointTypeEnum::VOLUME) => {
+            match mount.typ.as_deref() {
+                Some("volume") => {
                     let name = mount
                         .name
                         .as_deref()
@@ -1358,7 +1358,7 @@ impl DockerComputeDriver {
                         }
                     }
                 }
-                Some(bollard::models::MountPointTypeEnum::TMPFS) => {}
+                Some("tmpfs") => {}
                 _ => self
                     .config
                     .resource_admission
@@ -3883,7 +3883,7 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Option<M
             read_only,
             subpath,
         } => Ok(Some(Mount {
-            typ: Some(MountTypeEnum::VOLUME),
+            typ: Some(MountType::VOLUME),
             source: Some(source.clone()),
             target: Some(target.clone()),
             read_only: Some(*read_only),
@@ -3899,7 +3899,7 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Option<M
             size_bytes,
             mode,
         } => Ok(Some(Mount {
-            typ: Some(MountTypeEnum::TMPFS),
+            typ: Some(MountType::TMPFS),
             target: Some(target.clone()),
             tmpfs_options: Some(MountTmpfsOptions {
                 size_bytes: validate_optional_positive_integral_i64(
@@ -4991,7 +4991,7 @@ async fn stage_docker_supervisor_bundle(
     let mut mounts = vec![Mount {
         target: Some(SUPERVISOR_STATE_MOUNT_PATH.to_string()),
         source: Some(docker_supervisor_volume_name(sandbox, config)),
-        typ: Some(MountTypeEnum::VOLUME),
+        typ: Some(MountType::VOLUME),
         read_only: Some(false),
         volume_options: Some(MountVolumeOptions {
             no_copy: Some(true),
@@ -5003,7 +5003,7 @@ async fn stage_docker_supervisor_bundle(
         mounts.push(Mount {
             target: Some(BOUNDARY_CONTROL_MOUNT_PATH.to_string()),
             source: Some(docker_control_volume_name_by_id(&sandbox.id, config)),
-            typ: Some(MountTypeEnum::VOLUME),
+            typ: Some(MountType::VOLUME),
             read_only: Some(false),
             volume_options: Some(MountVolumeOptions {
                 no_copy: Some(true),
@@ -5342,7 +5342,7 @@ async fn spawn_docker_control_process(
         Mount {
             target: Some(BOUNDARY_MOUNT_PATH.to_string()),
             source: Some(docker_channel_volume_name(sandbox, config)),
-            typ: Some(MountTypeEnum::VOLUME),
+            typ: Some(MountType::VOLUME),
             read_only: Some(true),
             volume_options: Some(MountVolumeOptions {
                 no_copy: Some(true),
@@ -5353,7 +5353,7 @@ async fn spawn_docker_control_process(
         Mount {
             target: Some(SUPERVISOR_STATE_MOUNT_PATH.to_string()),
             source: Some(docker_supervisor_volume_name(sandbox, config)),
-            typ: Some(MountTypeEnum::VOLUME),
+            typ: Some(MountType::VOLUME),
             read_only: Some(true),
             volume_options: Some(MountVolumeOptions {
                 no_copy: Some(true),
@@ -5366,7 +5366,7 @@ async fn spawn_docker_control_process(
         supervisor_mounts.push(Mount {
             target: Some(BOUNDARY_CONTROL_MOUNT_PATH.to_string()),
             source: Some(docker_control_volume_name_by_id(&sandbox.id, config)),
-            typ: Some(MountTypeEnum::VOLUME),
+            typ: Some(MountType::VOLUME),
             read_only: Some(false),
             volume_options: Some(MountVolumeOptions {
                 no_copy: Some(true),
@@ -5383,7 +5383,7 @@ async fn spawn_docker_control_process(
         supervisor_mounts.push(Mount {
             target: Some(PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR.to_string()),
             source: Some(parent.display().to_string()),
-            typ: Some(MountTypeEnum::BIND),
+            typ: Some(MountType::BIND),
             read_only: Some(true),
             ..Default::default()
         });
@@ -6017,7 +6017,7 @@ fn build_container_create_body_for_image(
     user_mounts.push(Mount {
         target: Some(BOUNDARY_MOUNT_PATH.to_string()),
         source: Some(docker_channel_volume_name(sandbox, config)),
-        typ: Some(MountTypeEnum::VOLUME),
+        typ: Some(MountType::VOLUME),
         read_only: Some(false),
         volume_options: Some(MountVolumeOptions {
             no_copy: Some(true),
@@ -6029,7 +6029,7 @@ fn build_container_create_body_for_image(
     user_mounts.push(Mount {
         target: Some(BOUNDARY_CONTROL_MOUNT_PATH.to_string()),
         source: Some(docker_control_volume_name_by_id(&sandbox.id, config)),
-        typ: Some(MountTypeEnum::VOLUME),
+        typ: Some(MountType::VOLUME),
         read_only: Some(true),
         volume_options: Some(MountVolumeOptions {
             no_copy: Some(true),
@@ -6492,6 +6492,9 @@ fn container_ready_condition(
         }
         ContainerSummaryStateEnum::REMOVING => {
             ("False", "Deleting", "Container is being removed", true)
+        }
+        ContainerSummaryStateEnum::STOPPING => {
+            ("False", "Stopping", "Container is stopping", false)
         }
         ContainerSummaryStateEnum::PAUSED => {
             ("False", "ContainerPaused", "Container is paused", false)

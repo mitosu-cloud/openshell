@@ -2057,7 +2057,7 @@ fn build_container_create_body_includes_driver_config_mounts() {
         .expect("driver config mounts should be set");
 
     assert_eq!(mounts.len(), 4);
-    assert_eq!(mounts[0].typ, Some(MountTypeEnum::VOLUME));
+    assert_eq!(mounts[0].typ, Some(MountType::VOLUME));
     assert_eq!(mounts[0].source.as_deref(), Some("work-nfs"));
     assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/work"));
     assert_eq!(mounts[0].read_only, Some(true));
@@ -2068,9 +2068,9 @@ fn build_container_create_body_includes_driver_config_mounts() {
             .and_then(|options| options.subpath.as_deref()),
         Some("project-a")
     );
-    assert_eq!(mounts[1].typ, Some(MountTypeEnum::TMPFS));
+    assert_eq!(mounts[1].typ, Some(MountType::TMPFS));
     assert_eq!(mounts[1].target.as_deref(), Some("/sandbox/cache"));
-    assert_eq!(mounts[2].typ, Some(MountTypeEnum::VOLUME));
+    assert_eq!(mounts[2].typ, Some(MountType::VOLUME));
     assert_eq!(mounts[2].target.as_deref(), Some(BOUNDARY_MOUNT_PATH));
     assert_eq!(mounts[2].read_only, Some(false));
     assert_eq!(
@@ -2237,7 +2237,7 @@ fn build_container_create_body_includes_bind_mounts_when_enabled() {
     // Bind mounts must not appear in the structured mounts vec.
     let mounts = body.host_config.unwrap().mounts.unwrap_or_default();
     assert!(
-        mounts.iter().all(|m| m.typ != Some(MountTypeEnum::BIND)),
+        mounts.iter().all(|m| m.typ != Some(MountType::BIND)),
         "bind mounts should not appear in structured mounts"
     );
 }
@@ -4054,6 +4054,7 @@ fn container_state_needs_start_matches_startable_states() {
         ContainerSummaryStateEnum::PAUSED,
         ContainerSummaryStateEnum::DEAD,
         ContainerSummaryStateEnum::REMOVING,
+        ContainerSummaryStateEnum::STOPPING,
         ContainerSummaryStateEnum::EMPTY,
     ] {
         assert!(
