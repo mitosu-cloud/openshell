@@ -22,6 +22,7 @@ pub mod config_file;
 mod config_update_operation;
 mod credentials;
 mod defaults;
+pub mod embed;
 mod gateway_listener;
 mod gateway_members;
 mod gateway_metrics;
@@ -78,7 +79,8 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 /// Serializes tests that assert on captured spans, which share one exporter.
@@ -296,12 +298,40 @@ use sandbox_watch::SandboxWatchBus;
 pub use tls::TlsAcceptor;
 use tracing_bus::TracingLogBus;
 
-pub(crate) struct ServerStartupConfig {
+/// Inputs required to construct server state before sockets are bound.
+pub struct ServerStartupConfig {
     pub config: Config,
     pub config_file: Option<config_file::ConfigFile>,
     pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
     pub compute_driver: ComputeDriverSelection,
     pub legacy_compute_driver_env_seen: bool,
+}
+
+/// Addresses the gateway is actually listening on after bind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListenerInfo {
+    /// Operator-facing multiplexed gRPC/HTTP bind address.
+    pub primary: SocketAddr,
+    /// Extra callback-only listeners requested by the compute driver.
+    pub callback_addresses: Vec<SocketAddr>,
+}
+
+/// Fully constructed server state, before sockets are bound.
+pub struct BootstrappedServer {
+    state: Arc<ServerState>,
+    metrics_endpoint: Option<(SocketAddr, metrics_exporter_prometheus::PrometheusHandle)>,
+}
+
+/// Running listeners and the task that waits for shutdown.
+pub struct ServingServer {
+    /// Completes once listeners are bound and persisted sandboxes have been
+    /// asked to start.
+    pub ready: oneshot::Receiver<ListenerInfo>,
+    /// Resolves when the shutdown watch becomes true.
+    pub task: JoinHandle<Result<()>>,
+    state: Arc<ServerState>,
+    listener_task: JoinHandle<()>,
+    membership_worker: Option<JoinHandle<()>>,
 }
 
 /// Server state shared across handlers.
@@ -586,6 +616,32 @@ pub(crate) async fn run_server(
     tracing_log_bus: TracingLogBus,
     compute_drivers: ComputeDriverRegistry,
 ) -> Result<()> {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bootstrapped = bootstrap_state(
+        startup,
+        compute_drivers,
+        tracing_log_bus,
+        shutdown_rx.clone(),
+    )
+    .await?;
+    let serving = serve(bootstrapped, shutdown_rx).await?;
+    shutdown_signal().await;
+    info!("Shutdown signal received; stopping gateway");
+    serving
+        .state
+        .gateway_shutting_down
+        .store(true, Ordering::Release);
+    let _ = shutdown_tx.send(true);
+    shutdown_and_cleanup(serving).await
+}
+
+/// Construct authenticated server state without binding sockets.
+pub async fn bootstrap_state(
+    startup: ServerStartupConfig,
+    compute_drivers: ComputeDriverRegistry,
+    tracing_log_bus: TracingLogBus,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<BootstrappedServer> {
     let ServerStartupConfig {
         config,
         config_file,
@@ -593,7 +649,6 @@ pub(crate) async fn run_server(
         compute_driver,
         legacy_compute_driver_env_seen: _,
     } = startup;
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     auth::descriptor_authz::init()
         .map_err(|error| Error::config(format!("invalid gRPC authorization metadata: {error}")))?;
@@ -962,6 +1017,24 @@ pub(crate) async fn run_server(
             ))
         })?;
 
+    Ok(BootstrappedServer {
+        state,
+        metrics_endpoint,
+    })
+}
+
+/// Bind listeners and start serving until `shutdown` becomes true.
+pub async fn serve(
+    bootstrapped: BootstrappedServer,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<ServingServer> {
+    let BootstrappedServer {
+        state,
+        metrics_endpoint,
+    } = bootstrapped;
+    let store = state.store.clone();
+    let config = state.config.clone();
+
     let gateway_listener = bind_gateway_listener(config.bind_address).await?;
 
     // Create the multiplexed service
@@ -1033,6 +1106,10 @@ pub(crate) async fn run_server(
         None
     };
 
+    let listener_info = ListenerInfo {
+        primary: gateway_listener.address,
+        callback_addresses: Vec::new(),
+    };
     let enable_loopback_service_http = config.service_routing.enable_loopback_service_http;
     let listener_task = tokio::spawn(serve_gateway_listener(
         gateway_listener,
@@ -1098,16 +1175,43 @@ pub(crate) async fn run_server(
     provider_profile_sources::spawn_refresh(state.clone());
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
-    shutdown_signal().await;
-    info!("Shutdown signal received; stopping gateway");
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let _ = ready_tx.send(listener_info);
+
+    let mut shutdown_wait = shutdown_rx.clone();
+    let task = tokio::spawn(async move {
+        while !*shutdown_wait.borrow() {
+            if shutdown_wait.changed().await.is_err() {
+                break;
+            }
+        }
+        Ok(())
+    });
+
+    Ok(ServingServer {
+        ready: ready_rx,
+        task,
+        state,
+        listener_task,
+        membership_worker,
+    })
+}
+
+/// Stop listeners and run compute-driver shutdown cleanup.
+pub async fn shutdown_and_cleanup(serving: ServingServer) -> Result<()> {
+    let ServingServer {
+        ready: _,
+        task,
+        state,
+        listener_task,
+        membership_worker,
+    } = serving;
     state.gateway_shutting_down.store(true, Ordering::Release);
     state.supervisor_sessions.close_admission();
-    let _ = shutdown_tx.send(true);
-
+    let _ = task.await;
     if let Err(err) = listener_task.await {
         warn!(error = %err, "Gateway listener task failed during shutdown");
     }
-
     let compute_cleanup = state.compute.cleanup_on_shutdown().await;
     // Closing sessions redirect their supervisors through the ring. Let the
     // membership worker finish pointing it at the remaining replicas first.
@@ -1130,7 +1234,6 @@ pub(crate) async fn run_server(
     compute_cleanup
         .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
     session_cleanup.map_err(Error::execution)?;
-
     Ok(())
 }
 
@@ -1516,8 +1619,9 @@ pub struct ComputeDriverRegistry {
     drivers: BTreeMap<String, ComputeDriverRegistration>,
 }
 
+/// Names of installed drivers that passed auto-detection, in priority order.
 #[derive(Clone, Debug)]
-struct ComputeDriverDetection {
+pub struct ComputeDriverDetection {
     available: Vec<String>,
 }
 
@@ -1527,9 +1631,12 @@ impl ComputeDriverDetection {
     }
 }
 
+/// How the gateway chose the compute driver for this process.
 #[derive(Clone, Debug)]
-pub(crate) enum ComputeDriverSelection {
+pub enum ComputeDriverSelection {
+    /// Operator or embedder named the driver.
     Configured { name: String },
+    /// First auto-detectable installed driver that reported itself available.
     AutoDetected(ComputeDriverDetection),
 }
 
