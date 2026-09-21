@@ -90,6 +90,23 @@ pub(crate) fn install_jsonwebtoken_crypto_provider() {
     openshell_crypto::install_jwt_provider();
 }
 
+#[cfg(test)]
+mod crypto_provider_tolerance_tests {
+    #[test]
+    fn jsonwebtoken_provider_tolerates_already_installed() {
+        super::install_jsonwebtoken_crypto_provider();
+        super::install_jsonwebtoken_crypto_provider();
+    }
+
+    #[test]
+    fn rustls_provider_tolerates_already_installed() {
+        let first = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let second = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        assert!(first.is_ok() || second.is_err());
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 use compute::ComputeRuntime;
 use gateway_listener::{BoundGatewayListener, bind_gateway_listener};
 pub use grpc::OpenShellService;
