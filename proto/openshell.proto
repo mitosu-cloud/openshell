@@ -1821,6 +1821,25 @@ message RevokeSshSessionResponse {
   DeletionOutcome outcome = 2;
 }
 
+// How `ExecSandboxRequest.command` is launched inside the sandbox.
+enum ExecMode {
+  // Login shell (`bash -lc`). Default.
+  EXEC_MODE_LOGIN_SHELL = 0;
+  // Non-login shell (`bash -c`).
+  EXEC_MODE_SHELL = 1;
+  // Argv executed directly with a cleared environment.
+  EXEC_MODE_DIRECT = 2;
+}
+
+// POSIX signal the gateway may send on an interactive exec stream.
+enum ExecSignal {
+  EXEC_SIGNAL_UNSPECIFIED = 0;
+  EXEC_SIGNAL_TERM = 1;
+  EXEC_SIGNAL_KILL = 2;
+  EXEC_SIGNAL_INT = 3;
+  EXEC_SIGNAL_HUP = 4;
+}
+
 // Execute command request.
 message ExecSandboxRequest {
   reserved 5;
@@ -1857,7 +1876,12 @@ message ExecSandboxRequest {
   // (`bash -lc`) so user startup files (.bash_profile/.profile, and .bashrc if
   // sourced by them) are applied. When true, the command runs without those
   // files (`bash -c`), for automation that needs predictable startup behavior.
+  // Ignored when `exec_mode` is `EXEC_MODE_SHELL` or `EXEC_MODE_DIRECT`.
   bool no_login_shell = 10;
+
+  // Launch mode for `command`. `EXEC_MODE_LOGIN_SHELL` (the default) still
+  // honors `no_login_shell` for older clients.
+  ExecMode exec_mode = 11;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -1908,6 +1932,9 @@ message TcpForwardFrame {
   }
 }
 
+// Close stdin without ending the interactive exec stream.
+message ExecSandboxStdinEof {}
+
 // Client-to-server message for interactive exec.
 message ExecSandboxInput {
   oneof payload {
@@ -1917,6 +1944,10 @@ message ExecSandboxInput {
     bytes stdin = 2;
     // Terminal window size change.
     ExecSandboxWindowResize resize = 3;
+    // Close the remote stdin pipe; the stream remains open for signals/resize.
+    ExecSandboxStdinEof stdin_eof = 4;
+    // Signal the remote process group.
+    ExecSignal signal = 5;
   }
 }
 

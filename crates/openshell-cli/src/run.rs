@@ -1864,6 +1864,7 @@ pub async fn sandbox_exec_grpc(
             cols,
             rows,
             no_login_shell,
+            exec_mode: openshell_core::proto::ExecMode::LoginShell.into(),
         })
         .await
         .into_diagnostic()?
@@ -2248,6 +2249,7 @@ async fn sandbox_exec_interactive_grpc(
                 tty: true,
                 cols,
                 rows,
+                exec_mode: openshell_core::proto::ExecMode::LoginShell.into(),
             })),
         })
         .await

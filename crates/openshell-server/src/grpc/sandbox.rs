@@ -26,12 +26,12 @@ use openshell_core::proto::{
     CreateSandboxTemplateRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteSandboxRequest, DeleteSandboxResponse, DeleteSandboxTemplateRequest,
     DeleteSandboxTemplateResponse, DetachSandboxProviderRequest, DetachSandboxProviderResponse,
-    ExecSandboxEvent, ExecSandboxExit, ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr,
-    ExecSandboxStdout, GetSandboxRequest, GetSandboxTemplateRequest, ListSandboxProvidersRequest,
-    ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
-    ListSandboxesRequest, ListSandboxesResponse, Provider, ProviderMutationKind,
-    ResourceRequirements, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResources,
-    SandboxResponse, SandboxSpec, SandboxStreamEvent, SandboxTemplateResponse,
+    ExecMode, ExecSandboxEvent, ExecSandboxExit, ExecSandboxInput, ExecSandboxRequest,
+    ExecSandboxStderr, ExecSandboxStdout, ExecSignal, GetSandboxRequest, GetSandboxTemplateRequest,
+    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxTemplatesRequest,
+    ListSandboxTemplatesResponse, ListSandboxesRequest, ListSandboxesResponse, Provider,
+    ProviderMutationKind, ResourceRequirements, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    SandboxResources, SandboxResponse, SandboxSpec, SandboxStreamEvent, SandboxTemplateResponse,
     SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SshRelayTarget,
     StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
     WatchSandboxRequest, relay_open, tcp_forward_init,
@@ -74,6 +74,8 @@ use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
+const EXEC_MODE_DIRECT_ENV: (&str, &str) = ("OPENSHELL_EXEC_MODE", "direct");
+const EXEC_DIRECT_SSH_CAPABILITY: &[u8] = b" exec_direct";
 const MAX_TEMPLATES_PER_WORKSPACE: u32 = 1000;
 
 #[derive(Debug)]
@@ -2005,7 +2007,8 @@ pub(super) async fn handle_exec_sandbox(
         .await
         .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
-    let command_str = build_remote_exec_command(&req)
+    let exec_mode = effective_exec_mode(&req);
+    let command_str = build_exec_transport_command(&req, exec_mode)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let stdin_payload = req.stdin;
     let execution_timeout = req
@@ -2018,8 +2021,6 @@ pub(super) async fn handle_exec_sandbox(
     let (cols, rows) = pty_dimensions(req.cols, req.rows);
 
     let sandbox_id = sandbox.object_id().to_string();
-
-    let no_login_shell = req.no_login_shell;
 
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
@@ -2039,7 +2040,7 @@ pub(super) async fn handle_exec_sandbox(
             stdin_payload,
             execution_timeout,
             request_tty,
-            no_login_shell,
+            exec_mode,
             cols,
             rows,
         )
@@ -2450,10 +2451,10 @@ pub(super) async fn handle_exec_sandbox_interactive(
         .await
         .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
-    let command_str = build_remote_exec_command(&req)
+    let exec_mode = effective_exec_mode(&req);
+    let command_str = build_exec_transport_command(&req, exec_mode)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let request_tty = req.tty;
-    let no_login_shell = req.no_login_shell;
     let execution_timeout = req
         .execution_timeout
         .as_ref()
@@ -2486,7 +2487,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
             &command_str,
             input_stream,
             request_tty,
-            no_login_shell,
+            exec_mode,
             execution_timeout,
             cols,
             rows,
@@ -2734,6 +2735,112 @@ fn supervisor_supports_no_login_shell(remote_sshid: &[u8]) -> bool {
     remote_sshid.starts_with(OPENSHELL_SSHID_PREFIX)
 }
 
+fn supervisor_supports_direct_exec(remote_sshid: &[u8]) -> bool {
+    remote_sshid
+        .windows(EXEC_DIRECT_SSH_CAPABILITY.len())
+        .any(|window| window == EXEC_DIRECT_SSH_CAPABILITY)
+}
+
+fn effective_exec_mode(req: &ExecSandboxRequest) -> ExecMode {
+    match ExecMode::try_from(req.exec_mode).unwrap_or(ExecMode::LoginShell) {
+        ExecMode::Direct => ExecMode::Direct,
+        ExecMode::Shell => ExecMode::Shell,
+        ExecMode::LoginShell => {
+            if req.no_login_shell {
+                ExecMode::Shell
+            } else {
+                ExecMode::LoginShell
+            }
+        }
+    }
+}
+
+fn build_exec_transport_command(
+    req: &ExecSandboxRequest,
+    exec_mode: ExecMode,
+) -> Result<String, String> {
+    if exec_mode == ExecMode::Direct {
+        build_direct_exec_command(req)
+    } else {
+        build_remote_exec_command(req)
+    }
+}
+
+fn build_direct_exec_command(req: &ExecSandboxRequest) -> Result<String, String> {
+    let program = req
+        .command
+        .first()
+        .cloned()
+        .ok_or_else(|| "command is required".to_string())?;
+    let args = req.command.iter().skip(1).cloned().collect();
+    let mut env = req
+        .environment
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    env.sort_by(|left, right| left.0.cmp(&right.0));
+    let workdir = if req.workdir.is_empty() {
+        None
+    } else {
+        Some(req.workdir.clone())
+    };
+    let encoded =
+        openshell_core::direct_exec::encode(&openshell_core::direct_exec::DirectExecSpec {
+            program,
+            args,
+            env,
+            workdir,
+        })?;
+    if encoded.len() > MAX_COMMAND_STRING_LEN {
+        return Err(format!(
+            "assembled command string exceeds {MAX_COMMAND_STRING_LEN} byte limit"
+        ));
+    }
+    Ok(encoded)
+}
+
+fn map_exec_signal(signal: i32) -> Option<russh::Sig> {
+    match ExecSignal::try_from(signal).ok()? {
+        ExecSignal::Term => Some(russh::Sig::TERM),
+        ExecSignal::Kill => Some(russh::Sig::KILL),
+        ExecSignal::Int => Some(russh::Sig::INT),
+        ExecSignal::Hup => Some(russh::Sig::HUP),
+        ExecSignal::Unspecified => None,
+    }
+}
+
+async fn apply_exec_mode_env(
+    channel: &russh::Channel<russh::client::Msg>,
+    remote_sshid: &[u8],
+    exec_mode: ExecMode,
+) -> Result<(), Status> {
+    match exec_mode {
+        ExecMode::LoginShell => Ok(()),
+        ExecMode::Shell => {
+            if !supervisor_supports_no_login_shell(remote_sshid) {
+                return Err(Status::failed_precondition(
+                    "sandbox supervisor is too old to honor --no-login-shell; recreate the sandbox on a current gateway",
+                ));
+            }
+            channel
+                .set_env(false, NO_LOGIN_SHELL_ENV.0, NO_LOGIN_SHELL_ENV.1)
+                .await
+                .map_err(|e| Status::internal(format!("failed to set login-shell env: {e}")))
+        }
+        ExecMode::Direct => {
+            if !supervisor_supports_direct_exec(remote_sshid) {
+                return Err(Status::failed_precondition(
+                    "sandbox supervisor is too old to honor DIRECT exec; recreate the sandbox on a current gateway",
+                ));
+            }
+            channel
+                .set_env(false, EXEC_MODE_DIRECT_ENV.0, EXEC_MODE_DIRECT_ENV.1)
+                .await
+                .map_err(|e| Status::internal(format!("failed to set DIRECT exec env: {e}")))
+        }
+    }
+}
+
 /// russh client config for exec relays.
 fn exec_ssh_client_config() -> russh::client::Config {
     russh::client::Config {
@@ -2794,7 +2901,7 @@ async fn stream_exec_over_relay(
     stdin_payload: Vec<u8>,
     execution_timeout: Option<std::time::Duration>,
     request_tty: bool,
-    no_login_shell: bool,
+    exec_mode: ExecMode,
     cols: u32,
     rows: u32,
 ) -> Result<(), Status> {
@@ -2821,7 +2928,7 @@ async fn stream_exec_over_relay(
         command,
         stdin_payload,
         request_tty,
-        no_login_shell,
+        exec_mode,
         (cols, rows),
         tx.clone(),
     );
@@ -2874,7 +2981,7 @@ async fn stream_interactive_exec_over_relay(
     command: &str,
     input_stream: tonic::Streaming<ExecSandboxInput>,
     request_tty: bool,
-    no_login_shell: bool,
+    exec_mode: ExecMode,
     execution_timeout: Option<std::time::Duration>,
     cols: u32,
     rows: u32,
@@ -2901,7 +3008,7 @@ async fn stream_interactive_exec_over_relay(
         command,
         input_stream,
         request_tty,
-        no_login_shell,
+        exec_mode,
         cols,
         rows,
         tx.clone(),
@@ -2952,7 +3059,7 @@ async fn run_interactive_exec_with_russh(
     command: &str,
     mut input_stream: tonic::Streaming<ExecSandboxInput>,
     request_tty: bool,
-    no_login_shell: bool,
+    exec_mode: ExecMode,
     cols: u32,
     rows: u32,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
@@ -3012,17 +3119,9 @@ async fn run_interactive_exec_with_russh(
             .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
     }
 
-    if no_login_shell {
+    {
         let banner = remote_sshid.lock().unwrap().clone().unwrap_or_default();
-        if !supervisor_supports_no_login_shell(&banner) {
-            return Err(Status::failed_precondition(
-                "sandbox supervisor is too old to honor --no-login-shell; recreate the sandbox on a current gateway",
-            ));
-        }
-        channel
-            .set_env(false, NO_LOGIN_SHELL_ENV.0, NO_LOGIN_SHELL_ENV.1)
-            .await
-            .map_err(|e| Status::internal(format!("failed to set login-shell env: {e}")))?;
+        apply_exec_mode_env(&channel, &banner, exec_mode).await?;
     }
 
     channel
@@ -3045,6 +3144,14 @@ async fn run_interactive_exec_with_russh(
                         let _ = write_half
                             .window_change(resize.cols, resize.rows, 0, 0)
                             .await;
+                    }
+                }
+                Some(Payload::StdinEof(_)) => {
+                    let _ = write_half.eof().await;
+                }
+                Some(Payload::Signal(signal)) => {
+                    if let Some(sig) = map_exec_signal(signal) {
+                        let _ = write_half.signal(sig).await;
                     }
                 }
                 Some(Payload::Start(_)) | None => {}
@@ -3167,7 +3274,7 @@ async fn run_exec_with_russh(
     command: &str,
     stdin_payload: Vec<u8>,
     request_tty: bool,
-    no_shell_login: bool,
+    exec_mode: ExecMode,
     pty_size: (u32, u32),
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
 ) -> Result<i32, Status> {
@@ -3226,17 +3333,9 @@ async fn run_exec_with_russh(
             .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
     }
 
-    if no_shell_login {
+    {
         let banner = remote_sshid.lock().unwrap().clone().unwrap_or_default();
-        if !supervisor_supports_no_login_shell(&banner) {
-            return Err(Status::failed_precondition(
-                "sandbox supervisor is too old to honor --no-login-shell; recreate the sandbox on a current gateway",
-            ));
-        }
-        channel
-            .set_env(false, NO_LOGIN_SHELL_ENV.0, NO_LOGIN_SHELL_ENV.1)
-            .await
-            .map_err(|e| Status::internal(format!("failed to set login-shell env: {e}")))?;
+        apply_exec_mode_env(&channel, &banner, exec_mode).await?;
     }
 
     channel
@@ -3478,6 +3577,50 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(build_remote_exec_command(&req).unwrap(), "ls -la");
+    }
+
+    #[test]
+    fn effective_exec_mode_honors_legacy_no_login_shell() {
+        let mut req = ExecSandboxRequest {
+            command: vec!["true".into()],
+            no_login_shell: true,
+            ..Default::default()
+        };
+        assert_eq!(effective_exec_mode(&req), ExecMode::Shell);
+        req.exec_mode = ExecMode::Direct.into();
+        assert_eq!(effective_exec_mode(&req), ExecMode::Direct);
+        req.exec_mode = ExecMode::LoginShell.into();
+        req.no_login_shell = false;
+        assert_eq!(effective_exec_mode(&req), ExecMode::LoginShell);
+    }
+
+    #[test]
+    fn direct_exec_transport_encodes_argv_without_a_shell() {
+        let req = ExecSandboxRequest {
+            command: vec!["curl".into(), "-sS".into(), "https://example.test".into()],
+            environment: std::iter::once(("FOO".into(), "bar".into())).collect(),
+            workdir: "/workspace".into(),
+            exec_mode: ExecMode::Direct.into(),
+            ..Default::default()
+        };
+        let encoded = build_exec_transport_command(&req, ExecMode::Direct).unwrap();
+        let decoded = openshell_core::direct_exec::decode(&encoded).unwrap();
+        assert_eq!(decoded.program, "curl");
+        assert_eq!(
+            decoded.args,
+            vec!["-sS".to_string(), "https://example.test".to_string()]
+        );
+        assert_eq!(decoded.env, vec![("FOO".to_string(), "bar".to_string())]);
+        assert_eq!(decoded.workdir.as_deref(), Some("/workspace"));
+    }
+
+    #[test]
+    fn supervisor_direct_capability_is_advertised_as_an_ssh_comment() {
+        assert!(supervisor_supports_direct_exec(
+            b"SSH-2.0-OpenShell_0.0.0 exec_direct"
+        ));
+        assert!(!supervisor_supports_direct_exec(b"SSH-2.0-OpenShell_0.0.0"));
+        assert!(!supervisor_supports_direct_exec(b"SSH-2.0-OpenSSH_9.6"));
     }
 
     #[test]
