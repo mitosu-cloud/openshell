@@ -56,10 +56,9 @@ mod tls;
 #[cfg(test)]
 pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
-mod tracing_setup;
+pub mod tracing_setup;
 mod watch_cursor;
 mod ws_tunnel;
-
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{Config, Error, ObjectLabels, Result};
@@ -309,6 +308,29 @@ fn spawn_supervisor_token_refresh(
     });
 }
 pub use auth::audit::ConnectionSource;
+
+/// Install the Prometheus recorder only when the caller still owns the global
+/// slot. An already-installed recorder is not an error for an embedded host.
+fn try_install_prometheus_recorder(
+    mutation_lock_connections: Option<u32>,
+) -> Result<Option<metrics_exporter_prometheus::PrometheusHandle>> {
+    match gateway_metrics::install_global_recorder(
+        supervisor_session::RELAY_CAPACITY,
+        mutation_lock_connections,
+    ) {
+        Ok(handle) => Ok(Some(handle)),
+        Err(metrics_exporter_prometheus::BuildError::FailedToSetGlobalRecorder(err)) => {
+            warn!(
+                error = %err,
+                "Prometheus recorder already installed; continuing without replacing it"
+            );
+            Ok(None)
+        }
+        Err(err) => Err(Error::config(format!(
+            "failed to install metrics recorder: {err}"
+        ))),
+    }
+}
 pub use multiplex::{MultiplexService, MultiplexedService};
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
@@ -1010,14 +1032,11 @@ pub async fn bootstrap_state(
     let metrics_endpoint = config
         .metrics_bind_address
         .map(|metrics_bind_address| {
-            gateway_metrics::install_global_recorder(
-                supervisor_session::RELAY_CAPACITY,
-                store.mutation_lock_connections(),
-            )
-            .map(|prometheus_handle| (metrics_bind_address, prometheus_handle))
+            try_install_prometheus_recorder(store.mutation_lock_connections())
+                .map(|handle| handle.map(|handle| (metrics_bind_address, handle)))
         })
-        .transpose()
-        .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+        .transpose()?
+        .flatten();
 
     grpc::policy::backfill_legacy_policy_history(&state)
         .await
@@ -1109,7 +1128,7 @@ pub async fn serve(
             }
         });
     } else {
-        info!("Metrics server disabled");
+        info!("Dedicated metrics server disabled");
     }
 
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.
@@ -2329,6 +2348,15 @@ mod tests {
             )
             .expect("issuer"),
         )
+    }
+
+    #[test]
+    fn already_installed_prometheus_recorder_is_tolerated() {
+        assert!(super::try_install_prometheus_recorder(None).is_ok());
+        assert!(matches!(
+            super::try_install_prometheus_recorder(None),
+            Ok(None)
+        ));
     }
 
     #[tokio::test]
