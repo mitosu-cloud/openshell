@@ -543,10 +543,7 @@ impl PostgresStore {
         self.lock_pool.num_idle()
     }
 
-    /// Test support only: close the underlying connection pools.
-    ///
-    /// Do not call from runtime code; this tears down the active pools.
-    #[cfg(any(test, feature = "test-support"))]
+    /// Close the underlying connection pools.
     pub async fn close(&self) {
         self.pool.close().await;
         self.lock_pool.close().await;

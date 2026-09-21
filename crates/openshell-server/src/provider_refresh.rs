@@ -18,7 +18,10 @@ use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tonic::{Code, Status};
 use tracing::{Instrument as _, info, warn};
 
@@ -856,7 +859,7 @@ static REFRESH_ADMISSIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::cons
 
 fn refresh_lock(
     state: &StoredProviderCredentialRefreshState,
-) -> Result<std::sync::Arc<tokio::sync::Mutex<()>>, Status> {
+) -> Result<Arc<tokio::sync::Mutex<()>>, Status> {
     let key = refresh_state_name(&state.provider_id, &state.credential_key);
     let mut locks = REFRESH_LOCKS
         .lock()
@@ -865,8 +868,8 @@ fn refresh_lock(
     let lock = locks
         .get(&key)
         .and_then(std::sync::Weak::upgrade)
-        .unwrap_or_else(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
-    locks.insert(key, std::sync::Arc::downgrade(&lock));
+        .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+    locks.insert(key, Arc::downgrade(&lock));
     Ok(lock)
 }
 
@@ -2226,7 +2229,11 @@ fn test_sts_endpoint_override(_state: &StoredProviderCredentialRefreshState) -> 
     None
 }
 
-pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval: Duration) {
+pub fn spawn_refresh_worker(
+    state: Arc<crate::ServerState>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
     info!(
         interval_seconds = interval.as_secs(),
         "provider credential refresh worker started"
@@ -2235,29 +2242,40 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
-            match Box::pin(run_refresh_worker_tick(
-                state.store.as_ref(),
-                Some(&state.credentials),
-                Some(&state.compute),
-            ))
-            .await
-            {
-                Ok(providers) => {
-                    for (workspace, provider_name) in providers {
-                        crate::config_delivery::publish_provider(
-                            &state,
-                            &workspace,
-                            &provider_name,
-                        );
+            if *shutdown.borrow() {
+                break;
+            }
+            tokio::select! {
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        break;
                     }
                 }
-                Err(err) => {
-                    warn!(error = %err, "provider credential refresh worker tick failed");
+                _ = ticker.tick() => {
+                    match Box::pin(run_refresh_worker_tick(
+                        state.store.as_ref(),
+                        Some(&state.credentials),
+                        Some(&state.compute),
+                    ))
+                    .await
+                    {
+                        Ok(providers) => {
+                            for (workspace, provider_name) in providers {
+                                crate::config_delivery::publish_provider(
+                                    &state,
+                                    &workspace,
+                                    &provider_name,
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "provider credential refresh worker tick failed");
+                        }
+                    }
                 }
             }
         }
-    });
+    })
 }
 
 /// Returns the `(workspace, provider)` pairs whose provider records changed.

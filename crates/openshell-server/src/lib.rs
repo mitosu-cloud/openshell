@@ -186,11 +186,12 @@ fn mint_gateway_extension_credential(
 fn spawn_gateway_extension_token_refresh(
     issuer: Arc<auth::sandbox_jwt::ExtensionJwtIssuer>,
     credentials: Vec<GatewayExtensionCredential>,
-) {
+    mut shutdown: watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
     if credentials.is_empty() {
-        return;
+        return None;
     }
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         loop {
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -214,7 +215,9 @@ fn spawn_gateway_extension_token_refresh(
                         .max(100),
                 )
             };
-            tokio::time::sleep(refresh_delay).await;
+            if !wait_for_shutdown_or_sleep(&mut shutdown, refresh_delay).await {
+                break;
+            }
             for credential in &credentials {
                 match issuer.mint_extension_token(
                     &credential.audience,
@@ -241,7 +244,22 @@ fn spawn_gateway_extension_token_refresh(
                 }
             }
         }
-    });
+    }))
+}
+
+/// Wait until `shutdown` becomes true or the sender is dropped, or `duration`
+/// elapses. Returns `false` when background work should stop.
+pub(crate) async fn wait_for_shutdown_or_sleep(
+    shutdown: &mut watch::Receiver<bool>,
+    duration: Duration,
+) -> bool {
+    if *shutdown.borrow() {
+        return false;
+    }
+    tokio::select! {
+        result = shutdown.changed() => result.is_ok() && !*shutdown.borrow(),
+        () = tokio::time::sleep(duration) => true,
+    }
 }
 pub use auth::audit::ConnectionSource;
 pub use multiplex::{MultiplexService, MultiplexedService};
@@ -273,6 +291,7 @@ pub struct ListenerInfo {
 pub struct BootstrappedServer {
     state: Arc<ServerState>,
     metrics_endpoint: Option<(SocketAddr, metrics_exporter_prometheus::PrometheusHandle)>,
+    background_tasks: Vec<JoinHandle<()>>,
 }
 
 /// Running listeners and the task that waits for shutdown.
@@ -285,6 +304,7 @@ pub struct ServingServer {
     state: Arc<ServerState>,
     listener_task: JoinHandle<()>,
     membership_worker: Option<JoinHandle<()>>,
+    background_tasks: Vec<JoinHandle<()>>,
 }
 
 /// Server state shared across handlers.
@@ -796,8 +816,15 @@ pub async fn bootstrap_state(
     state.provider_profile_sources = provider_profile_sources;
     state.extension_jwt_issuer = extension_jwt_issuer.clone();
     state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
-    if let Some(issuer) = extension_jwt_issuer {
-        spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
+    let mut background_tasks = Vec::new();
+    if let Some(issuer) = extension_jwt_issuer
+        && let Some(task) = spawn_gateway_extension_token_refresh(
+            issuer,
+            gateway_extension_credentials,
+            shutdown_rx.clone(),
+        )
+    {
+        background_tasks.push(task);
     }
 
     if state.sandbox_session_jwt_authority.is_some()
@@ -942,6 +969,7 @@ pub async fn bootstrap_state(
     Ok(BootstrappedServer {
         state,
         metrics_endpoint,
+        background_tasks,
     })
 }
 
@@ -953,6 +981,7 @@ pub async fn serve(
     let BootstrappedServer {
         state,
         metrics_endpoint,
+        mut background_tasks,
     } = bootstrapped;
     let store = state.store.clone();
     let config = state.config.clone();
@@ -1092,10 +1121,22 @@ pub async fn serve(
         gateway_members::MEMBER_REFRESH_INTERVAL,
         shutdown_rx.clone(),
     );
-    ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
-    supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_profile_sources::spawn_refresh(state.clone());
-    provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
+    background_tasks.push(ssh_sessions::spawn_session_reaper(
+        store.clone(),
+        Duration::from_hours(1),
+        shutdown_rx.clone(),
+    ));
+    background_tasks.push(supervisor_session::spawn_relay_reaper(
+        state.clone(),
+        Duration::from_secs(30),
+        shutdown_rx.clone(),
+    ));
+    background_tasks.push(provider_refresh::spawn_refresh_worker(
+        state.clone(),
+        Duration::from_mins(1),
+        shutdown_rx.clone(),
+    ));
 
     let (ready_tx, ready_rx) = oneshot::channel();
     let _ = ready_tx.send(listener_info);
@@ -1116,6 +1157,7 @@ pub async fn serve(
         state,
         listener_task,
         membership_worker,
+        background_tasks,
     })
 }
 
@@ -1127,12 +1169,18 @@ pub async fn shutdown_and_cleanup(serving: ServingServer) -> Result<()> {
         state,
         listener_task,
         membership_worker,
+        background_tasks,
     } = serving;
     state.gateway_shutting_down.store(true, Ordering::Release);
     state.supervisor_sessions.close_admission();
     let _ = task.await;
     if let Err(err) = listener_task.await {
         warn!(error = %err, "Gateway listener task failed during shutdown");
+    }
+    for background_task in background_tasks {
+        if let Err(err) = background_task.await {
+            warn!(error = %err, "Background task failed during shutdown");
+        }
     }
     let compute_cleanup = state.compute.cleanup_on_shutdown().await;
     // Closing sessions redirect their supervisors through the ring. Let the
@@ -1153,6 +1201,7 @@ pub async fn shutdown_and_cleanup(serving: ServingServer) -> Result<()> {
     if let Err(err) = &session_cleanup {
         warn!(error = %err, "Gateway supervisor session cleanup incomplete");
     }
+    state.store.close().await;
     compute_cleanup
         .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
     session_cleanup.map_err(Error::execution)?;
@@ -2178,6 +2227,22 @@ mod tests {
             )
             .expect("issuer"),
         )
+    }
+
+    #[tokio::test]
+    async fn wait_for_shutdown_or_sleep_stops_when_signaled() {
+        let (tx, mut rx) = watch::channel(false);
+        let wait = super::wait_for_shutdown_or_sleep(&mut rx, Duration::from_secs(60));
+        tx.send(true).unwrap();
+        assert!(!wait.await);
+    }
+
+    #[tokio::test]
+    async fn wait_for_shutdown_or_sleep_returns_after_duration() {
+        let (_tx, mut rx) = watch::channel(false);
+        let started = std::time::Instant::now();
+        assert!(super::wait_for_shutdown_or_sleep(&mut rx, Duration::from_millis(20)).await);
+        assert!(started.elapsed() >= Duration::from_millis(20));
     }
 
     #[test]
