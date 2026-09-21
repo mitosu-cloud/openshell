@@ -17,7 +17,7 @@ compile_error!(
 );
 
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
-mod vm;
+pub mod vm;
 
 #[cfg(any(
     all(target_os = "windows", feature = "compute-driver-mxc"),
@@ -32,15 +32,7 @@ mod vm;
     )
 ))]
 use openshell_core::telemetry::TelemetryComputeDriver;
-#[cfg(any(
-    target_os = "windows",
-    feature = "compute-driver-docker",
-    feature = "compute-driver-kubernetes",
-    feature = "compute-driver-podman",
-    feature = "compute-driver-vm"
-))]
-use openshell_server::ComputeDriverRegistration;
-use openshell_server::ComputeDriverRegistry;
+use openshell_server::{ComputeDriverRegistration, ComputeDriverRegistry};
 
 /// Install every first-party compute driver linked into the standard gateway.
 #[must_use]
@@ -62,6 +54,99 @@ pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
     #[cfg(target_os = "windows")]
     install_unsupported_windows_compute_drivers(&mut registry);
     registry
+}
+
+/// Install the named local compute drivers compiled into this binary.
+///
+/// Only `docker`, `podman`, and `vm` are accepted. Kubernetes is excluded so
+/// an embedded host cannot pull in the cluster driver by accident.
+pub fn install_compute_drivers(names: &[&str]) -> openshell_core::Result<ComputeDriverRegistry> {
+    let mut registry = ComputeDriverRegistry::new();
+    for name in names {
+        let registration = embed_compute_driver_registration(name)?;
+        registry.install(registration)?;
+    }
+    Ok(registry)
+}
+
+fn embed_compute_driver_registration(
+    name: &str,
+) -> openshell_core::Result<ComputeDriverRegistration> {
+    match name {
+        "docker" => docker_registration().ok_or_else(|| {
+            openshell_core::Error::config(
+                "compute driver 'docker' is not compiled into this binary",
+            )
+        }),
+        "podman" => podman_registration().ok_or_else(|| {
+            openshell_core::Error::config(
+                "compute driver 'podman' is not compiled into this binary",
+            )
+        }),
+        "vm" => vm_registration().ok_or_else(|| {
+            openshell_core::Error::config("compute driver 'vm' is not compiled into this binary")
+        }),
+        other => Err(openshell_core::Error::config(format!(
+            "install_compute_drivers accepts only docker, podman, and vm; got '{other}'"
+        ))),
+    }
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-docker"))]
+fn docker_registration() -> Option<ComputeDriverRegistration> {
+    Some(
+        ComputeDriverRegistration::new(
+            "docker",
+            300,
+            Some(openshell_driver_docker::is_available),
+            DockerFactory,
+        )
+        .expect("first-party driver name is valid")
+        .with_telemetry_category(TelemetryComputeDriver::anonymous_category("docker"))
+        .with_local_singleplayer()
+        .with_in_process_tracing(openshell_driver_docker::otel_tracing::TRACING),
+    )
+}
+
+#[cfg(not(all(not(target_os = "windows"), feature = "compute-driver-docker")))]
+fn docker_registration() -> Option<ComputeDriverRegistration> {
+    None
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
+fn podman_registration() -> Option<ComputeDriverRegistration> {
+    Some(
+        ComputeDriverRegistration::new(
+            "podman",
+            200,
+            Some(openshell_driver_podman::driver::is_available),
+            PodmanFactory,
+        )
+        .expect("first-party driver name is valid")
+        .with_telemetry_category(TelemetryComputeDriver::anonymous_category("podman"))
+        .with_local_singleplayer()
+        .with_in_process_tracing(openshell_driver_podman::otel_tracing::TRACING),
+    )
+}
+
+#[cfg(not(all(not(target_os = "windows"), feature = "compute-driver-podman")))]
+fn podman_registration() -> Option<ComputeDriverRegistration> {
+    None
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
+fn vm_registration() -> Option<ComputeDriverRegistration> {
+    Some(
+        ComputeDriverRegistration::new("vm", u16::MAX, None, VmFactory)
+            .expect("first-party driver name is valid")
+            .with_telemetry_category(TelemetryComputeDriver::anonymous_category("vm"))
+            .with_local_singleplayer(),
+    )
+}
+
+#[cfg(not(all(not(target_os = "windows"), feature = "compute-driver-vm")))]
+fn vm_registration() -> Option<ComputeDriverRegistration> {
+    None
 }
 
 #[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
@@ -629,5 +714,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
+    }
+
+    #[test]
+    fn install_compute_drivers_selects_named_local_drivers() {
+        let names = [
+            #[cfg(feature = "compute-driver-docker")]
+            "docker",
+            #[cfg(feature = "compute-driver-vm")]
+            "vm",
+        ];
+        if names.is_empty() {
+            return;
+        }
+        let registry = install_compute_drivers(&names).expect("local drivers");
+        assert_eq!(registry.installed_driver_names().collect::<Vec<_>>(), names);
+        assert!(
+            !registry
+                .installed_driver_names()
+                .any(|name| name == "kubernetes")
+        );
+    }
+
+    #[test]
+    fn install_compute_drivers_rejects_kubernetes() {
+        match install_compute_drivers(&["kubernetes"]) {
+            Ok(_) => panic!("kubernetes is excluded"),
+            Err(error) => assert!(error.to_string().contains("docker, podman, and vm")),
+        }
+    }
+
+    #[test]
+    fn vm_compute_config_is_constructible_from_the_public_module() {
+        #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
+        {
+            let _ = vm::VmComputeConfig {
+                state_dir: std::path::PathBuf::from("/tmp/openshell-vm"),
+                ..Default::default()
+            };
+        }
     }
 }
