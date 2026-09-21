@@ -47,10 +47,10 @@ mod tls;
 #[cfg(test)]
 pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
-mod tracing_setup;
+pub mod tracing_setup;
 mod ws_tunnel;
 
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{BuildError, PrometheusBuilder, PrometheusHandle};
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{Config, Error, ObjectLabels, Result};
@@ -257,6 +257,24 @@ pub(crate) async fn wait_for_shutdown_or_sleep(
     tokio::select! {
         result = shutdown.changed() => result.is_ok() && !*shutdown.borrow(),
         () = tokio::time::sleep(duration) => true,
+    }
+}
+
+/// Install the Prometheus recorder only when the caller still owns the global
+/// slot. An already-installed recorder is not an error for an embedded host.
+fn try_install_prometheus_recorder() -> Result<Option<PrometheusHandle>> {
+    match PrometheusBuilder::new().install_recorder() {
+        Ok(handle) => Ok(Some(handle)),
+        Err(BuildError::FailedToSetGlobalRecorder(err)) => {
+            warn!(
+                error = %err,
+                "Prometheus recorder already installed; continuing without replacing it"
+            );
+            Ok(None)
+        }
+        Err(err) => Err(Error::config(format!(
+            "failed to install metrics recorder: {err}"
+        ))),
     }
 }
 pub use multiplex::{MultiplexService, MultiplexedService};
@@ -852,26 +870,36 @@ pub async fn serve(
     }
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
+    // The global recorder is installed only for that listener; an already-installed
+    // recorder (typical when the gateway is embedded) is left in place.
     if let Some(metrics_bind_address) = config.metrics_bind_address {
-        let prometheus_handle = PrometheusBuilder::new()
-            .install_recorder()
-            .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
-        let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
-            Error::transport(format!(
-                "failed to bind metrics port {metrics_bind_address}: {e}",
-            ))
-        })?;
-        info!(address = %metrics_bind_address, "Metrics server listening");
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(
-                metrics_listener,
-                metrics_router(prometheus_handle).into_make_service(),
-            )
-            .await
-            {
-                error!("Metrics server error: {e}");
+        match try_install_prometheus_recorder()? {
+            Some(prometheus_handle) => {
+                let metrics_listener =
+                    TcpListener::bind(metrics_bind_address).await.map_err(|e| {
+                        Error::transport(format!(
+                            "failed to bind metrics port {metrics_bind_address}: {e}",
+                        ))
+                    })?;
+                info!(address = %metrics_bind_address, "Metrics server listening");
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(
+                        metrics_listener,
+                        metrics_router(prometheus_handle).into_make_service(),
+                    )
+                    .await
+                    {
+                        error!("Metrics server error: {e}");
+                    }
+                });
             }
-        });
+            None => {
+                warn!(
+                    address = %metrics_bind_address,
+                    "skipping dedicated metrics listener because a Prometheus recorder is already installed"
+                );
+            }
+        }
     } else {
         info!("Metrics server disabled");
     }
@@ -2002,6 +2030,12 @@ mod tests {
             )
             .expect("issuer"),
         )
+    }
+
+    #[test]
+    fn already_installed_prometheus_recorder_is_tolerated() {
+        assert!(super::try_install_prometheus_recorder().is_ok());
+        assert!(matches!(super::try_install_prometheus_recorder(), Ok(None)));
     }
 
     #[tokio::test]

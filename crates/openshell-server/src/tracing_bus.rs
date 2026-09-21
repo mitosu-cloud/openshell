@@ -44,7 +44,8 @@ impl TracingLogBus {
         }
     }
 
-    pub(crate) fn layer<S: Subscriber>(&self) -> impl Layer<S> {
+    /// Tracing layer that copies sandbox-tagged events onto this bus.
+    pub fn layer<S: Subscriber>(&self) -> impl Layer<S> {
         SandboxLogLayer {
             bus: self.clone(),
             default_tail: Self::DEFAULT_TAIL,

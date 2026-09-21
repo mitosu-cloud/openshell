@@ -7,18 +7,25 @@
 //! `OpenShell` product telemetry collected for maintainers is handled by
 //! [`crate::telemetry`].
 
+use std::path::PathBuf;
+
 use openshell_ocsf::OcsfJsonlLayer;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use tracing::Subscriber;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::registry::LookupSpan;
 
 use crate::config_file::OtlpConfig;
-use crate::otel_tracing::{GatewayResourceAttributes, SetupError};
 use crate::tracing_bus::TracingLogBus;
+
+pub use crate::otel_tracing::{GatewayResourceAttributes, SetupError};
 
 pub struct TracingHandle {
     tracer_provider: Option<SdkTracerProvider>,
     driver_tracer_provider: Option<SdkTracerProvider>,
+    ocsf_jsonl_dir: Option<PathBuf>,
 }
 
 impl TracingHandle {
@@ -36,13 +43,20 @@ impl TracingHandle {
     }
 }
 
-pub fn install(
+/// Build the gateway tracing stack without installing it as the process default.
+///
+/// An embedder composes the returned layer onto its own subscriber. The stock
+/// CLI path calls [`install`], which layers this onto the registry and `init`s.
+pub fn layers<S>(
     env_filter: EnvFilter,
     tracing_log_bus: &TracingLogBus,
     otlp_config: Option<&OtlpConfig>,
     driver: Option<openshell_otel::ComputeDriverTracing>,
     gateway: GatewayResourceAttributes<'_>,
-) -> (TracingHandle, Option<SetupError>) {
+) -> (impl Layer<S>, TracingHandle, Option<SetupError>)
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
     let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config, gateway);
     let driver_endpoint = driver
         .is_some()
@@ -65,17 +79,17 @@ pub fn install(
     // Keep the audit sink independent from the operator's diagnostic log
     // level. An explicit JSONL opt-in must keep every OCSF event even when the
     // console and routed diagnostic logs are restricted to `warn` or `error`.
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(env_filter.clone()))
-        .with(tracing_log_bus.layer().with_filter(env_filter.clone()))
-        .with(jsonl_layer)
-        .with(
+    let layer = tracing_subscriber::fmt::layer()
+        .with_filter(env_filter.clone())
+        .and_then(tracing_log_bus.layer().with_filter(env_filter.clone()))
+        .and_then(jsonl_layer)
+        .and_then(
             tracer_provider
                 .as_ref()
                 .map(|provider| crate::otel_tracing::layer(provider, driver))
                 .with_filter(env_filter.clone()),
         )
-        .with(
+        .and_then(
             driver_tracer_provider
                 .as_ref()
                 .map(|provider| {
@@ -84,10 +98,31 @@ pub fn install(
                         .in_process_layer(provider)
                 })
                 .with_filter(env_filter),
-        )
-        .init();
+        );
 
-    if let Some(dir) = jsonl_dir {
+    (
+        layer,
+        TracingHandle {
+            tracer_provider,
+            driver_tracer_provider,
+            ocsf_jsonl_dir: jsonl_dir,
+        },
+        setup_error.or(driver_setup_error),
+    )
+}
+
+pub fn install(
+    env_filter: EnvFilter,
+    tracing_log_bus: &TracingLogBus,
+    otlp_config: Option<&OtlpConfig>,
+    driver: Option<openshell_otel::ComputeDriverTracing>,
+    gateway: GatewayResourceAttributes<'_>,
+) -> (TracingHandle, Option<SetupError>) {
+    let (layer, handle, setup_error) =
+        layers(env_filter, tracing_log_bus, otlp_config, driver, gateway);
+    tracing_subscriber::registry().with(layer).init();
+
+    if let Some(dir) = &handle.ocsf_jsonl_dir {
         tracing::info!(
             target: "openshell_server",
             ocsf_jsonl_dir = %dir.display(),
@@ -100,13 +135,7 @@ pub fn install(
         );
     }
 
-    (
-        TracingHandle {
-            tracer_provider,
-            driver_tracer_provider,
-        },
-        setup_error.or(driver_setup_error),
-    )
+    (handle, setup_error)
 }
 
 /// Build the OCSF JSONL audit layer for the gateway, plus the directory it
@@ -126,7 +155,7 @@ fn build_ocsf_jsonl_layer(
     _compute_driver: Option<&str>,
 ) -> (
     Option<OcsfJsonlLayer<tracing_appender::rolling::RollingFileAppender>>,
-    Option<std::path::PathBuf>,
+    Option<PathBuf>,
 ) {
     // The gateway-local JSONL sink belongs to the Windows/MXC ETW path. A
     // cross-platform sink needs an explicit storage and configuration contract.
@@ -138,7 +167,7 @@ fn build_ocsf_jsonl_layer(
     compute_driver: Option<&str>,
 ) -> (
     Option<OcsfJsonlLayer<tracing_appender::rolling::RollingFileAppender>>,
-    Option<std::path::PathBuf>,
+    Option<PathBuf>,
 ) {
     let requested = std::env::var("OPENSHELL_OCSF_JSON").ok();
     if !mxc_ocsf_jsonl_requested(compute_driver, requested.as_deref()) {
@@ -278,6 +307,24 @@ mod tests {
                 "expected {value:?} to opt in"
             );
         }
+    }
+
+    #[test]
+    fn layers_compose_onto_a_local_subscriber() {
+        let bus = crate::tracing_bus::TracingLogBus::new();
+        let (layer, handle, setup_error) = super::layers(
+            EnvFilter::new("info"),
+            &bus,
+            None,
+            None,
+            crate::otel_tracing::GatewayResourceAttributes::new(Some("test"), Some("docker")),
+        );
+        assert!(setup_error.is_none());
+        drop(handle);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("embedded tracing layer");
+        });
     }
 
     #[test]
