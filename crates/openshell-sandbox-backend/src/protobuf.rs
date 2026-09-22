@@ -510,6 +510,17 @@ impl WireMessage for w::RequestEnvelope {
             }),
             W::OpenMediation => P::OpenMediation(p::OpenMediation {}),
             W::AcceptNetwork => P::AcceptNetwork(p::AcceptNetwork {}),
+            W::ProvisionFile {
+                path,
+                mode,
+                contents,
+                overwrite,
+            } => P::ProvisionFile(p::ProvisionFile {
+                path: path.clone(),
+                mode: *mode,
+                contents: contents.clone(),
+                overwrite: *overwrite,
+            }),
         };
         Ok(p::RequestEnvelope {
             request_id: self.request_id.clone(),
@@ -573,6 +584,12 @@ impl WireMessage for w::RequestEnvelope {
             },
             P::OpenMediation(_) => W::OpenMediation,
             P::AcceptNetwork(_) => W::AcceptNetwork,
+            P::ProvisionFile(v) => W::ProvisionFile {
+                path: v.path,
+                mode: v.mode,
+                contents: v.contents,
+                overwrite: v.overwrite,
+            },
         };
         // The server derives a fingerprint from decoded typed fields. Clients
         // supply only the random ID; protobuf map order never changes a replay.
@@ -654,6 +671,15 @@ impl WireMessage for w::ResponseEnvelope {
                 policy_generation: *policy_generation,
                 timing: Some(timing.to_proto()?),
             }),
+            W::FileProvisioned {
+                written,
+                length,
+                mode,
+            } => P::FileProvisioned(p::FileProvisioned {
+                written: *written,
+                length: *length,
+                mode: *mode,
+            }),
             W::Error { kind, message } => P::Error(p::Error {
                 kind: kind.to_proto()? as i32,
                 message: message.clone(),
@@ -716,6 +742,11 @@ impl WireMessage for w::ResponseEnvelope {
                 }),
                 policy_generation: v.policy_generation,
                 timing: w::MediationTimingWire::from_proto(v.timing.unwrap_or_default())?,
+            },
+            P::FileProvisioned(v) => W::FileProvisioned {
+                written: v.written,
+                length: v.length,
+                mode: v.mode,
             },
             P::Error(v) => W::Error {
                 kind: w::BoundaryErrorKind::from_proto(enum_value(v.kind)?)?,
@@ -868,5 +899,30 @@ mod tests {
         let bytes = encode(&request).unwrap();
         let decoded: w::RequestEnvelope = decode(&bytes).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn private_file_request_and_response_round_trip_without_debugging_contents() {
+        let request = w::RequestEnvelope::new(w::Request::ProvisionFile {
+            path: "/run/private/token".into(),
+            mode: 0o600,
+            contents: b"sensitive-token".to_vec(),
+            overwrite: true,
+        })
+        .unwrap();
+        assert!(!format!("{request:?}").contains("sensitive-token"));
+        let decoded: w::RequestEnvelope = decode(&encode(&request).unwrap()).unwrap();
+        assert_eq!(decoded, request);
+
+        let response = w::ResponseEnvelope {
+            request_id: request.request_id,
+            response: w::Response::FileProvisioned {
+                written: true,
+                length: 15,
+                mode: 0o600,
+            },
+        };
+        let decoded: w::ResponseEnvelope = decode(&encode(&response).unwrap()).unwrap();
+        assert_eq!(decoded, response);
     }
 }

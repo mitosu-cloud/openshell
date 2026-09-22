@@ -102,6 +102,7 @@ pub async fn start_boundary_access(
         .map_err(|error| miette::miette!(error.to_string()))?;
     let main_session = crate::main_session::MainSession::from_boundary(attachment, agent);
     let ssh_socket_path = ssh_socket_path.map(std::path::PathBuf::from);
+    let session_exec = Arc::clone(&boundary_exec);
     let ssh_task = start_optional_ssh(
         ssh_socket_path.clone(),
         shared_ssh_socket,
@@ -123,6 +124,7 @@ pub async fn start_boundary_access(
                 id.to_string(),
                 ssh_socket_path.unwrap_or_default(),
                 port_forward,
+                session_exec,
                 None,
                 terminating.clone(),
                 crate::supervisor_session::SessionRuntimeContext {

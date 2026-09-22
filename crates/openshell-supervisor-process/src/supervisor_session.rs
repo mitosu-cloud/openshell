@@ -13,7 +13,7 @@
 #[cfg(test)]
 use openshell_sandbox_backend::test_support as rpc_test;
 
-use openshell_sandbox_backend::BoundaryLoopbackConnector;
+use openshell_sandbox_backend::{BoundaryExec, BoundaryLoopbackConnector};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,12 +24,12 @@ use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
     ConfigApplyFailure, ConfigApplyOutcome, ConfigSnapshotRevision, ConfigUpdate,
     ConfigUpdateResult, ConfigurationAdmissionState, FinalizeMainProcessExitRequest,
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, RelayOpenResult,
-    ReportMainProcessExitRequest, SandboxConfigRevision, SandboxConfigurationAdmission,
-    SupervisorHeartbeat, SupervisorHello, SupervisorMessage, TcpRelayTarget,
-    config_snapshot_revision, gateway_message, relay_open, supervisor_message,
+    GatewayMessage, ProvisionSandboxFileCommand, ProvisionSandboxFileResult, RelayFrame, RelayInit,
+    RelayOpen, RelayOpenResult, ReportMainProcessExitRequest, SandboxConfigRevision,
+    SandboxConfigurationAdmission, SupervisorHeartbeat, SupervisorHello, SupervisorMessage,
+    TcpRelayTarget, config_snapshot_revision, gateway_message, relay_open, supervisor_message,
 };
-use openshell_isolation_interface::contract::LoopbackTarget;
+use openshell_isolation_interface::contract::{FileProvisionRequest, LoopbackTarget};
 use openshell_ocsf::{
     ActivityId, BaseEventBuilder, ConnectionInfo, Endpoint, EventContext, NetworkActivityBuilder,
     OcsfEvent, SeverityId, StatusId, ocsf_emit,
@@ -385,6 +385,7 @@ pub fn spawn(
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     port_forward: Arc<BoundaryLoopbackConnector>,
+    boundary_exec: Arc<BoundaryExec>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     runtime: SessionRuntimeContext,
@@ -394,6 +395,7 @@ pub fn spawn(
         sandbox_id,
         ssh_socket_path,
         port_forward,
+        boundary_exec,
         expected_ssh_peer_pid,
         terminating,
         runtime,
@@ -407,6 +409,7 @@ pub fn spawn_with_readiness(
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     port_forward: Arc<BoundaryLoopbackConnector>,
+    boundary_exec: Arc<BoundaryExec>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     runtime: SessionRuntimeContext,
@@ -417,6 +420,7 @@ pub fn spawn_with_readiness(
         sandbox_id,
         ssh_socket_path,
         port_forward,
+        boundary_exec,
         expected_ssh_peer_pid,
         terminating,
         instance_id: runtime.instance_id,
@@ -433,6 +437,7 @@ struct SessionConfig {
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     port_forward: Arc<BoundaryLoopbackConnector>,
+    boundary_exec: Arc<BoundaryExec>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
@@ -720,6 +725,7 @@ async fn run_single_session(
                     sandbox_id: &config.sandbox_id,
                     ssh_socket_path: &config.ssh_socket_path,
                     port_forward: &config.port_forward,
+                    boundary_exec: &config.boundary_exec,
                     expected_ssh_peer_pid: config.expected_ssh_peer_pid,
                     channel: &channel,
                     tx: &tx,
@@ -868,6 +874,7 @@ struct GatewayMessageContext<'a> {
     sandbox_id: &'a str,
     ssh_socket_path: &'a std::path::Path,
     port_forward: &'a Arc<BoundaryLoopbackConnector>,
+    boundary_exec: &'a Arc<BoundaryExec>,
     expected_ssh_peer_pid: Option<u32>,
     channel: &'a grpc_client::AuthedChannel,
     tx: &'a mpsc::Sender<SupervisorMessage>,
@@ -950,6 +957,14 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                 }
             });
         }
+        Some(gateway_message::Payload::ProvisionSandboxFile(request)) => {
+            let request = request.clone();
+            let boundary_exec = Arc::clone(context.boundary_exec);
+            let tx = context.tx.clone();
+            tokio::spawn(async move {
+                provision_sandbox_file(boundary_exec, tx, request).await;
+            });
+        }
         Some(gateway_message::Payload::RelayClose(close)) => {
             let event = relay_close_from_gateway_event(
                 &openshell_ocsf::ctx::ctx(),
@@ -961,6 +976,48 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
         _ => {
             warn!(sandbox_id = %context.sandbox_id, "supervisor session: unexpected gateway message");
         }
+    }
+}
+
+async fn provision_sandbox_file(
+    boundary_exec: Arc<BoundaryExec>,
+    tx: mpsc::Sender<SupervisorMessage>,
+    request: ProvisionSandboxFileCommand,
+) {
+    let request_id = request.request_id.clone();
+    let outcome = boundary_exec
+        .provision_file(FileProvisionRequest {
+            path: request.path,
+            mode: request.mode,
+            contents: request.contents,
+            overwrite: request.overwrite,
+        })
+        .await;
+    let result = match outcome {
+        Ok(report) => ProvisionSandboxFileResult {
+            request_id,
+            success: true,
+            error: String::new(),
+            written: report.written,
+            length: report.length,
+            mode: report.mode,
+        },
+        Err(error) => ProvisionSandboxFileResult {
+            request_id,
+            success: false,
+            error: error.to_string(),
+            written: false,
+            length: 0,
+            mode: 0,
+        },
+    };
+    let message = SupervisorMessage {
+        payload: Some(supervisor_message::Payload::ProvisionSandboxFileResult(
+            result,
+        )),
+    };
+    if tx.send(message).await.is_err() {
+        warn!("supervisor session: private file result could not be delivered");
     }
 }
 

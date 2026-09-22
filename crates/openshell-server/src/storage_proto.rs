@@ -158,8 +158,10 @@ mod tests {
     // record; absent report extensions retain compatibility without a rewrite.
     // Direct exec adds one public request mode, one public signal enum, and one
     // public stdin-EOF message. The durable closure is unchanged.
+    // Private file provisioning adds a public RPC pair and two internal
+    // supervisor-session command/result messages. None are durable roots.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "78ad9f4f85ba18a221f120add829f2bc726f50bd27fddb6f4fc8ca81bc293138";
+        "3a9dfff9818a2873c90403bd8d8a40e5d71324189d097f81a872479471b04ad9";
     const DURABLE_SCHEMA_SHA256: &str =
         "d4dc7abdb91b919db1f7be0d4652e30cbfda86f3b2ed9b59d5de1f76a2bf691d";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -626,7 +628,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            104 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -636,7 +638,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            79 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -646,7 +648,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            79 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
@@ -697,7 +699,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (329, 31),
+                (333, 31),
                 (95, 22),
                 (83, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
