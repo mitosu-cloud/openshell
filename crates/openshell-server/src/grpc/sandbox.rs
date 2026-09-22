@@ -78,6 +78,10 @@ const EXEC_MODE_DIRECT_ENV: (&str, &str) = ("OPENSHELL_EXEC_MODE", "direct");
 const EXEC_DIRECT_SSH_CAPABILITY: &[u8] = b" exec_direct";
 const MAX_TEMPLATES_PER_WORKSPACE: u32 = 1000;
 
+#[cfg(test)]
+#[path = "interactive_exec_tests.rs"]
+mod interactive_exec_tests;
+
 #[derive(Debug)]
 pub struct WatchSandboxStream {
     receiver: ReceiverStream<Result<SandboxStreamEvent, Status>>,
@@ -3085,7 +3089,7 @@ async fn stream_interactive_exec_over_relay(
                     )),
                 }))
                 .await;
-            let _ = proxy_task.await;
+            finish_interactive_exec_proxy(proxy_task).await;
             return Ok(());
         }
     } else {
@@ -3095,12 +3099,12 @@ async fn stream_interactive_exec_over_relay(
     let exit_code = match exec_result {
         Ok(code) => code,
         Err(status) => {
-            let _ = proxy_task.await;
+            finish_interactive_exec_proxy(proxy_task).await;
             return Err(status);
         }
     };
 
-    let _ = proxy_task.await;
+    finish_interactive_exec_proxy(proxy_task).await;
 
     let _ = tx
         .send(Ok(ExecSandboxEvent {
@@ -3113,17 +3117,28 @@ async fn stream_interactive_exec_over_relay(
     Ok(())
 }
 
+async fn finish_interactive_exec_proxy(mut task: tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(EXEC_POST_EXIT_CLOSE_TIMEOUT, &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_interactive_exec_with_russh(
     local_proxy_port: u16,
     command: &str,
-    mut input_stream: tonic::Streaming<ExecSandboxInput>,
+    mut input_stream: impl futures::Stream<Item = Result<ExecSandboxInput, Status>> + Unpin,
     request_tty: bool,
     exec_mode: ExecMode,
     cols: u32,
     rows: u32,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
 ) -> Result<i32, Status> {
+    use futures::StreamExt;
     use openshell_core::proto::exec_sandbox_input::Payload;
     use russh::ChannelMsg;
 
@@ -3191,91 +3206,148 @@ async fn run_interactive_exec_with_russh(
 
     let (mut read_half, write_half) = channel.split();
 
-    let stdin_task = tokio::spawn(async move {
-        while let Ok(Some(msg)) = input_stream.message().await {
+    // Keep both directions independently polled, but owned by this operation.
+    // A detached stdin task would survive operation timeout and retain the SSH
+    // channel. Normal request EOF closes stdin only, never the output channel.
+    let input = async {
+        let mut stdin_eof = false;
+        while let Some(msg) = input_stream.next().await {
+            // Even ignored non-PTY resize frames must cooperate with output
+            // and cancellation when the request stream stays continuously ready.
+            tokio::task::consume_budget().await;
+            let msg = msg?;
             match msg.payload {
                 Some(Payload::Stdin(data)) => {
-                    if write_half.data(std::io::Cursor::new(data)).await.is_err() {
-                        break;
+                    if stdin_eof {
+                        return Err(Status::invalid_argument("received stdin after stdin EOF"));
                     }
+                    write_half
+                        .data(std::io::Cursor::new(data))
+                        .await
+                        .map_err(|_| {
+                            Status::unavailable("exec relay failed while writing stdin")
+                        })?;
                 }
                 Some(Payload::Resize(resize)) => {
                     if request_tty {
-                        let _ = write_half
+                        write_half
                             .window_change(resize.cols, resize.rows, 0, 0)
-                            .await;
+                            .await
+                            .map_err(|_| Status::unavailable("exec relay failed while resizing"))?;
                     }
                 }
                 Some(Payload::StdinEof(_)) => {
-                    let _ = write_half.eof().await;
+                    if !stdin_eof {
+                        write_half.eof().await.map_err(|_| {
+                            Status::unavailable("exec relay failed while closing stdin")
+                        })?;
+                        stdin_eof = true;
+                    }
                 }
                 Some(Payload::Signal(signal)) => {
                     if let Some(sig) = map_exec_signal(signal) {
-                        let _ = write_half.signal(sig).await;
+                        write_half.signal(sig).await.map_err(|_| {
+                            Status::unavailable("exec relay failed while sending signal")
+                        })?;
                     }
                 }
-                Some(Payload::Start(_)) | None => {}
+                Some(Payload::Start(_)) | None => {
+                    return Err(Status::invalid_argument(
+                        "expected stdin, stdin EOF, signal, or resize after exec start",
+                    ));
+                }
             }
         }
-        let _ = write_half.eof().await;
-        let _ = write_half.close().await;
-    });
-
-    let mut exit_code: Option<i32> = None;
-    loop {
-        // Bound the post-ExitStatus wait against a lost Close.
-        let msg = if exit_code.is_some() {
-            match tokio::time::timeout(EXEC_POST_EXIT_CLOSE_TIMEOUT, read_half.wait()).await {
-                Ok(Some(msg)) => msg,
-                Ok(None) | Err(_) => break,
-            }
+        if stdin_eof {
+            Ok(())
         } else {
-            match read_half.wait().await {
-                Some(msg) => msg,
-                None => break,
+            write_half
+                .eof()
+                .await
+                .map_err(|_| Status::unavailable("exec relay failed while closing stdin"))
+        }
+    };
+
+    let output = async {
+        let mut exit_code: Option<i32> = None;
+        loop {
+            // Bound the post-ExitStatus wait against a lost Close.
+            let msg = if exit_code.is_some() {
+                match tokio::time::timeout(EXEC_POST_EXIT_CLOSE_TIMEOUT, read_half.wait()).await {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) | Err(_) => break,
+                }
+            } else {
+                match read_half.wait().await {
+                    Some(msg) => msg,
+                    None => break,
+                }
+            };
+            match msg {
+                ChannelMsg::Data { data } => {
+                    let event = Ok(ExecSandboxEvent {
+                        payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Stdout(
+                            ExecSandboxStdout {
+                                data: data.to_vec(),
+                            },
+                        )),
+                    });
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                ChannelMsg::ExtendedData { data, .. } => {
+                    let event = Ok(ExecSandboxEvent {
+                        payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Stderr(
+                            ExecSandboxStderr {
+                                data: data.to_vec(),
+                            },
+                        )),
+                    });
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                ChannelMsg::ExitStatus { exit_status } => {
+                    let converted = i32::try_from(exit_status).unwrap_or(i32::MAX);
+                    exit_code = Some(converted);
+                }
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+
+        exec_loop_result(exit_code)
+    };
+
+    let result = {
+        tokio::pin!(input, output);
+        let exchange = async {
+            tokio::select! {
+                result = &mut input => {
+                    result?;
+                    output.await
+                }
+                result = &mut output => result,
             }
         };
-        match msg {
-            ChannelMsg::Data { data } => {
-                let event = Ok(ExecSandboxEvent {
-                    payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Stdout(
-                        ExecSandboxStdout {
-                            data: data.to_vec(),
-                        },
-                    )),
-                });
-                if tx.send(event).await.is_err() {
-                    break;
-                }
-            }
-            ChannelMsg::ExtendedData { data, .. } => {
-                let event = Ok(ExecSandboxEvent {
-                    payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Stderr(
-                        ExecSandboxStderr {
-                            data: data.to_vec(),
-                        },
-                    )),
-                });
-                if tx.send(event).await.is_err() {
-                    break;
-                }
-            }
-            ChannelMsg::ExitStatus { exit_status } => {
-                let converted = i32::try_from(exit_status).unwrap_or(i32::MAX);
-                exit_code = Some(converted);
-            }
-            ChannelMsg::Close => break,
-            _ => {}
+        tokio::select! {
+            biased;
+            () = tx.closed() => Err(Status::cancelled("exec response stream closed")),
+            result = exchange => result,
         }
-    }
+    };
 
-    stdin_task.abort();
+    // EOF above deliberately leaves this channel open until output completes.
+    // Bound cleanup even if the SSH peer is no longer making progress.
+    let _ = tokio::time::timeout(EXEC_POST_EXIT_CLOSE_TIMEOUT, write_half.close()).await;
+    let _ = tokio::time::timeout(
+        EXEC_POST_EXIT_CLOSE_TIMEOUT,
+        client.disconnect(russh::Disconnect::ByApplication, "exec complete", "en"),
+    )
+    .await;
 
-    let _ = client
-        .disconnect(russh::Disconnect::ByApplication, "exec complete", "en")
-        .await;
-
-    exec_loop_result(exit_code)
+    result
 }
 
 /// Create a localhost SSH proxy that bridges to a relay `DuplexStream`.
