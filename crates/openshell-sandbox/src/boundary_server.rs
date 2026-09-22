@@ -4915,6 +4915,7 @@ mod linux {
                 program: "/bin/sh".to_string(),
                 args: vec!["-c".to_string(), "printf '%s' \"$REPLAY_TEST\"".to_string()],
                 env: Vec::new(),
+                exact_environment: false,
                 workdir: None,
                 pty: false,
             };
@@ -5195,6 +5196,7 @@ mod linux {
                 program: "/bin/sleep".to_string(),
                 args: vec!["30".to_string()],
                 env: Vec::new(),
+                exact_environment: false,
                 workdir: None,
                 pty: false,
             };
@@ -5262,6 +5264,7 @@ mod linux {
                     program: "/bin/sh".to_string(),
                     args: vec!["-c".to_string(), format!("exit {exit_code}")],
                     env: Vec::new(),
+                    exact_environment: false,
                     workdir: None,
                     pty: false,
                 };
@@ -5299,6 +5302,7 @@ mod linux {
                                     .to_string(),
                             ],
                             env: Vec::new(),
+                            exact_environment: false,
                             workdir: None,
                             pty: false,
                         }

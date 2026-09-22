@@ -69,32 +69,39 @@ impl LocalBoundaryExec {
         let (session_user, session_home) =
             crate::process::session_user_and_home(&self.policy, effective_workdir);
         let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
-        command
-            .env_clear()
-            .env(openshell_core::sandbox_env::SANDBOX, "1")
-            .env("HOME", session_home)
-            .env("USER", session_user)
-            .env("SHELL", "/bin/bash")
-            .env("PATH", path)
-            .env("TERM", if spec.pty { "xterm-256color" } else { "dumb" });
-        for (key, value) in &self.user_environment {
-            if !key.starts_with("OPENSHELL_") {
-                command.env(key, value);
+        command.env_clear();
+        if !spec.exact_environment {
+            // Shell and SFTP sessions use the sandbox's canonical environment.
+            // DIRECT exec is an explicit process contract and receives only the
+            // caller's requested variables.
+            command
+                .env(openshell_core::sandbox_env::SANDBOX, "1")
+                .env("HOME", session_home)
+                .env("USER", session_user)
+                .env("SHELL", "/bin/bash")
+                .env("PATH", path)
+                .env("TERM", if spec.pty { "xterm-256color" } else { "dumb" });
+            for (key, value) in &self.user_environment {
+                if !key.starts_with("OPENSHELL_") {
+                    command.env(key, value);
+                }
             }
-        }
-        if let Some((ca_cert_path, combined_bundle_path)) = self.ca_file_paths.as_deref() {
-            for (key, value) in crate::child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
-                command.env(key, value);
+            if let Some((ca_cert_path, combined_bundle_path)) = self.ca_file_paths.as_deref() {
+                for (key, value) in
+                    crate::child_env::tls_env_vars(ca_cert_path, combined_bundle_path)
+                {
+                    command.env(key, value);
+                }
             }
-        }
-        for (key, value) in self.provider_credentials.child_env_with_gcp_resolved() {
-            if !crate::process::is_supervisor_only_env_var(&key) {
-                command.env(key, value);
+            for (key, value) in self.provider_credentials.child_env_with_gcp_resolved() {
+                if !crate::process::is_supervisor_only_env_var(&key) {
+                    command.env(key, value);
+                }
             }
+            crate::process::strip_proxy_env_std(&mut command);
         }
-        crate::process::strip_proxy_env_std(&mut command);
         for (key, value) in &spec.env {
-            if !key.starts_with("OPENSHELL_") {
+            if !key.starts_with("OPENSHELL_") && !crate::process::is_proxy_env_var(key) {
                 command.env(key, value);
             }
         }
@@ -536,6 +543,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_exec_receives_only_requested_environment() {
+        let executor = executor();
+        let exact = ExecSpec {
+            program: "/usr/bin/env".into(),
+            args: vec![],
+            env: vec![
+                ("CONFORMANCE_MARKER".into(), "exact".into()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ],
+            exact_environment: true,
+            workdir: None,
+            pty: false,
+        };
+        let output = executor.command(&exact).unwrap().output().unwrap();
+        assert!(output.status.success());
+        let mut actual = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec!["CONFORMANCE_MARKER=exact", "PATH=/usr/bin:/bin"]
+        );
+
+        let normal = ExecSpec {
+            exact_environment: false,
+            ..exact
+        };
+        let output = executor.command(&normal).unwrap().output().unwrap();
+        let env = String::from_utf8(output.stdout).unwrap();
+        assert!(env.lines().any(|line| line.starts_with("HOME=")));
+        assert!(env.lines().any(|line| line == "OPENSHELL_SANDBOX=1"));
+    }
+
+    #[tokio::test]
     async fn non_pty_exec_preserves_stdin_stdout_and_stderr() {
         let mut session = executor()
             .exec(ExecSpec {
@@ -548,6 +592,7 @@ mod tests {
                 env: vec![],
                 workdir: None,
                 pty: false,
+                exact_environment: false,
             })
             .await
             .expect("spawn exec");
@@ -587,6 +632,7 @@ mod tests {
                 env: vec![],
                 workdir: None,
                 pty: false,
+                exact_environment: false,
             })
             .await;
         assert!(matches!(result, Err(BackendError::Terminated(_))));
@@ -603,6 +649,7 @@ mod tests {
                 env: vec![],
                 workdir: None,
                 pty: false,
+                exact_environment: false,
             })
             .await;
         assert!(matches!(result, Err(BackendError::Process(_))));
@@ -622,6 +669,7 @@ mod tests {
                     env: vec![],
                     workdir: None,
                     pty: false,
+                    exact_environment: false,
                 })
                 .await
         });
@@ -653,6 +701,7 @@ mod tests {
                 env: vec![],
                 workdir: None,
                 pty: false,
+                exact_environment: false,
             })
         })
         .await
@@ -684,6 +733,7 @@ mod tests {
                 env: vec![],
                 workdir: None,
                 pty: false,
+                exact_environment: false,
             })
             .await
             .expect("spawn exec");
@@ -703,6 +753,7 @@ mod tests {
                 env: vec![],
                 workdir: None,
                 pty: true,
+                exact_environment: false,
             })
             .await
             .expect("spawn pty exec");

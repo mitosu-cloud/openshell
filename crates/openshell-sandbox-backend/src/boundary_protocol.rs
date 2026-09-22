@@ -915,6 +915,8 @@ pub struct ExecSpecWire {
     pub program: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    #[serde(default)]
+    pub exact_environment: bool,
     pub workdir: Option<String>,
     pub pty: bool,
 }
@@ -925,6 +927,7 @@ impl From<ExecSpec> for ExecSpecWire {
             program: spec.program,
             args: spec.args,
             env: spec.env,
+            exact_environment: spec.exact_environment,
             workdir: spec.workdir,
             pty: spec.pty,
         }
@@ -937,6 +940,7 @@ impl From<ExecSpecWire> for ExecSpec {
             program: spec.program,
             args: spec.args,
             env: spec.env,
+            exact_environment: spec.exact_environment,
             workdir: spec.workdir,
             pty: spec.pty,
         }

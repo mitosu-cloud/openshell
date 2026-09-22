@@ -744,6 +744,7 @@ impl russh::server::Handler for SshHandler {
                     env: vec![],
                     workdir: None,
                     pty: false,
+                    exact_environment: false,
                 },
             )
             .await?;
@@ -935,6 +936,7 @@ impl SshHandler {
                 env,
                 workdir: decoded.workdir,
                 pty: pty_requested,
+                exact_environment: true,
             }
         } else {
             let (program, args) = command.map_or_else(
@@ -958,6 +960,7 @@ impl SshHandler {
                 env: term_env,
                 workdir: None,
                 pty: pty_requested,
+                exact_environment: false,
             }
         };
         self.start_exec_spec(channel, handle, spec).await?;

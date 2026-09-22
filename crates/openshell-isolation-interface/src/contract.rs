@@ -745,8 +745,12 @@ pub struct ExecSpec {
     pub program: String,
     /// Program arguments.
     pub args: Vec<String>,
-    /// Extra environment over the boundary's base.
+    /// Extra environment over the boundary's base, or the complete child
+    /// environment when `exact_environment` is set.
     pub env: Vec<(String, String)>,
+    /// DIRECT exec receives only `env`; shell and SFTP sessions retain the
+    /// boundary's normal identity, provider, and TLS environment.
+    pub exact_environment: bool,
     /// Working directory, if any.
     pub workdir: Option<String>,
     /// Whether to allocate a PTY.
