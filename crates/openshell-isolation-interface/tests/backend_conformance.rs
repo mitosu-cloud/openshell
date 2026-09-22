@@ -53,7 +53,6 @@ fn provisioning_evidence_binds_native_facts_to_the_generation() {
         provisioning_evidence("generation-1", b"different-native-evidence").evidence_digest,
     );
 }
-
 #[test]
 fn sha256_digest_rejects_signed_hex_chunks() {
     let signed = format!("+0{}", "00".repeat(31));

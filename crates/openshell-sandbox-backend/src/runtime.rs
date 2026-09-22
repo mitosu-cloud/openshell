@@ -3820,6 +3820,7 @@ mod tests {
                 env: Vec::new(),
                 workdir: None,
                 pty: false,
+                exact_environment: false,
             },
         )
         .await
