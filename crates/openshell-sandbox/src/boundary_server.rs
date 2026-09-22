@@ -6622,6 +6622,7 @@ mod linux {
                 shell: None,
                 runtime_helper: None,
                 env: Vec::new(),
+                exact_environment: false,
                 workdir: None,
                 pty: false,
             };
@@ -6918,6 +6919,7 @@ mod linux {
                 shell: None,
                 runtime_helper: None,
                 env: Vec::new(),
+                exact_environment: false,
                 workdir: None,
                 pty: false,
             };
@@ -7017,6 +7019,7 @@ mod linux {
                     shell: None,
                     runtime_helper: None,
                     env: Vec::new(),
+                    exact_environment: false,
                     workdir: None,
                     pty: false,
                 };
@@ -7061,6 +7064,7 @@ mod linux {
                             shell: None,
                             runtime_helper: None,
                             env: Vec::new(),
+                            exact_environment: false,
                             workdir: None,
                             pty: false,
                         }

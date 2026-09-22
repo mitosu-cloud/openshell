@@ -1174,6 +1174,8 @@ pub struct ExecSpecWire {
     #[serde(default)]
     pub runtime_helper: Option<RuntimeHelperWire>,
     pub env: Vec<(String, String)>,
+    #[serde(default)]
+    pub exact_environment: bool,
     pub workdir: Option<String>,
     pub pty: bool,
 }
@@ -1220,6 +1222,7 @@ impl From<ExecSpec> for ExecSpecWire {
                 }
             }),
             env: spec.env,
+            exact_environment: spec.exact_environment,
             workdir: spec.workdir,
             pty: spec.pty,
         }
@@ -1238,6 +1241,7 @@ impl From<ExecSpecWire> for ExecSpec {
                 }
             }),
             env: spec.env,
+            exact_environment: spec.exact_environment,
             workdir: spec.workdir,
             pty: spec.pty,
         }
@@ -1726,6 +1730,7 @@ mod tests {
                 shell: None,
                 runtime_helper: None,
                 env: Vec::new(),
+                exact_environment: false,
                 workdir: None,
                 pty: false,
             },
@@ -1934,6 +1939,7 @@ mod tests {
 
         assert_eq!(wire.shell, None);
         assert_eq!(wire.runtime_helper, None);
+        assert!(!wire.exact_environment);
     }
 
     #[test]
@@ -1944,6 +1950,7 @@ mod tests {
             shell: None,
             runtime_helper: Some(openshell_isolation_interface::contract::RuntimeHelper::Sftp),
             env: Vec::new(),
+            exact_environment: false,
             workdir: None,
             pty: false,
         };

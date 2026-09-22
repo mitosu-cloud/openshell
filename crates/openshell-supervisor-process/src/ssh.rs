@@ -889,6 +889,7 @@ impl russh::server::Handler for SshHandler {
                     env: vec![],
                     workdir: None,
                     pty: false,
+                    exact_environment: false,
                 },
             )
             .await?;
@@ -1155,6 +1156,7 @@ impl SshHandler {
                 }),
                 runtime_helper: None,
                 env: Vec::new(),
+                exact_environment: false,
                 workdir: None,
                 pty: false,
             };
@@ -1271,6 +1273,7 @@ impl SshHandler {
                 env,
                 workdir: decoded.workdir,
                 pty: pty_requested,
+                exact_environment: true,
             }
         } else {
             openshell_isolation_interface::contract::ExecSpec {
@@ -1284,6 +1287,7 @@ impl SshHandler {
                 env: term_env,
                 workdir: None,
                 pty: pty_requested,
+                exact_environment: false,
             }
         };
         self.start_exec_spec(channel, handle, spec).await?;

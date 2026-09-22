@@ -336,8 +336,12 @@ pub struct ExecSpec {
     /// Trusted helper implemented by the sandbox runtime. This intent is set
     /// only by supervisor-owned protocol adapters, never by public exec APIs.
     pub runtime_helper: Option<RuntimeHelper>,
-    /// Extra environment over the boundary's base.
+    /// Extra environment over the boundary's base, or the complete child
+    /// environment when `exact_environment` is set.
     pub env: Vec<(String, String)>,
+    /// DIRECT exec receives only `env`; shell and SFTP sessions retain the
+    /// boundary's normal identity, provider, and TLS environment.
+    pub exact_environment: bool,
     /// Working directory, if any.
     pub workdir: Option<String>,
     /// Whether to allocate a PTY.

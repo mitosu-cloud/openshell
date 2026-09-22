@@ -895,6 +895,7 @@ mod tests {
                 shell: None,
                 runtime_helper: None,
                 env: Vec::new(),
+                exact_environment: false,
                 workdir: None,
                 pty: false,
             }),

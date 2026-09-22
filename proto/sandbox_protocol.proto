@@ -278,6 +278,8 @@ message ExecSpec {
   repeated EnvironmentEntry env = 5 [(openshell.options.v1.secret) = true];
   optional string workdir = 6;
   bool pty = 7;
+  // DIRECT exec receives exactly the requested environment when set.
+  bool exact_environment = 8;
 }
 message EnvironmentEntry {
   string name = 1;

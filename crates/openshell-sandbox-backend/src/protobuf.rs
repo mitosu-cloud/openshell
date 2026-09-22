@@ -206,6 +206,7 @@ impl WireMessage for w::ExecSpecWire {
                 .collect(),
             workdir: self.workdir.clone(),
             pty: self.pty,
+            exact_environment: self.exact_environment,
         })
     }
     fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
@@ -223,6 +224,7 @@ impl WireMessage for w::ExecSpecWire {
             env: v.env.into_iter().map(|v| (v.name, v.value)).collect(),
             workdir: v.workdir,
             pty: v.pty,
+            exact_environment: v.exact_environment,
         })
     }
 }
@@ -847,6 +849,7 @@ mod tests {
                 shell: None,
                 runtime_helper: None,
                 env: vec![],
+                exact_environment: false,
                 workdir: None,
                 pty: false,
             },
