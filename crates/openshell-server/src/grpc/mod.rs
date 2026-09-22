@@ -427,6 +427,13 @@ impl OpenShell for OpenShellService {
         sandbox::handle_exec_sandbox_interactive(&self.state, request).await
     }
 
+    async fn provision_sandbox_file(
+        &self,
+        request: Request<openshell_core::proto::ProvisionSandboxFileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProvisionSandboxFileResponse>, Status> {
+        sandbox::handle_provision_sandbox_file(&self.state, request).await
+    }
+
     // --- SSH sessions ---
 
     async fn create_ssh_session(

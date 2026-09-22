@@ -1971,6 +1971,78 @@ fn pty_dimensions(cols: u32, rows: u32) -> (u32, u32) {
     )
 }
 
+const MAX_PRIVATE_FILE_BYTES: usize = 256 * 1024;
+
+pub(super) async fn handle_provision_sandbox_file(
+    state: &Arc<ServerState>,
+    request: Request<openshell_core::proto::ProvisionSandboxFileRequest>,
+) -> Result<Response<openshell_core::proto::ProvisionSandboxFileResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let request = request.into_inner();
+    if request.sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+    if request.mode != 0o600 {
+        return Err(Status::invalid_argument("credential files must be mode 0600"));
+    }
+    if request.contents.is_empty() || request.contents.len() > MAX_PRIVATE_FILE_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "private file must contain 1..={MAX_PRIVATE_FILE_BYTES} bytes"
+        )));
+    }
+    validate_private_file_path(&request.path)?;
+    let sandbox = fetch_and_authorize_sandbox(state, &principal, &request.sandbox_id).await?;
+    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
+        return Err(Status::failed_precondition("sandbox is not ready"));
+    }
+    let sandbox_id = sandbox.object_id().to_string();
+    let result = state
+        .supervisor_sessions
+        .provision_private_file(
+            &sandbox_id,
+            request.path,
+            request.mode,
+            request.contents,
+            request.overwrite,
+        )
+        .await?;
+    if !result.success {
+        return Err(Status::failed_precondition(if result.error.is_empty() {
+            "private file provisioning failed".to_string()
+        } else {
+            result.error
+        }));
+    }
+    Ok(Response::new(
+        openshell_core::proto::ProvisionSandboxFileResponse {
+            written: result.written,
+            length: result.length,
+            mode: result.mode,
+        },
+    ))
+}
+
+fn validate_private_file_path(path: &str) -> Result<(), Status> {
+    if !path.starts_with('/') || path.contains('\0') || path.contains("//") {
+        return Err(Status::invalid_argument(
+            "private file path must be absolute",
+        ));
+    }
+    if path.split('/').skip(1).any(|part| {
+        part.is_empty() || part == "." || part == ".." || part.contains(['\\', '\n'])
+    }) {
+        return Err(Status::invalid_argument(
+            "private file path must not contain '.' or '..'",
+        ));
+    }
+    if path == "/.openshell" || path.starts_with("/.openshell/") {
+        return Err(Status::invalid_argument(
+            "private file path overlaps /.openshell",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn handle_exec_sandbox(
     state: &Arc<ServerState>,
     request: Request<ExecSandboxRequest>,

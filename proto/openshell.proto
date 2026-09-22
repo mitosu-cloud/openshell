@@ -278,6 +278,19 @@ service OpenShell {
     };
   }
 
+  // Write one private file as the workload identity.
+  //
+  // The bytes stay on this RPC and the supervisor-to-boundary control frame.
+  // They are not placed in argv, the environment, or a shell command.
+  rpc ProvisionSandboxFile(ProvisionSandboxFileRequest)
+      returns (ProvisionSandboxFileResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
   // Create a provider.
   rpc CreateProvider(CreateProviderRequest) returns (ProviderResponse) {
     option (openshell.options.v1.authorization) = {
@@ -1840,6 +1853,23 @@ enum ExecSignal {
   EXEC_SIGNAL_HUP = 4;
 }
 
+// Private file written by the workload identity. Mode must be 0600.
+message ProvisionSandboxFileRequest {
+  string sandbox_id = 1;
+  // Absolute guest path. Parents are created. `..` and `/.openshell` are rejected.
+  string path = 2;
+  uint32 mode = 3;
+  bytes contents = 4;
+  bool overwrite = 5;
+}
+
+message ProvisionSandboxFileResponse {
+  // False when an existing mode-0600 file was kept because overwrite was false.
+  bool written = 1;
+  uint64 length = 2;
+  uint32 mode = 3;
+}
+
 // Execute command request.
 message ExecSandboxRequest {
   reserved 5;
@@ -2937,6 +2967,7 @@ message SupervisorMessage {
     SupervisorHeartbeat heartbeat = 2;
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
+    ProvisionSandboxFileResult provision_sandbox_file_result = 5;
   }
 }
 
@@ -2948,7 +2979,27 @@ message GatewayMessage {
     GatewayHeartbeat heartbeat = 3;
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
+    ProvisionSandboxFileCommand provision_sandbox_file = 6;
   }
+}
+
+// Gateway asks the supervisor to write one private file through the boundary.
+// The contents are not an exec argument.
+message ProvisionSandboxFileCommand {
+  string request_id = 1;
+  string path = 2;
+  uint32 mode = 3;
+  bytes contents = 4;
+  bool overwrite = 5;
+}
+
+message ProvisionSandboxFileResult {
+  string request_id = 1;
+  bool success = 2;
+  string error = 3;
+  bool written = 4;
+  uint64 length = 5;
+  uint32 mode = 6;
 }
 
 // Supervisor identifies itself and the sandbox it manages.

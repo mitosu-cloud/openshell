@@ -152,6 +152,13 @@ impl OpenShell for RelayGateway {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn provision_sandbox_file(
+        &self,
+        _: tonic::Request<openshell_core::proto::ProvisionSandboxFileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProvisionSandboxFileResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     type ForwardTcpStream =
         std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<TcpForwardFrame, Status>> + Send>>;
     async fn forward_tcp(

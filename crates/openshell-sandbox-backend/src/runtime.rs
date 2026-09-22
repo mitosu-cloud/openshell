@@ -641,6 +641,36 @@ impl BoundaryExec for RemoteExec {
         let mut generation = self.publication_generation.lock().await;
         self.synchronize(&mut generation).await
     }
+
+    async fn provision_file(
+        &self,
+        request: openshell_isolation_interface::contract::FileProvisionRequest,
+    ) -> Result<openshell_isolation_interface::contract::FileProvisionResult, BackendError> {
+        let response = self
+            .client
+            .call_idempotent(Request::ProvisionFile {
+                path: request.path,
+                mode: request.mode,
+                contents: request.contents,
+                overwrite: request.overwrite,
+            })
+            .await?;
+        match response {
+            Response::FileProvisioned {
+                written,
+                length,
+                mode,
+            } => Ok(
+                openshell_isolation_interface::contract::FileProvisionResult {
+                    written,
+                    length,
+                    mode,
+                },
+            ),
+            Response::Error { message, .. } => Err(BackendError::Process(message)),
+            other => Err(unexpected_response("file_provisioned", &other)),
+        }
+    }
 }
 
 struct RemoteLoopbackConnector {
@@ -2068,6 +2098,11 @@ mod tests {
                             Request::AcceptNetwork => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Unavailable,
                                 message: "no pending network request".to_string(),
+                            },
+                            Request::ProvisionFile { .. } => Response::FileProvisioned {
+                                written: true,
+                                length: 0,
+                                mode: 0o600,
                             },
                         },
                     }) {

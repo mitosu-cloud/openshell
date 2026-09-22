@@ -4550,6 +4550,7 @@ name = "openshell-sandbox-backend"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "base64",
  "hyper-util",
  "libc",
  "openshell-core",

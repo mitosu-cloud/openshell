@@ -15,10 +15,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen,
-    ReportMainProcessExitRequest, ReportMainProcessExitResponse, Sandbox, SandboxPhase,
-    SessionAccepted, SshRelayTarget, SupervisorMessage, gateway_message, relay_open,
-    supervisor_message,
+    GatewayMessage, ProvisionSandboxFileCommand, ProvisionSandboxFileResult,
+    ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen, ReportMainProcessExitRequest,
+    ReportMainProcessExitResponse, Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget,
+    SupervisorMessage, gateway_message, relay_open, supervisor_message,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
@@ -106,6 +106,8 @@ pub struct SupervisorSessionRegistry {
     sessions: Mutex<HashMap<String, LiveSession>>,
     /// `channel_id` -> oneshot sender for the reverse CONNECT stream.
     pending_relays: Mutex<HashMap<String, PendingRelay>>,
+    /// `request_id` -> private-file result. The map does not retain file bytes.
+    pending_provisions: Mutex<HashMap<String, oneshot::Sender<ProvisionSandboxFileResult>>>,
 }
 
 struct PendingRelay {
@@ -125,9 +127,11 @@ impl std::fmt::Debug for SupervisorSessionRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let session_count = self.sessions.lock().unwrap().len();
         let pending_count = self.pending_relays.lock().unwrap().len();
+        let provision_count = self.pending_provisions.lock().unwrap().len();
         f.debug_struct("SupervisorSessionRegistry")
             .field("sessions", &session_count)
             .field("pending_relays", &pending_count)
+            .field("pending_provisions", &provision_count)
             .finish()
     }
 }
@@ -567,6 +571,60 @@ impl SupervisorSessionRegistry {
         }
 
         Ok((channel_id, relay_rx))
+    }
+
+    /// Ask the supervisor to write one private file through the boundary.
+    ///
+    /// The contents are sent once on the supervisor session and are not logged.
+    pub async fn provision_private_file(
+        &self,
+        sandbox_id: &str,
+        path: String,
+        mode: u32,
+        contents: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<ProvisionSandboxFileResult, Status> {
+        let tx = self
+            .wait_for_session(sandbox_id, Duration::from_secs(15))
+            .await?;
+        let request_id = Uuid::new_v4().to_string();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.pending_provisions
+            .lock()
+            .unwrap()
+            .insert(request_id.clone(), reply_tx);
+        let message = GatewayMessage {
+            payload: Some(gateway_message::Payload::ProvisionSandboxFile(
+                ProvisionSandboxFileCommand {
+                    request_id: request_id.clone(),
+                    path,
+                    mode,
+                    contents,
+                    overwrite,
+                },
+            )),
+        };
+        if tx.send(message).await.is_err() {
+            self.pending_provisions.lock().unwrap().remove(&request_id);
+            return Err(Status::unavailable("supervisor session disconnected"));
+        }
+        match tokio::time::timeout(Duration::from_secs(15), reply_rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err(Status::unavailable("supervisor session disconnected")),
+            Err(_) => {
+                self.pending_provisions.lock().unwrap().remove(&request_id);
+                Err(Status::deadline_exceeded(
+                    "private file provisioning timed out",
+                ))
+            }
+        }
+    }
+
+    pub fn take_provision(
+        &self,
+        request_id: &str,
+    ) -> Option<oneshot::Sender<ProvisionSandboxFileResult>> {
+        self.pending_provisions.lock().unwrap().remove(request_id)
     }
 
     pub fn fail_pending_relay(&self, channel_id: &str, error: String) -> bool {
@@ -1274,6 +1332,24 @@ fn handle_supervisor_message(
                     pending_relay_failed = failed,
                     "supervisor session: relay open failed"
                 );
+            }
+        }
+        Some(supervisor_message::Payload::ProvisionSandboxFileResult(result)) => {
+            let request_id = result.request_id.clone();
+            let success = result.success;
+            match state.supervisor_sessions.take_provision(&request_id) {
+                Some(sender) => {
+                    let _ = sender.send(result);
+                }
+                None => {
+                    info!(
+                        sandbox_id = %sandbox_id,
+                        session_id = %session_id,
+                        request_id = %request_id,
+                        success,
+                        "supervisor session: private file result had no waiter"
+                    );
+                }
             }
         }
         Some(supervisor_message::Payload::RelayClose(close)) => {

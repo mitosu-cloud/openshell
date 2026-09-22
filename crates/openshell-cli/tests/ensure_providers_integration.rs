@@ -556,6 +556,14 @@ impl OpenShell for TestOpenShell {
         )))
     }
 
+    async fn provision_sandbox_file(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ProvisionSandboxFileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProvisionSandboxFileResponse>, Status>
+    {
+        Err(Status::unimplemented("provision_sandbox_file"))
+    }
+
     type ExecSandboxInteractiveStream =
         tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
     async fn exec_sandbox_interactive(

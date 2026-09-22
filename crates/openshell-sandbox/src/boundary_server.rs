@@ -1578,6 +1578,76 @@ mod linux {
             }
         }
 
+        fn provision_private_file(
+            &self,
+            path: String,
+            mode: u32,
+            contents: Vec<u8>,
+            overwrite: bool,
+        ) -> Response {
+            if mode != 0o600 {
+                return guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "credential files must be mode 0600",
+                );
+            }
+            let uid = match self.workload_uid() {
+                Ok(uid) => uid,
+                Err(message) => return guest_error(BoundaryErrorKind::Denied, message),
+            };
+            #[cfg(not(unix))]
+            {
+                let _ = (path, contents, overwrite, uid);
+                return guest_error(
+                    BoundaryErrorKind::Unavailable,
+                    "private file provisioning requires unix",
+                );
+            }
+            #[cfg(unix)]
+            match crate::provision_file::provision_private_file(&path, &contents, overwrite, uid) {
+                Ok(report) => Response::FileProvisioned {
+                    written: report.written,
+                    length: report.length,
+                    mode: report.mode,
+                },
+                Err(message) => guest_error(BoundaryErrorKind::Invalid, message),
+            }
+        }
+
+        fn workload_uid(&self) -> Result<u32, String> {
+            let policy = lock(&self.attached_policy);
+            let Some(policy) = policy.as_ref() else {
+                return Err("workload identity is not bound".into());
+            };
+            let raw = policy
+                .run_as_user
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "workload identity is not bound".to_string())?;
+            if let Ok(uid) = raw.parse::<u32>() {
+                if uid == 0 {
+                    return Err("workload identity must not be root".into());
+                }
+                return Ok(uid);
+            }
+            #[cfg(unix)]
+            {
+                let user = nix::unistd::User::from_name(raw)
+                    .map_err(|error| format!("resolving workload identity: {error}"))?
+                    .ok_or_else(|| format!("workload identity '{raw}' does not exist"))?;
+                let uid = user.uid.as_raw();
+                if uid == 0 {
+                    return Err("workload identity must not be root".into());
+                }
+                return Ok(uid);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = raw;
+                Err("private file provisioning requires a unix workload identity".into())
+            }
+        }
+
         fn authorize_request(
             &self,
             principal: &SandboxProtocolPrincipal,
@@ -1912,6 +1982,12 @@ mod linux {
                 Request::Wait { process_id } => self.wait(&process_id),
                 Request::Signal { process_id, signal } => self.signal(&process_id, signal),
                 Request::Terminate { process_id } => self.terminate(&process_id),
+                Request::ProvisionFile {
+                    path,
+                    mode,
+                    contents,
+                    overwrite,
+                } => self.provision_private_file(path, mode, contents, overwrite),
                 Request::ExecSignal { process_id, signal } => self.signal_exec(&process_id, signal),
                 Request::Resize {
                     process_id,

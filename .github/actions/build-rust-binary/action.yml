@@ -29,6 +29,10 @@ inputs:
     description: Additional flags passed to cargo build
     required: false
     default: ""
+  entitlements:
+    description: macOS entitlements plist applied to this binary only, after verification and before upload. Ignored when empty. Refused on other operating systems.
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -76,6 +80,22 @@ runs:
         "$binary" --version | grep -q "^${INPUTS_BINARY} "
         # Confirm Syft can decode the embedded cargo-auditable metadata.
         SYFT_CHECK_FOR_APP_UPDATE=false syft "file:${binary}" -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
+
+    - name: Codesign ${{ inputs.binary }}
+      if: inputs.entitlements != ''
+      shell: bash
+      env:
+        INPUTS_BINARY: ${{ inputs.binary }}
+        INPUTS_TRIPLE: ${{ inputs.triple }}
+        INPUTS_ENTITLEMENTS: ${{ inputs.entitlements }}
+      run: |
+        if [ "$(uname -s)" != Darwin ]; then
+          echo "entitlements are applied only on macOS, and only to the named binary" >&2
+          exit 1
+        fi
+        binary="target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY}"
+        codesign --force --sign - --entitlements "$INPUTS_ENTITLEMENTS" "$binary"
+        codesign --verify --strict --verbose=2 "$binary"
 
     - name: Upload ${{ inputs.binary }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

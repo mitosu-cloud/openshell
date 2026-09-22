@@ -559,6 +559,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn provision_sandbox_file(
+        &self,
+        _: tonic::Request<proto::ProvisionSandboxFileRequest>,
+    ) -> Result<Response<proto::ProvisionSandboxFileResponse>, Status> {
+        Err(Status::unimplemented("provision_sandbox_file"))
+    }
+
     async fn create_provider(
         &self,
         _: tonic::Request<proto::CreateProviderRequest>,
