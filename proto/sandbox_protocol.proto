@@ -65,8 +65,8 @@ message StdinClosed {}
 // not authorize behavior: send behavior-affecting additions only after
 // negotiating the receiver's supporting capability. No client digest required.
 // Replayable mutations: Attach, Confirm, StartAgent, UpdateProviderEnvironment,
-// Exec, Signal, Terminate, TerminateBoundary, and Resize. Exec outcomes remain
-// retained through the deadline even after process exit.
+// Exec, Signal, Terminate, TerminateBoundary, Resize, and ProvisionFile. Exec
+// outcomes remain retained through the deadline even after process exit.
 message RequestEnvelope {
   string request_id = 1;
   oneof request {
@@ -85,6 +85,7 @@ message RequestEnvelope {
     LoopbackConnect loopback_connect = 24;
     OpenMediation open_mediation = 25;
     AcceptNetwork accept_network = 26;
+    ProvisionFile provision_file = 27;
   }
 }
 message ResponseEnvelope {
@@ -106,6 +107,7 @@ message ResponseEnvelope {
     MediationReady mediation_ready = 24;
     NetworkConnected network_connected = 25;
     Error error = 26;
+    FileProvisioned file_provisioned = 27;
   }
 }
 // Read-only image-policy discovery, permitted before attachment.
@@ -172,6 +174,12 @@ message LoopbackConnect {
 }
 message OpenMediation {}
 message AcceptNetwork {}
+message ProvisionFile {
+  string path = 1;
+  uint32 mode = 2;
+  bytes contents = 3 [(openshell.options.v1.secret) = true];
+  bool overwrite = 4;
+}
 
 // No image policy is yaml absent with invalid=false. invalid=true reports an
 // unreadable or invalid image policy; it must not be treated as missing.
@@ -220,6 +228,11 @@ message NetworkConnected {
   uint64 policy_generation = 4;
   // Omitted timing means unmeasured (zero).
   MediationTiming timing = 5;
+}
+message FileProvisioned {
+  bool written = 1;
+  uint64 length = 2;
+  uint32 mode = 3;
 }
 message Error {
   BoundaryErrorKind kind = 1;

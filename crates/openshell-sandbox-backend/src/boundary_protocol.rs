@@ -28,7 +28,7 @@ use openshell_isolation_interface::contract::{
     BoundarySignal, ExecSpec, ExecutableIdentity, ProvisioningEvidence, ResolveError, ShellSpec,
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
@@ -211,7 +211,7 @@ impl FromStr for SupervisorInstanceId {
 impl Serialize for SupervisorInstanceId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer,
+        S: Serializer,
     {
         serializer.collect_str(self)
     }
@@ -220,7 +220,7 @@ impl Serialize for SupervisorInstanceId {
 impl<'de> Deserialize<'de> for SupervisorInstanceId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
         value.parse().map_err(|_| {
@@ -815,6 +815,37 @@ pub enum Request {
     /// plane.
     OpenMediation,
     AcceptNetwork,
+    /// Write one private file as the workload identity. Contents are base64
+    /// on the wire so a credential does not expand into a JSON number array.
+    ProvisionFile {
+        path: String,
+        mode: u32,
+        #[serde(with = "contents_base64")]
+        contents: Vec<u8>,
+        overwrite: bool,
+    },
+}
+
+mod contents_base64 {
+    use super::{Deserialize, Deserializer, Serializer};
+    use base64::Engine;
+
+    pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl Request {
@@ -833,6 +864,7 @@ impl Request {
                 | Self::Terminate { .. }
                 | Self::TerminateBoundary
                 | Self::Resize { .. }
+                | Self::ProvisionFile { .. }
         )
     }
 }
@@ -921,6 +953,18 @@ impl fmt::Debug for Request {
                 .finish(),
             Self::OpenMediation => formatter.write_str("OpenMediation"),
             Self::AcceptNetwork => formatter.write_str("AcceptNetwork"),
+            Self::ProvisionFile {
+                path,
+                mode,
+                contents,
+                overwrite,
+            } => formatter
+                .debug_struct("ProvisionFile")
+                .field("path", path)
+                .field("mode", mode)
+                .field("contents_len", &contents.len())
+                .field("overwrite", overwrite)
+                .finish(),
         }
     }
 }
@@ -981,6 +1025,11 @@ pub enum Response {
         socket: Option<openshell_isolation_interface::contract::NetworkSocketMetadata>,
         policy_generation: u64,
         timing: MediationTimingWire,
+    },
+    FileProvisioned {
+        written: bool,
+        length: u64,
+        mode: u32,
     },
     Error {
         kind: BoundaryErrorKind,

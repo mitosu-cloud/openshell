@@ -359,6 +359,36 @@ pub struct ShellSpec {
     pub login: bool,
 }
 
+/// One private file for a boundary provisioning operation.
+///
+/// `Debug` reports the length only. The bytes are a credential.
+pub struct FileProvisionRequest {
+    pub path: String,
+    pub mode: u32,
+    pub contents: Vec<u8>,
+    pub overwrite: bool,
+}
+
+impl fmt::Debug for FileProvisionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileProvisionRequest")
+            .field("path", &self.path)
+            .field("mode", &self.mode)
+            .field("contents_len", &self.contents.len())
+            .field("overwrite", &self.overwrite)
+            .finish()
+    }
+}
+
+/// Result of a private-file write. `mode` is the mode actually applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileProvisionResult {
+    pub written: bool,
+    pub length: u64,
+    pub mode: u32,
+}
+
 /// Evidence that the running workload boundary installed one provider snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderEnvironmentInstallation {

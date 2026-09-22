@@ -27,6 +27,8 @@ pub mod perf;
 pub mod process;
 #[cfg(target_os = "linux")]
 mod provider_files;
+#[cfg(unix)]
+mod provision_file;
 #[cfg(target_os = "linux")]
 mod pty;
 #[cfg(target_os = "linux")]

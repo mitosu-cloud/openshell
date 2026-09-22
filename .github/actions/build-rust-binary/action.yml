@@ -30,7 +30,7 @@ inputs:
     required: false
     default: ""
   entitlements-file:
-    description: Path to an entitlements plist for macOS ad-hoc codesigning (skipped when empty or not on macOS)
+    description: macOS entitlements plist applied to this binary only, after verification and before upload. Ignored when empty. Refused on other operating systems.
     required: false
     default: ""
 runs:
@@ -70,14 +70,21 @@ runs:
         # Confirm Syft can decode the embedded cargo-auditable metadata.
         SYFT_CHECK_FOR_APP_UPDATE=false syft "file:${binary}" -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
 
-    - name: Codesign with entitlements
-      if: inputs.entitlements-file != '' && runner.os == 'macOS'
+    - name: Codesign ${{ inputs.binary }}
+      if: inputs.entitlements-file != ''
       shell: bash
       env:
-        INPUTS_ENTITLEMENTS: ${{ inputs.entitlements-file }}
-        INPUTS_TRIPLE: ${{ inputs.triple }}
         INPUTS_BINARY: ${{ inputs.binary }}
-      run: /usr/bin/codesign --entitlements "${INPUTS_ENTITLEMENTS}" --force -s - "target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY}"
+        INPUTS_TRIPLE: ${{ inputs.triple }}
+        INPUTS_ENTITLEMENTS: ${{ inputs.entitlements-file }}
+      run: |
+        if [ "$(uname -s)" != Darwin ]; then
+          echo "entitlements are applied only on macOS, and only to the named binary" >&2
+          exit 1
+        fi
+        binary="target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY}"
+        /usr/bin/codesign --force --sign - --entitlements "$INPUTS_ENTITLEMENTS" "$binary"
+        /usr/bin/codesign --verify --strict --verbose=2 "$binary"
 
     - name: Upload ${{ inputs.binary }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
