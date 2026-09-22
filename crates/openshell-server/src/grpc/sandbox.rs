@@ -3931,6 +3931,7 @@ async fn run_interactive_exec_with_russh(
     // A detached stdin task would survive operation timeout and retain the SSH
     // channel. Normal request EOF closes stdin only, never the output channel.
     let input = async {
+        let mut stdin_eof = false;
         while let Some(msg) = input_stream.next().await {
             // Even ignored non-PTY resize frames must cooperate with output
             // and cancellation when the request stream stays continuously ready.
@@ -3938,6 +3939,9 @@ async fn run_interactive_exec_with_russh(
             let msg = msg?;
             match msg.payload {
                 Some(Payload::Stdin(data)) => {
+                    if stdin_eof {
+                        return Err(Status::invalid_argument("received stdin after stdin EOF"));
+                    }
                     write_half
                         .data(std::io::Cursor::new(data))
                         .await
@@ -3954,11 +3958,18 @@ async fn run_interactive_exec_with_russh(
                     }
                 }
                 Some(Payload::StdinEof(_)) => {
-                    let _ = write_half.eof().await;
+                    if !stdin_eof {
+                        write_half.eof().await.map_err(|_| {
+                            Status::unavailable("exec relay failed while closing stdin")
+                        })?;
+                        stdin_eof = true;
+                    }
                 }
                 Some(Payload::Signal(signal)) => {
                     if let Some(sig) = map_exec_signal(signal) {
-                        let _ = write_half.signal(sig).await;
+                        write_half.signal(sig).await.map_err(|_| {
+                            Status::unavailable("exec relay failed while sending signal")
+                        })?;
                     }
                 }
                 Some(Payload::Start(_)) | None => {
@@ -3968,10 +3979,14 @@ async fn run_interactive_exec_with_russh(
                 }
             }
         }
-        write_half
-            .eof()
-            .await
-            .map_err(|_| Status::unavailable("exec relay failed while closing stdin"))
+        if stdin_eof {
+            Ok(())
+        } else {
+            write_half
+                .eof()
+                .await
+                .map_err(|_| Status::unavailable("exec relay failed while closing stdin"))
+        }
     };
 
     let output = async {
