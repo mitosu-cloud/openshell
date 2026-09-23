@@ -680,7 +680,7 @@ async fn preauthorize_transparent_open(
         match resolve_transparent_target(destination, policy_dns_store, opa_engine) {
             Ok(target) => target,
             Err(error) => {
-                warn!(%destination, %error, "Denied staged transparent connection");
+                warn!(%destination, %error, "Denied staged transparent connection: {error}");
                 emit_staged_transparent_denial(
                     destination,
                     None,
