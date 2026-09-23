@@ -575,7 +575,7 @@ async fn preauthorize_transparent_open(
     let host = match transparent_destination_host(destination, policy_dns_store, opa_engine) {
         Ok(host) => host,
         Err(error) => {
-            warn!(%destination, %error, "Denied staged transparent connection");
+            warn!(%destination, %error, "Denied staged transparent connection: {error}");
             emit_staged_transparent_denial(
                 destination,
                 &binary_identity,
