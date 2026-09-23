@@ -1234,6 +1234,7 @@ async fn handle_transparent_tcp_connection(
         String::new(),
         relay::RelaySignals {
             activity: activity_tx.clone(),
+            denial: denial_tx.clone(),
             endpoint_observation: None,
         },
     );
@@ -3031,6 +3032,7 @@ async fn handle_mediated_connection(
         workspace,
         relay::RelaySignals {
             activity: activity_tx.clone(),
+            denial: denial_tx.clone(),
             endpoint_observation: endpoint_observation_tx,
         },
     );
@@ -5685,6 +5687,7 @@ async fn handle_forward_proxy(
         workspace,
         relay::RelaySignals {
             activity: activity_tx.cloned(),
+            denial: denial_tx.cloned(),
             endpoint_observation: endpoint_observation_tx,
         },
     );
