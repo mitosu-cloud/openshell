@@ -38,6 +38,9 @@ pub(super) struct RelayContext<'a> {
 pub(super) struct RelaySignals {
     /// Receives general sandbox network activity.
     pub(super) activity: Option<ActivitySender>,
+    /// Enforced L7 denials for policy-advisor aggregation.
+    pub(super) denial:
+        Option<tokio::sync::mpsc::UnboundedSender<openshell_core::denial::DenialEvent>>,
     /// Receives terminal tool server results for endpoint status reporting.
     pub(super) endpoint_observation: Option<EndpointObservationSender>,
 }
@@ -97,6 +100,7 @@ pub(super) fn http_context(
         provider_credential_installation_id: None,
         body_classifier: None,
         activity_tx: signals.activity,
+        denial_tx: signals.denial,
         token_grant_resolver,
         agent_proposals,
         workspace,
@@ -397,6 +401,7 @@ mod tests {
             provider_credential_installation_id: None,
             body_classifier: None,
             activity_tx: None,
+            denial_tx: None,
             token_grant_resolver: None,
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
             workspace: String::new(),
