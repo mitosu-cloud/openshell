@@ -103,6 +103,25 @@ pub fn canonicalize_advisor_add_rule(
     sandbox_owners.sort();
 
     let mut contract = contract;
+    // L7 denials carry the exact denied method and path. Keep the existing
+    // inspection contract, but include those observed allows in the candidate
+    // so a reviewer sees the actual permission being added. Observation-only
+    // L4 proposals have no rules and retain the old behavior.
+    if !incoming_endpoint.rules.is_empty() {
+        if !incoming_endpoint.protocol.eq_ignore_ascii_case("rest")
+            || !contract.protocol.eq_ignore_ascii_case("rest")
+            || !incoming_endpoint
+                .enforcement
+                .eq_ignore_ascii_case("enforce")
+            || !contract.enforcement.eq_ignore_ascii_case("enforce")
+        {
+            return Err(format!(
+                "cannot append observed L7 paths to the existing {}:{} contract",
+                incoming_endpoint.host, port
+            ));
+        }
+        append_unique_l7_rules(&mut contract.rules, &incoming_endpoint.rules);
+    }
     let target_name = if let Some(owner) = sandbox_owners.first() {
         if let Some(endpoint) =
             base_policy.network_policies[owner]
@@ -2457,6 +2476,56 @@ mod tests {
                 }],
             },
         ]
+    }
+
+    #[test]
+    fn canonicalize_advisor_retains_denied_rest_path_on_existing_endpoint() {
+        let mut existing_endpoint = endpoint("example.com", 443);
+        existing_endpoint.protocol = "rest".to_string();
+        existing_endpoint.enforcement = "enforce".to_string();
+        existing_endpoint.rules = vec![rest_rule("GET", "/allowed")];
+        let mut base = SandboxPolicy::default();
+        base.network_policies.insert(
+            "draft_seed".to_string(),
+            NetworkPolicyRule {
+                name: "draft_seed".to_string(),
+                endpoints: vec![existing_endpoint],
+                binaries: vec![binary("/usr/bin/curl")],
+            },
+        );
+        let mut observed = endpoint("example.com", 443);
+        observed.protocol = "rest".to_string();
+        observed.enforcement = "enforce".to_string();
+        observed.rules = vec![rest_rule("GET", "/")];
+        observed.advisor_proposed = true;
+        let incoming = NetworkPolicyRule {
+            name: "allow_example_com_443".to_string(),
+            endpoints: vec![observed],
+            binaries: vec![binary("/usr/bin/curl")],
+        };
+
+        let (name, canonical) =
+            canonicalize_advisor_add_rule(&base, &base, "allow_example_com_443", &incoming)
+                .unwrap();
+        assert_eq!(name, "draft_seed");
+        assert_eq!(
+            canonical.endpoints[0].rules,
+            vec![rest_rule("GET", "/allowed"), rest_rule("GET", "/")]
+        );
+        let merged = merge_policy(
+            base,
+            &[PolicyMergeOp::AddRule {
+                rule_name: name,
+                rule: canonical,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            merged.policy.network_policies["draft_seed"].endpoints[0]
+                .rules
+                .len(),
+            2
+        );
     }
 
     #[test]

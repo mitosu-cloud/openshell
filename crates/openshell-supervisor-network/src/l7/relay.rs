@@ -22,6 +22,7 @@ use crate::l7::{EndpointObserver, EnforcementMode, L7EndpointConfig, L7Protocol,
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::activity::{ActivitySender, try_record_activity};
+use openshell_core::denial::DenialEvent;
 use openshell_core::endpoint_status::{EndpointObservationSender, EndpointResult};
 use openshell_core::secrets::{self, SecretResolver};
 use openshell_ocsf::{
@@ -33,6 +34,7 @@ use openshell_ocsf::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc as denial_mpsc;
 use tracing::{debug, warn};
 
 /// Context for L7 request policy evaluation.
@@ -68,6 +70,8 @@ pub struct L7EvalContext {
     pub(crate) body_classifier: Option<Arc<secrets::body::BodyCredentialClassifier>>,
     /// Anonymous activity counter channel.
     pub(crate) activity_tx: Option<ActivitySender>,
+    /// Operator-review draft summaries for enforced L7 denials.
+    pub(crate) denial_tx: Option<denial_mpsc::UnboundedSender<DenialEvent>>,
     /// Dynamic credentials (token grants) keyed by endpoint-bound provider metadata.
     pub(crate) dynamic_credentials: Option<
         Arc<
@@ -864,6 +868,7 @@ where
         let Some(config) = select_l7_config_for_path(configs, &route_target) else {
             let reason = "no L7 endpoint path matched request";
             emit_l7_request_log(ctx, &req.action, &route_target, "deny", "l7", reason, None);
+            emit_l7_denial_summary(ctx, &req.action, &route_target, reason);
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
@@ -1305,6 +1310,21 @@ fn select_l7_config_for_path<'a>(
         .iter()
         .filter(|config| config.matches_path(path))
         .max_by_key(|config| config.path_specificity())
+}
+
+fn emit_l7_denial_summary(ctx: &L7EvalContext, method: &str, path: &str, reason: &str) {
+    if let Some(tx) = &ctx.denial_tx {
+        let _ = tx.send(DenialEvent {
+            host: ctx.host.clone(),
+            port: ctx.port,
+            binary: ctx.binary_path.clone(),
+            ancestors: ctx.ancestors.clone(),
+            deny_reason: reason.to_string(),
+            denial_stage: "l7".into(),
+            l7_method: Some(method.to_string()),
+            l7_path: Some(path.to_string()),
+        });
+    }
 }
 
 fn emit_l7_request_log(
@@ -1829,6 +1849,9 @@ where
                 ))
                 .build();
             ocsf_emit!(event);
+            if decision_str == "deny" {
+                emit_l7_denial_summary(ctx, &request_info.action, &redacted_target, &reason);
+            }
         }
 
         if allowed || config.enforcement == EnforcementMode::Audit {
@@ -3360,6 +3383,31 @@ mod tests {
     use std::collections::HashMap as TestHashMap;
     use std::path::PathBuf;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn enforced_l7_denial_reaches_draft_aggregator_without_query() {
+        let (denial_tx, mut denial_rx) = denial_mpsc::unbounded_channel();
+        let ctx = L7EvalContext {
+            host: "example.com".into(),
+            port: 443,
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec!["/usr/bin/bash".into()],
+            denial_tx: Some(denial_tx),
+            ..Default::default()
+        };
+
+        emit_l7_denial_summary(&ctx, "GET", "/private", "GET /private not permitted");
+        let event = denial_rx
+            .try_recv()
+            .expect("the aggregator receives the denial");
+        assert_eq!(event.host, "example.com");
+        assert_eq!(event.port, 443);
+        assert_eq!(event.binary, "/usr/bin/curl");
+        assert_eq!(event.ancestors, ["/usr/bin/bash"]);
+        assert_eq!(event.denial_stage, "l7");
+        assert_eq!(event.l7_method.as_deref(), Some("GET"));
+        assert_eq!(event.l7_path.as_deref(), Some("/private"));
+    }
 
     #[tokio::test]
     async fn body_denial_returns_actionable_local_json() {
