@@ -206,8 +206,11 @@ On graceful gateway shutdown, persisted running intent for Docker, Podman, and
 VM is stopped through the shared `StopSandbox` RPC before any gateway-managed
 driver process exits. The gateway does not persist `Stopped` for this
 infrastructure event. On startup, it reconciles the retained intent through the
-shared idempotent `StartSandbox` RPC before watch processing begins. Explicitly
-`Stopped` sandboxes are excluded from both sweeps. Kubernetes workloads are
+shared idempotent `StartSandbox` RPC before watch processing begins. For a
+still-running VM, a new gateway session supplies a validated launch bundle and
+fresh generation; the driver stops the old guest before starting that generation.
+An empty-bundle duplicate start only succeeds for the generation already
+running. Explicitly `Stopped` sandboxes are excluded from both sweeps. Kubernetes workloads are
 cluster-owned and continue running without gateway shutdown or startup
 lifecycle calls.
 

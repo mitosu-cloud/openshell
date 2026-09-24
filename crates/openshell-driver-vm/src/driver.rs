@@ -1805,27 +1805,41 @@ impl VmDriver {
             )
         };
         if already_running {
-            let active_generation =
-                tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE))
-                    .await
-                    .map_err(|error| {
-                        Status::failed_precondition(format!(
-                            "read active VM sandbox generation: {error}"
-                        ))
-                    })?;
-            if active_generation.trim() != generation.as_str() {
-                return Err(Status::failed_precondition(format!(
-                    "VM sandbox is already running generation {}",
-                    active_generation.trim()
-                )));
-            }
             if launch_authentication.is_empty() {
+                // An unauthenticated duplicate start is only idempotent for
+                // the generation already running; it cannot replace a guest.
+                let active_generation =
+                    tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE))
+                        .await
+                        .map_err(|error| {
+                            Status::failed_precondition(format!(
+                                "read active VM sandbox generation: {error}"
+                            ))
+                        })?;
+                if active_generation.trim() != generation.as_str() {
+                    return Err(Status::failed_precondition(format!(
+                        "VM sandbox is already running generation {}",
+                        active_generation.trim()
+                    )));
+                }
                 return Ok(());
             }
-            // The gateway keeps launch sessions in memory. A non-empty bundle
-            // during startup recovery represents a new gateway session, so
-            // restart the VM before installing it rather than leaving the old
-            // supervisor connected with invalid credentials.
+            // A restarted gateway issues a fresh generation and authenticated
+            // launch bundle. Validate the bundle before stopping the old VM;
+            // then restart it with the new supervisor session.
+            let authentication = serde_json::from_slice::<
+                openshell_core::jwt::SandboxLaunchAuthentication,
+            >(&launch_authentication)
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "decode VM sandbox launch authentication: {error}"
+                ))
+            })?;
+            authentication.validate().map_err(|error| {
+                Status::failed_precondition(format!(
+                    "validate VM sandbox launch authentication: {error}"
+                ))
+            })?;
             self.stop_sandbox(&record_id, sandbox_name).await?;
         }
 
