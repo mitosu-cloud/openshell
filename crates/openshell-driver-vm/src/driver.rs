@@ -2022,21 +2022,23 @@ impl VmDriver {
             )
         };
         if already_running {
-            let active_generation =
-                tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE))
-                    .await
-                    .map_err(|error| {
-                        Status::failed_precondition(format!(
-                            "read active VM sandbox generation: {error}"
-                        ))
-                    })?;
-            if active_generation.trim() != generation.as_str() {
-                return Err(Status::failed_precondition(format!(
-                    "VM sandbox is already running generation {}",
-                    active_generation.trim()
-                )));
-            }
             if launch_authentication.is_empty() {
+                // An unauthenticated duplicate start is only idempotent for
+                // the generation already running; it cannot replace a guest.
+                let active_generation =
+                    tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE))
+                        .await
+                        .map_err(|error| {
+                            Status::failed_precondition(format!(
+                                "read active VM sandbox generation: {error}"
+                            ))
+                        })?;
+                if active_generation.trim() != generation.as_str() {
+                    return Err(Status::failed_precondition(format!(
+                        "VM sandbox is already running generation {}",
+                        active_generation.trim()
+                    )));
+                }
                 return Ok(());
             }
         }

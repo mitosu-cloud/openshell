@@ -15,6 +15,12 @@ MicroVM native restart mechanisms remain disabled. When policy selects a
 replacement, the gateway stops and starts the compute resource while retaining
 the sandbox record and driver-supported persistent storage.
 
+When a gateway restarts, it reconciles retained running intent before watch
+processing begins. A still-running MicroVM receives a validated launch bundle
+and fresh authenticated generation; the VM driver stops the old guest before
+starting that generation. An empty-bundle duplicate start is idempotent only
+for the generation already running.
+
 | Runtime | Driver | Use when |
 |---|---|---|
 | [Docker](#docker-driver) | `docker` | Local development and single-machine gateways. |
