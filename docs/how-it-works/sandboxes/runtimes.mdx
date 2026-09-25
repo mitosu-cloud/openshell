@@ -244,6 +244,11 @@ VM sandboxes have no network interface. All traffic flows through the OpenShell 
 
 If the gateway is briefly unavailable while a VM starts, its supervisor retries the session connection. The sandbox stays in provisioning until the gateway accepts the session.
 
+Before restarting a MicroVM, the driver journal-checks a sparse copy of its
+preserved writable overlay. The repaired copy replaces the original only when
+automatic ext4 recovery succeeds. An unrecoverable overlay remains intact for
+manual recovery.
+
 ### MicroVM Stop Durability
 
 When you run `openshell sandbox stop` while the main process is running, OpenShell terminates the workload and flushes the guest root filesystem before acknowledging termination. The guest waits up to three seconds for the flush. The host allows up to 22 seconds for supervisor shutdown, then up to five seconds to stop the VM.
