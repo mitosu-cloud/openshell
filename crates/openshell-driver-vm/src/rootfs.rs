@@ -368,20 +368,59 @@ pub fn set_rootfs_image_file_mode(
 }
 
 /// Replay the ext4 journal and repair automatically correctable filesystem
-/// state before the driver mutates a preserved guest disk offline.
+/// state before the driver mutates a preserved guest disk offline. Check a
+/// sparse copy: e2fsck can partially change an image even when it returns an
+/// error, and the original must remain available for manual recovery.
 pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
+    let parent = image_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| format!("rootfs image has no parent: {}", image_path.display()))?;
     let mut failures = Vec::new();
     let mut unavailable = Vec::new();
 
     for candidate in e2fs_tool_candidates("e2fsck") {
         let label = candidate.display().to_string();
-        match Command::new(&candidate)
+        let staged = parent.join(format!(
+            ".openshell-overlay-recovery-{}-{}",
+            std::process::id(),
+            INJECTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        if let Err(error) = clone_or_copy_sparse_file(image_path, &staged) {
+            let _ = fs::remove_file(&staged);
+            return Err(error);
+        }
+        let check = Command::new(&candidate)
             .arg("-p")
             .arg("-f")
-            .arg(image_path)
-            .output()
-        {
-            Ok(output) if matches!(output.status.code(), Some(0..=2)) => return Ok(()),
+            .arg(&staged)
+            .output();
+        match check {
+            Ok(output) if matches!(output.status.code(), Some(0..=2)) => {
+                let commit = (|| {
+                    File::open(&staged)
+                        .and_then(|file| file.sync_all())
+                        .map_err(|error| {
+                            format!("sync repaired overlay {}: {error}", staged.display())
+                        })?;
+                    fs::rename(&staged, image_path).map_err(|error| {
+                        format!(
+                            "commit repaired overlay {} to {}: {error}",
+                            staged.display(),
+                            image_path.display()
+                        )
+                    })?;
+                    File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|error| {
+                            format!("sync overlay directory {}: {error}", parent.display())
+                        })
+                })();
+                if commit.is_err() {
+                    let _ = fs::remove_file(&staged);
+                }
+                return commit;
+            }
             Ok(output) => failures.push(format!(
                 "{label} failed with status {}\nstdout: {}\nstderr: {}",
                 output.status,
@@ -392,7 +431,8 @@ pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
                 unavailable.push(format!("{label} not found"));
             }
             Err(error) => failures.push(format!("run {label}: {error}")),
-        }
+        };
+        let _ = fs::remove_file(&staged);
     }
 
     Err(if failures.is_empty() {
@@ -1520,6 +1560,46 @@ mod tests {
             .expect("create ext4 image");
 
         recover_rootfs_image(&image).expect("recover clean ext4 image");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_rootfs_image_preserves_original_when_fsck_cannot_repair() {
+        if !e2fs_tool_candidates("e2fsck")
+            .iter()
+            .any(|candidate| Command::new(candidate).arg("-V").output().is_ok())
+        {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        let image = dir.join("overlay.ext4");
+        fs::create_dir_all(source.join("upper")).expect("create source upperdir");
+        fs::create_dir_all(source.join("work")).expect("create source workdir");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create ext4 image");
+        run_debugfs(&image, "mkdir /upper/orphan").expect("create orphan directory");
+        run_debugfs(&image, "unlink /upper/orphan").expect("unlink orphan directory");
+        let before = sha256_reader(File::open(&image).expect("open image")).expect("hash image");
+
+        let error = recover_rootfs_image(&image).expect_err("orphan directory needs manual repair");
+        assert!(error.contains("UNEXPECTED INCONSISTENCY"), "{error}");
+        let after = sha256_reader(File::open(&image).expect("reopen image")).expect("hash image");
+        assert_eq!(after, before, "failed recovery changed original image");
+        assert_eq!(
+            fs::read_dir(&dir)
+                .expect("read test directory")
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".openshell-overlay-recovery-"))
+                .count(),
+            0,
+            "failed recovery left a staging image"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

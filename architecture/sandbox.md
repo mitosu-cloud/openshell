@@ -444,6 +444,10 @@ credentials, private CA keys, policy, and gateway credentials stay host-side.
 Both libkrun and QEMU guests are NIC-less; intercepted workload connections
 cross the authenticated vsock channel. A gateway-host proxy is addressed as
 `host.openshell.internal`, which the host supervisor normalizes to `127.0.0.1`.
+On restart, the VM driver checks a sparse copy of a preserved guest overlay
+before booting it. It replaces the original disk only after automatic ext4
+recovery succeeds; a failed check leaves the original available for manual
+recovery.
 
 The Docker driver runs `openshell-supervisor` in a separate companion container.
 Its private named volume contains supervisor bootstrap and channel material.
