@@ -178,7 +178,8 @@ Inspect sandbox OCSF configuration and finding events for the validation
 rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
-The published supervisor image uses a shell-free distroless Debian 13 base.
+The published supervisor image uses a shell-free distroless Debian 13 base
+with glibc and the GCC unwind runtime for its GNU-linked executable.
 Use container logs, engine inspection and the configured exec health probe for
 diagnostics; `exec ... sh`, package installation and in-container shell scripts
 are unavailable. Workload shells belong to the separate sandbox image. Preserve
@@ -263,7 +264,7 @@ Common findings:
   upgrade.
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
 - A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: confirm the selected isolation backend advertises TCP mediation, then inspect the sandbox and supervisor logs for protected-channel setup or listener failures. A driver that cannot supply the required outer egress fence and authenticated runtime channel must reject the policy before starting the agent.
-- Supervisor runtime validation fails: verify `supervisor_image` contains a static `/openshell-supervisor` executable from the same release as the sandbox runtime.
+- Supervisor runtime validation fails: run its `/openshell-supervisor --version` entrypoint and inspect loader errors. The GNU-linked supervisor image must supply glibc and `libgcc_s.so.1`; merely containing the executable does not establish that it can run. Use the companion image from the same release as the sandbox runtime.
 - The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
 
@@ -527,8 +528,8 @@ helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage
 The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes.
 
 For vulnerability reports, record the running image digest and scan that exact
-artifact. The gateway includes a pinned Distroless base; the supervisor includes
-Alpine packages updated at image build time. A dependency or base-image fix only
+artifact. The gateway and supervisor include pinned Distroless Debian bases;
+the sandbox runtime image includes Alpine packages updated at image build time. A dependency or base-image fix only
 reaches deployed containers after rebuilding, publishing, and redeploying the
 images. Compare findings against the SBOM for that digest, not just its mutable
 `latest` or `dev` tag.

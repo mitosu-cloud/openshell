@@ -192,9 +192,11 @@ Runtime layout:
 - **Sandbox**: Alpine-based `openshell/sandbox` image containing the static
   musl `/openshell-sandbox` binary and its static VM guest-init helper.
   Drivers stage this binary into the workload trust domain.
-- **Supervisor**: digest-pinned `gcr.io/distroless/base-nossl-debian13` base
+- **Supervisor**: digest-pinned `gcr.io/distroless/cc-debian13:nonroot` base
   with the dynamically linked GNU `/openshell-supervisor` binary. The base
-  supplies glibc and CA roots without a shell, package manager, OpenSSL or zlib.
+  supplies glibc, the GCC unwind library (`libgcc_s.so.1`), and CA roots without
+  a shell or package manager. Image assembly explicitly restores `USER 0` and
+  `WORKDIR /` from the nonroot base.
   GNU supervisor builds must not reference `GLIBC_*` symbols newer than
   `GLIBC_2.28`. Image defaults remain UID 0 and working directory `/`; compute
   drivers set the runtime identity and writable mounts. Docker stages private
