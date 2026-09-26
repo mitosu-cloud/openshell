@@ -227,7 +227,8 @@ Inspect sandbox OCSF configuration and finding events for the validation
 rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
-The published supervisor image uses a shell-free distroless Debian 13 base.
+The published supervisor image uses a shell-free distroless Debian 13 base
+with glibc and the GCC unwind runtime for its GNU-linked executable.
 For custom builds using `SUPERVISOR_BASE_IMAGE`, check the selected base's GNU
 runtime libraries, CA certificates, and inherited user and working directory.
 Use container logs, engine inspection and the configured exec health probe for
@@ -338,7 +339,7 @@ Common findings:
   for the current networking options.
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
 - A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: inspect supervisor and backend logs for policy rejection, network-mediation initialization, protected-channel setup, or listener failures. A backend that cannot enforce the admitted policy must reject it before starting workload code.
-- Supervisor runtime validation fails: verify `supervisor_image` contains an `/openshell-supervisor` executable from the same release as the sandbox runtime, and that the dynamic loader and shared libraries it links against are available inside that image. `docker run --rm --network none --entrypoint /openshell-supervisor <supervisor_image> --version` should print that release; a `no such file or directory` error for a binary that exists means the loader or a library is missing. The supervisor runs from its own image and does not need to be static; only `/openshell-sandbox` must be.
+- Supervisor runtime validation fails: verify `supervisor_image` contains an `/openshell-supervisor` executable from the same release as the sandbox runtime, and that the dynamic loader, glibc, and `libgcc_s.so.1` are available inside that image. `docker run --rm --network none --entrypoint /openshell-supervisor <supervisor_image> --version` should print that release; a `no such file or directory` error for a binary that exists means the loader or a library is missing. The supervisor runs from its own image and does not need to be static; only `/openshell-sandbox` must be.
 - New Docker and Podman sandboxes dial the supervisor over a separate private
   Unix socket volume; the workload keeps `network=none`. Check both containers'
   mounts and socket-directory ownership if attachment times out. Existing
@@ -897,8 +898,8 @@ helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage
 The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes. Kubernetes sandboxes take the configured supervisor and runtime images each time they start, so a sandbox that kept running through an upgrade uses its previous images until its next stop and start.
 
 For vulnerability reports, record the running image digest and scan that exact
-artifact. The gateway includes a pinned Distroless base; the supervisor includes
-Alpine packages updated at image build time. A dependency or base-image fix only
+artifact. The gateway and supervisor include pinned Distroless Debian bases;
+the sandbox runtime image includes Alpine packages updated at image build time. A dependency or base-image fix only
 reaches deployed containers after rebuilding, publishing, and redeploying the
 images. Compare findings against the SBOM for that digest, not just its mutable
 `latest` or `dev` tag.

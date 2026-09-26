@@ -60,6 +60,10 @@ and `SUPERVISOR_BASE_IMAGE` build arguments override their pinned bases. See
 [Container Image Base Overrides](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#container-image-base-overrides)
 for build commands and base compatibility requirements.
 
+The published supervisor image is a shell-free distroless Debian 13 image. It
+includes glibc and the GCC unwind runtime (`libgcc_s.so.1`) required by the
+GNU-linked supervisor executable.
+
 For TLS-enabled Docker, Podman, and MicroVM gateways, set `guest_tls_ca` in
 `[openshell.gateway]` or use the package-managed local CA. Remove the retired
 `guest_tls_cert` and `guest_tls_key` fields. Supervisors receive only the
