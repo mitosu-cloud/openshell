@@ -314,7 +314,8 @@ mise run build:docker:supervisor -- --build-arg SUPERVISOR_BASE_IMAGE=registry.e
 ```
 
 Choose bases that provide the GNU runtime libraries required by the binaries
-and CA certificates for the target architecture. Validate the resulting images
+and CA certificates for the target architecture. The supervisor specifically
+requires the GCC unwind runtime (`libgcc_s.so.1`). Validate the resulting images
 with your deployment. The sandbox image uses `scratch` and has no base override.
 
 ## Main Tasks
