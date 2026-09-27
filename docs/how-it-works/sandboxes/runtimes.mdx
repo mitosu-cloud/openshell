@@ -16,10 +16,14 @@ replacement, the gateway stops and starts the compute resource while retaining
 the sandbox record and driver-supported persistent storage.
 
 When a gateway restarts, it reconciles retained running intent before watch
-processing begins. A still-running MicroVM receives a validated launch bundle
-and fresh authenticated generation; the VM driver stops the old guest before
-starting that generation. An empty-bundle duplicate start is idempotent only
-for the generation already running.
+processing begins. A still-running Docker or MicroVM sandbox receives a
+validated launch bundle and fresh authenticated generation; the driver stops
+the old boundary before starting that generation. Docker retains the exact
+container, writable layer, and volumes, but its running processes restart. A
+new supervisor cannot claim the old boundary's authenticated session, so
+replacing only the supervisor is insufficient. An empty-bundle duplicate start
+is idempotent only for the generation already running. Explicitly stopped
+sandboxes and completed main commands are not automatically restarted.
 
 | Runtime | Driver | Use when |
 |---|---|---|
