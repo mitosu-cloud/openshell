@@ -832,3 +832,11 @@ For Docker, Podman, MicroVM, and Kubernetes behavior, refer to [Sandbox Compute 
 - To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
 - To control what the agent can access, refer to [Policies](/sandboxes/policies).
 - To use the default runtime image, refer to [Base Sandbox Container](#base-sandbox-container).
+
+### Local gateway recovery
+
+Docker and VM sandboxes with running intent restart their processes when the
+local gateway recovers. After an abrupt gateway exit, recovery installs fresh
+credentials on both the sandbox runtime and its supervisor. Docker retains the
+same container, writable layer, and volumes. Explicitly stopped sandboxes remain
+stopped; completed main commands are not automatically replayed.

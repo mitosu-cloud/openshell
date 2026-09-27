@@ -2265,7 +2265,7 @@ impl DockerComputeDriver {
             .map_err(|error| internal_status("inspect Docker sandbox outer fence", error))?;
         validate_docker_outer_fence(&inspected)?;
         let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-        let previous_finished_at = if state == ContainerSummaryStateEnum::EXITED {
+        let mut previous_finished_at = if state == ContainerSummaryStateEnum::EXITED {
             inspected
                 .state
                 .as_ref()
@@ -2281,27 +2281,32 @@ impl DockerComputeDriver {
             .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
             .map_or(sandbox_id, String::as_str);
         if !container_state_needs_start(state) {
-            adopt_or_verify_docker_start_generation(resolved_sandbox_id, &self.config, generation)
-                .await?;
             if launch_authentication.is_empty() {
+                adopt_or_verify_docker_start_generation(
+                    resolved_sandbox_id,
+                    &self.config,
+                    generation,
+                )
+                .await?;
                 self.ensure_control_process_for_container(&container)
                     .await?;
                 return Ok(true);
             }
 
-            // A gateway restart refreshes the supervisor-facing credentials.
-            // The running sandbox keeps its driver-owned channel identity,
-            // TLS identity, and process tree.
-            self.stop_control_process(resolved_sandbox_id).await;
-            refresh_docker_supervisor_authentication(
-                resolved_sandbox_id,
-                &self.config,
-                launch_authentication,
-            )
-            .await?;
-            self.ensure_control_process_for_container(&container)
+            // A new supervisor cannot claim the old boundary generation. As
+            // with VM recovery, validate the fresh launch bundle before
+            // stopping compute, then rotate both sides of the channel. Keep
+            // the exact container and its writable layer and mounts.
+            decode_docker_launch_authentication(launch_authentication)?;
+            self.stop_sandbox_inner(resolved_sandbox_id, sandbox_name)
                 .await?;
-            return Ok(true);
+            previous_finished_at = self
+                .docker
+                .inspect_container(&target, None)
+                .await
+                .map_err(|error| internal_status("inspect stopped Docker sandbox", error))?
+                .state
+                .and_then(|state| state.finished_at);
         }
 
         // Fence a poll that observed this stopped run but has not published it
@@ -4645,35 +4650,6 @@ async fn refresh_docker_boundary_authentication(
         tls.private_key_pem.as_bytes(),
     )
     .await?;
-    write_docker_boundary_file(
-        &directory.join(RUNTIME_DESCRIPTOR_FILE),
-        &descriptor.payload,
-    )
-    .await?;
-    write_docker_boundary_file(
-        &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
-        &supervisor_auth,
-    )
-    .await
-}
-
-async fn refresh_docker_supervisor_authentication(
-    sandbox_id: &str,
-    config: &DockerDriverRuntimeConfig,
-    encoded_authentication: &[u8],
-) -> Result<(), Status> {
-    let authentication = decode_docker_launch_authentication(encoded_authentication)?;
-    let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
-    let Some(runtime_descriptor) = read_docker_runtime_descriptor(sandbox_id, config).await? else {
-        return Err(Status::failed_precondition(
-            "Docker sandbox runtime descriptor is missing during supervisor authentication rotation",
-        ));
-    };
-    let descriptor = runtime_descriptor
-        .backend_descriptor()
-        .map_err(|error| Status::internal(error.to_string()))?;
-    let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
-        .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
     write_docker_boundary_file(
         &directory.join(RUNTIME_DESCRIPTOR_FILE),
         &descriptor.payload,

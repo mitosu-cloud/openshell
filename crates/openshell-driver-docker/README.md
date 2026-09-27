@@ -86,7 +86,10 @@ Stop terminates the supervisor companion and stops the workload container
 without removing it. Docker retains the workload writable layer and attached
 volumes. Start stages a fresh sandbox bootstrap bundle, restarts that workload,
 and creates a new supervisor companion. A durably stopped sandbox stays stopped
-across gateway restarts.
+across gateway restarts. After an abrupt gateway exit, a fresh authenticated
+launch also stops and restarts a still-running container. It retains the exact
+container and its storage, but running processes restart with the new boundary
+generation. Replacing only the supervisor cannot recover that generation.
 
 Delete force-removes both containers, the driver-owned runtime volumes, and the
 host-private runtime descriptor. Missing or altered descriptor and channel resources

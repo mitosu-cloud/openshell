@@ -272,7 +272,12 @@ During a graceful gateway restart, Docker, Podman, and VM sandboxes with
 running intent should stop before the gateway exits and restart after it
 returns. Check for `Stopped sandbox during gateway shutdown` and `Started
 sandbox during gateway startup` in gateway logs. A sandbox explicitly stopped
-through the CLI remains stopped. Kubernetes sandboxes are cluster-owned and do
+through the CLI remains stopped. After an abrupt gateway exit, Docker and VM
+recovery must restart a still-running boundary with the new launch credentials.
+Replacing only the supervisor produces repeated boundary exchange failures:
+a new supervisor instance cannot claim the old authenticated generation.
+Docker keeps the same container and its storage, but running processes restart.
+Kubernetes sandboxes are cluster-owned and do
 not follow this local gateway lifecycle. Internal and external drivers follow
 the same rule: `GetCapabilities.gateway_manages_lifecycle` must be true for the
 gateway to run shutdown and startup sweeps.
