@@ -121,17 +121,16 @@ mod tests {
     // Restart policy is stored in SandboxSpec, and the count and well-known
     // timestamps are stored in SandboxStatus. Legacy payloads decode with
     // Unspecified (treated as Never), zero count, and absent timestamps.
-    // ProviderProfileFile is reachable from stored provider profiles. Its
-    // additive declaration changes the durable and public/durable overlap
-    // inventories; the provider-environment file map is public-only. The
-    // request has no provider-file capability field: older supervisors ignore
-    // the additive file map while retaining the rest of the response.
+    // ProviderProfileFile and ProviderProfileEnvironment are reachable from
+    // stored provider profiles. Their additive declarations belong to the
+    // public and durable closures while preserving existing field tags and
+    // legacy payload decoding.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "2ed66dbc38c60eb96c7461c76d02813c177facfad93753b180534477270ad240";
+        "1df99e9ce6226bf9b861e6a81be14d52bd5342df5389ecd654ae3ab0b889e788";
     const DURABLE_SCHEMA_SHA256: &str =
-        "399737f2a367d2e3a9d78cf84e2a97eef041835554599790788e4bbf318116c3";
+        "999c6e40941595a72b1161a5d50a566308ff9f9ff24e15e5b201b90ef5ddf842";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "d3c444ecdb42306af8a81791481fdfc147ddc54bf344e1c8e69bd06745c6cc3c";
+        "ae394c00ba43c1bb76ec0aced3e4f3eb791807506b4e2432c110dd41c80e4fb5";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -594,9 +593,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (306, 26),
-                (93, 20),
-                (81, 20),
+                (309, 26),
+                (96, 20),
+                (84, 20),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -696,6 +695,8 @@ mod tests {
         let profile = profile.profile.expect("profile");
         assert_eq!(profile.id, "profile");
         assert_eq!(profile.display_name, "Legacy");
+        assert!(profile.environment.is_none());
+        assert!(profile.required_platform_adapter.is_empty());
 
         let policy_payload =
             PolicyRevisionPayload::decode(legacy_bytes(V0_0_116_POLICY_PAYLOAD).as_slice())

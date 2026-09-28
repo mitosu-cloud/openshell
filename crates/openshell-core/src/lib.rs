@@ -24,7 +24,6 @@ pub mod extension_protocol;
 #[cfg(unix)]
 pub mod external_driver_socket;
 pub mod forward;
-pub mod google_cloud;
 pub mod gpu;
 pub mod grpc_client;
 pub mod host_pattern;

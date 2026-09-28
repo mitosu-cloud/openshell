@@ -7,201 +7,41 @@ description: "Authenticate with Google Cloud APIs and Vertex AI inside OpenShell
 keywords: "Generative AI, Google Cloud, Vertex AI, GCP, OAuth2, Credentials, Sandbox"
 ---
 
-The `google-cloud` provider gives sandboxes native GCP credentials so
-any Google Cloud SDK works out of the box — Cloud Storage, BigQuery, Drive,
-Maps, Discovery Engine, or any other GCP API. A GCE metadata server emulator
-on loopback provides credential placeholders that the
-sandbox proxy resolves to real tokens at request time. The sandbox process
-never holds a real GCP credential.
+Google provider profiles declare credential refresh, environment defaults, and
+local discovery behavior. The Vertex AI profile supports native API requests
+with gateway-refreshed bearer tokens.
 
-## Quick Start
+## Google Cloud Metadata
 
-Import the `google-cloud` profile first; a gateway serves only the profiles you
-imported:
+The `google-cloud` example requires the `gcp-metadata` platform adapter for GCP
+SDK metadata discovery. Current runtimes do not provide this adapter. Import,
+update, and attachment reject that requirement with:
 
-```shell
-openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-cloud.yaml --global
+```text
+required platform adapter 'gcp-metadata' is unavailable in this build
 ```
 
-If you already have `gcloud` configured with Application Default Credentials,
-create a provider with automatic credential refresh in one command:
+The metadata server was removed during the supervisor/sandbox runtime split in
+[PR #2942](https://github.com/NVIDIA/OpenShell/pull/2942). The example now declares
+its dependency so provider setup reports the missing capability before a
+workload attempts metadata authentication. Removing the requirement does not
+supply a metadata server.
 
-```shell
-openshell provider create \
-  --name my-gcp \
-  --type google-cloud \
-  --from-gcloud-adc \
-  --config project_id="$(gcloud config get-value project)" \
-  --config region=global
-```
+The example records these non-secret defaults as profile data:
 
-`--from-gcloud-adc` reads your ADC file, configures OAuth2 refresh on the
-gateway, and mints the first access token before the command returns. The
-gateway rotates the token automatically — no manual refresh needed.
+| Variable | Declared value |
+|---|---|
+| `GCE_METADATA_HOST` | `127.0.0.1:8174` |
+| `GCE_METADATA_IP` | `127.0.0.1:8174` |
+| `METADATA_SERVER_DETECTION` | `assume-present` |
+| `GCP_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT` | `project_id` config |
+| `CLOUD_ML_REGION`, `GCP_LOCATION` | `region` config |
+| `GCP_SERVICE_ACCOUNT_EMAIL` | `service_account_email` config |
 
-## Authentication Flows
-
-Two credential flows are supported. Choose based on your environment.
-
-### Application Default Credentials (gcloud ADC)
-
-Use credentials from `gcloud auth application-default login`. The gateway
-exchanges the refresh token for short-lived access tokens automatically.
-
-```shell
-openshell provider create \
-  --name my-gcp \
-  --type google-cloud \
-  --config project_id=my-project \
-  --config region=us-central1 \
-  --credential GCP_ADC_ACCESS_TOKEN=placeholder
-```
-
-Configure credential refresh with the ADC JSON fields:
-
-```shell
-openshell provider refresh configure my-gcp \
-  --credential-key GCP_ADC_ACCESS_TOKEN \
-  --strategy oauth2-refresh-token \
-  --material client_id=YOUR_CLIENT_ID \
-  --material client_secret=YOUR_CLIENT_SECRET \
-  --material refresh_token=YOUR_REFRESH_TOKEN \
-  --secret-material-key client_secret \
-  --secret-material-key refresh_token
-```
-
-Find these values in your ADC file at
-`~/.config/gcloud/application_default_credentials.json`.
-
-Trigger the first token mint:
-
-```shell
-openshell provider refresh rotate my-gcp \
-  --credential-key GCP_ADC_ACCESS_TOKEN
-```
-
-### Service Account Key
-
-Use a GCP service account JSON key file. The gateway signs JWTs and
-exchanges them for access tokens using the `google-service-account-jwt`
-strategy.
-
-```shell
-openshell provider create \
-  --name my-gcp \
-  --type google-cloud \
-  --config project_id=my-project \
-  --config region=us-central1 \
-  --credential GCP_SA_ACCESS_TOKEN=placeholder
-```
-
-```shell
-openshell provider refresh configure my-gcp \
-  --credential-key GCP_SA_ACCESS_TOKEN \
-  --strategy google-service-account-jwt \
-  --material client_email=sa@my-project.iam.gserviceaccount.com \
-  --material private_key="$(jq -r .private_key /path/to/sa-key.json)" \
-  --secret-material-key private_key
-```
-
-```shell
-openshell provider refresh rotate my-gcp \
-  --credential-key GCP_SA_ACCESS_TOKEN
-```
-
-## Configuration Keys
-
-Set these with `--config key=value` during provider creation:
-
-| Key | Description | Example |
-|-----|-------------|---------|
-| `project_id` | GCP project ID | `my-project-123` |
-| `region` | GCP region | `us-central1` |
-| `service_account_email` | SA email for metadata endpoint | `sa@proj.iam.gserviceaccount.com` |
-
-## How It Works
-
-When a sandbox starts with the `google-cloud` provider attached:
-
-1. The gateway mints a fresh GCP access token and stores it in the
-   sandbox proxy's credential resolver.
-2. A loopback HTTP server on `127.0.0.1:8174` emulates the GCE instance
-   metadata API, serving **credential placeholders** (not real tokens) to
-   GCP SDKs. The sandbox process never holds a real GCP credential.
-3. When the SDK makes an API call, it sends the placeholder in the
-   `Authorization` header. The sandbox proxy TLS-terminates the
-   outbound connection, resolves the placeholder to the real token,
-   and forwards the request to GCP.
-4. When the token approaches expiry, the gateway refreshes it. The
-   proxy's resolver is updated atomically — subsequent API calls
-   use the new token automatically.
-
-Configuration values (`project_id`, `region`, `service_account_email`)
-are **visible in plain text** inside the sandbox — they appear as
-environment variables and are served by the metadata endpoint. These are
-non-secret identifiers, not credentials. Access tokens are never exposed;
-only placeholders reach the sandbox process.
-
-### Injected Environment Variables
-
-The provider automatically injects these into the sandbox. Non-secret
-vars are resolved to real values at process spawn time; token vars stay
-as placeholders for proxy-time resolution.
-
-| Variable | Value | Purpose |
-|----------|-------|---------|
-| `GCE_METADATA_HOST` | `127.0.0.1:8174` | GCP SDK metadata discovery (loopback server) |
-| `GCE_METADATA_IP` | `127.0.0.1:8174` | Python google-auth ping detection |
-| `METADATA_SERVER_DETECTION` | `assume-present` | Node.js gcp-metadata skip detection |
-| `GCP_PROJECT_ID` | from `project_id` config | GCP SDK project |
-| `GOOGLE_CLOUD_PROJECT` | from `project_id` config | Alternative project var |
-| `CLOUD_ML_REGION` | from `region` config | GCP region |
-| `GCP_LOCATION` | from `region` config | Alternative region var |
-
-## Using with GCP APIs
-
-The metadata emulator serves tokens with the `cloud-platform` OAuth2 scope,
-which grants access to any GCP API the underlying service account has IAM
-permissions for. Add the target API hosts to your sandbox network policy:
-
-Attach `my-gcp` to the sandbox first. Because the `google-cloud` profile has no
-endpoints, each API endpoint must bind to that provider instance. Without the
-binding, OpenShell withholds its access token from the sandbox.
-
-```yaml
-network_policies:
-  gcp_apis:
-    name: gcp-apis
-    endpoints:
-      - host: "*.googleapis.com"
-        port: 443
-        protocol: rest
-        access: read-write
-        enforcement: enforce
-        credential_binding:
-          provider: my-gcp
-    binaries:
-      - { path: /usr/bin/curl }
-      - { path: /usr/bin/node }
-      - { path: "/sandbox/.uv/python/**" }
-      - { path: "/sandbox/.venv/**" }
-```
-
-For a running sandbox, export its base policy. Remove the metadata header above
-the `---` line, add the endpoint and binaries shown above, then apply the file:
-
-```shell
-openshell policy get my-sandbox --base > sandbox-policy.yaml
-# Edit sandbox-policy.yaml to add the gcp_apis rule shown above.
-openshell policy set my-sandbox --policy sandbox-policy.yaml --wait
-```
-
-## Network Policy
-
-The `google-cloud` provider type does not include any network policy
-endpoints by default. You must add endpoint rules to your sandbox policy
-for each GCP API the sandbox needs to reach. See "Using with GCP APIs"
-above for an example.
+For a client that accepts bearer-token authentication directly, author a
+[provider profile](/how-it-works/providers/profiles) with the required Google API
+endpoints and refresh credential. That workflow does not require metadata
+emulation. The Vertex example below uses native bearer-token authentication.
 
 ## Vertex AI
 
@@ -230,13 +70,13 @@ openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShel
 
 #### Service Account Key
 
-Create the provider with the JSON key as gateway-only bootstrap material:
+Create the provider for runtime credentials:
 
 ```shell
 openshell provider create \
   --name vertex-prod \
   --type google-vertex-ai \
-  --credential GOOGLE_SERVICE_ACCOUNT_KEY="$(cat /path/to/key.json)" \
+  --runtime-credentials \
   --config VERTEX_AI_PROJECT_ID=my-gcp-project \
   --config VERTEX_AI_REGION=us-central1
 ```
@@ -254,6 +94,16 @@ openshell provider refresh configure vertex-prod \
 
 The private key remains in the gateway credential store. Sandboxes receive
 only an opaque placeholder for the short-lived access token.
+
+The profile's `environment` and `discovery.config_env_vars` declarations supply
+SDK configuration and local discovery behavior. A copy imported under another
+ID keeps those effects. Do not store `GOOGLE_SERVICE_ACCOUNT_KEY` as a provider
+credential or non-secret environment default; supply the private key through
+refresh configuration. If an older provider record still holds that key after
+the profile declaration is removed, the gateway omits it and continues to
+provide the access token and SDK configuration. Two Vertex providers can share
+the same non-secret SDK defaults when their values match and their credential
+environment keys differ.
 
 #### gcloud Application Default Credentials
 
@@ -279,7 +129,7 @@ file and refresh token do not enter the sandbox.
 | Key | Required | Default | Description |
 |---|---|---|---|
 | `VERTEX_AI_PROJECT_ID` | Yes | — | GCP project ID exposed as non-secret workload configuration. |
-| `VERTEX_AI_REGION` | No | `us-central1` | Vertex location exposed as non-secret workload configuration. |
+| `VERTEX_AI_REGION` | Client dependent | — | Vertex location exposed as non-secret workload configuration. Set it explicitly for regional endpoints. |
 
 When the provider is attached, OpenShell also projects standard project and
 location aliases such as `GOOGLE_CLOUD_PROJECT`, `ANTHROPIC_VERTEX_PROJECT_ID`,
