@@ -50,22 +50,21 @@ pub fn provision_private_file(
         .and_then(|name| name.to_str())
         .ok_or_else(|| "private file name is not portable".to_string())?;
     create_private_parents(parent)?;
-    if let Some(existing) = existing_private_file(&destination, expected_uid)? {
-        if !overwrite {
-            return Ok(PrivateFileReport {
-                written: false,
-                length: existing,
-                mode: PRIVATE_FILE_MODE,
-            });
-        }
+    if let Some(existing) = existing_private_file(&destination, expected_uid)?
+        && !overwrite
+    {
+        return Ok(PrivateFileReport {
+            written: false,
+            length: existing,
+            mode: PRIVATE_FILE_MODE,
+        });
     }
     let temporary = parent.join(format!(
         ".{leaf}.mitosu-provision-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
+            .map_or(0, |duration| duration.as_nanos())
     ));
     let write_result = write_exclusive(&temporary, contents);
     if let Err(error) = write_result {
@@ -91,7 +90,7 @@ fn normalize_private_path(path: &str) -> Result<PathBuf, String> {
     let mut out = PathBuf::new();
     for component in Path::new(path).components() {
         match component {
-            Component::RootDir => out.push("/"),
+            Component::RootDir => out = PathBuf::from("/"),
             Component::Normal(part) => {
                 let part = part.to_str().ok_or("private file path is not UTF-8")?;
                 if part.contains(['\\', '\n']) {

@@ -1639,6 +1639,9 @@ pub fn build_isolation_specs(
         .sysctl
         .insert("net.ipv4.ip_unprivileged_port_start".into(), "0".into());
     workload.netns.nsmode = "none".into();
+    // Podman generates an empty resolver for network=none and rejects custom
+    // DNS servers in that mode. Keep our provisioned resolver in the rootfs;
+    // its exact sandbox-local relay is mediated by the sandbox boundary.
     workload.networks.clear();
     workload.portmappings.clear();
     workload.hostadd.clear();
@@ -1974,6 +1977,8 @@ mod tests {
         assert_eq!(specs.supervisor.groups, vec!["2000"]);
         assert!(specs.supervisor.cap_add.is_empty());
         assert_eq!(specs.workload.netns.nsmode, "none");
+        assert_eq!(specs.workload.use_image_resolve_conf, Some(true));
+        assert_eq!(specs.supervisor.use_image_resolve_conf, None);
         assert_eq!(
             specs
                 .workload

@@ -224,6 +224,14 @@ Podman supports the same `volume`, `tmpfs`, and `bind` mounts as [Docker](#docke
 
 Podman also supports `image` mounts, which mount a container image read-only at `target`. Image mounts require disabling resource admission.
 
+The network-none Podman workload uses a driver-provisioned resolver pointing
+to the sandbox-local relay at `127.0.0.53`. Podman leaves that resolver intact,
+and seccomp sends DNS requests over authenticated mediation; no direct workload
+DNS route is created. Create, start, stop, delete, watch, and status operations
+serialize per sandbox so containment cannot race an intentional companion
+restart. A genuinely missing supervisor still triggers workload containment
+after the transition completes.
+
 ## MicroVM Driver
 
 The MicroVM driver runs each sandbox in its own lightweight VM. It requires host virtualization: Apple Hypervisor on macOS or KVM on Linux.

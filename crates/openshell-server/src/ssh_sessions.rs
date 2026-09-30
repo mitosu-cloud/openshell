@@ -297,7 +297,7 @@ mod tests {
     async fn session_reaper_exits_on_shutdown() {
         let store = Arc::new(test_store().await);
         let (tx, rx) = watch::channel(false);
-        let handle = spawn_session_reaper(store, Duration::from_secs(60), rx);
+        let handle = spawn_session_reaper(store, Duration::from_mins(1), rx);
         tx.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
