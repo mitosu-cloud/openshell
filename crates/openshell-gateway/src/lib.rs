@@ -93,6 +93,10 @@ fn embed_compute_driver_registration(
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-docker"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "enabled and disabled driver registrations share an optional return type"
+)]
 fn docker_registration() -> Option<ComputeDriverRegistration> {
     Some(
         ComputeDriverRegistration::new(
@@ -114,6 +118,10 @@ fn docker_registration() -> Option<ComputeDriverRegistration> {
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "enabled and disabled driver registrations share an optional return type"
+)]
 fn podman_registration() -> Option<ComputeDriverRegistration> {
     Some(
         ComputeDriverRegistration::new(
@@ -135,6 +143,10 @@ fn podman_registration() -> Option<ComputeDriverRegistration> {
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "enabled and disabled driver registrations share an optional return type"
+)]
 fn vm_registration() -> Option<ComputeDriverRegistration> {
     Some(
         ComputeDriverRegistration::new("vm", u16::MAX, None, VmFactory)

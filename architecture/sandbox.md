@@ -27,6 +27,14 @@ TCP Service, or VM vsock channel. Independent bidirectional `Exchange` RPCs
 carry lifecycle, exec, TCP, and forwarding traffic, while one persistent
 bidirectional `Mediate` RPC carries multiplexed DNS traffic. General application
 UDP is unsupported; UDP DNS remains mediated by the supervisor.
+Podman's network-none workload uses a driver-provisioned resolver pointing at
+a sandbox-local relay at `127.0.0.53`. Podman leaves that rootfs resolver intact;
+seccomp sends its DNS requests over the authenticated mediation channel.
+The supervisor uses its own host resolver, and no direct workload DNS route
+is created.
+Podman lifecycle transitions serialize with watch inspection per sandbox so
+containment cannot race a deliberate supervisor restart. A genuinely missing
+companion still triggers workload containment after the transition completes.
 The sandbox probes HTTP/2 connection liveness every five seconds and closes
 connections that miss a ten-second acknowledgement deadline. Closing a
 connection freezes the owned workload process tree and cancels its stream

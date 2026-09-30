@@ -1837,6 +1837,8 @@ message RevokeSshSessionResponse {
 // How `ExecSandboxRequest.command` is launched inside the sandbox.
 enum ExecMode {
   // Login shell (`bash -lc`). Default.
+  // Keep the existing generated name and zero-value behavior for older clients.
+  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
   EXEC_MODE_LOGIN_SHELL = 0;
   // Non-login shell (`bash -c`).
   EXEC_MODE_SHELL = 1;

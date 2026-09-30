@@ -557,7 +557,10 @@ impl PodmanClient {
         timeout_secs: u32,
     ) -> Result<(), PodmanApiError> {
         validate_name(name)?;
-        let http_timeout = Duration::from_secs(u64::from(timeout_secs) + 5);
+        // Libpod also tears down mounts and namespaces after the process
+        // stops. Retain the normal API budget after the signal grace period,
+        // including when immediate termination is requested during recovery.
+        let http_timeout = Duration::from_secs(u64::from(timeout_secs)) + API_TIMEOUT;
         let (status, bytes) = self
             .request(
                 hyper::Method::POST,
@@ -1147,6 +1150,31 @@ mod tests {
                 .expect("request log lock should not be poisoned")
                 .as_slice(),
             ["DELETE /v5.0.0/libpod/containers/sandbox-123?force=true&volumes=true&timeout=10"]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_container_allows_cleanup_after_immediate_termination() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "stop-container-delayed",
+            vec![StubResponse::new(StatusCode::NO_CONTENT, "").with_delay(Duration::from_secs(6))],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+        let stopping = tokio::spawn(async move { client.stop_container("sandbox-123", 0).await });
+        while request_log.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        stopping
+            .await
+            .unwrap()
+            .expect("stop must allow Libpod cleanup");
+        handle.await.unwrap();
+        assert_eq!(
+            request_log.lock().unwrap().as_slice(),
+            ["POST /v5.0.0/libpod/containers/sandbox-123/stop?timeout=0"]
         );
         let _ = std::fs::remove_file(socket_path);
     }

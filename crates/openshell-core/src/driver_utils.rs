@@ -843,7 +843,10 @@ pub fn sandbox_log_level(sandbox: &DriverSandbox, default_level: &str) -> String
 /// - `"ghcr.io/org/image@sha256:abc"` → `None`  (pinned by digest)
 /// - `"ghcr.io/org/image:"` → `None`  (empty tag)
 pub fn supervisor_image_tag(image: &str) -> Option<&str> {
-    if image.contains('@') {
+    let image_id = image.strip_prefix("sha256:").unwrap_or(image);
+    if image.contains('@')
+        || (image_id.len() == 64 && image_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
         return None;
     }
 
@@ -858,7 +861,7 @@ pub fn supervisor_image_tag(image: &str) -> Option<&str> {
 /// Return `true` if the supervisor image should be refreshed before each use.
 ///
 /// Mutable tags (`dev`, `latest`) are always re-pulled so that the running
-/// container tracks the latest pushed version.  Digest-pinned references and
+/// container tracks the latest pushed version. Image IDs, digest-pinned references and
 /// all other versioned tags are treated as immutable and pulled at most once.
 pub fn supervisor_image_should_refresh(image: &str) -> bool {
     matches!(supervisor_image_tag(image), Some("dev" | "latest"))

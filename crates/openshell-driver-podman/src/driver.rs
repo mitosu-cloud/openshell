@@ -786,6 +786,7 @@ impl PodmanComputeDriver {
         // invalid.
         let name = validated_container_name(sandbox)?;
         let validated = self.validated_sandbox_create(sandbox).await?;
+        let _transition = self.lifecycle_event_fences.transition(&sandbox.id).await;
 
         let vol_name = container::volume_name(&sandbox.id);
 
@@ -1076,6 +1077,9 @@ impl PodmanComputeDriver {
                     self.client
                         .copy_to_container(&workload_id, "/sandbox", archives.workspace)
                         .await?;
+                    self.client
+                        .copy_to_container(&workload_id, "/etc", archives.resolver)
+                        .await?;
                     let supervisor_id = self
                         .client
                         .create_typed_container(&specs.supervisor)
@@ -1250,6 +1254,7 @@ impl PodmanComputeDriver {
     )]
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let _transition = self.lifecycle_event_fences.transition(sandbox_id).await;
         let container = self.find_container(sandbox_id).await?;
         let supervisor = crate::isolation::supervisor_name(sandbox_id);
         match self
@@ -1330,6 +1335,7 @@ impl PodmanComputeDriver {
         )
         .map_err(|error| ComputeDriverError::InvalidArgument(error.to_string()))?;
         let launch_authentication = decode_launch_authentication(encoded_authentication)?;
+        let _transition = self.lifecycle_event_fences.transition(sandbox_id).await;
         let container = self
             .find_container(sandbox_id)
             .await?
@@ -1356,15 +1362,26 @@ impl PodmanComputeDriver {
                 if metadata.generation == generation.as_str() && encoded_authentication.is_empty() {
                     return span_status.finish(Ok(()));
                 }
-                if metadata.generation != generation.as_str() {
+                if metadata.generation != generation.as_str() && encoded_authentication.is_empty() {
                     return span_status.finish(Err(ComputeDriverError::Precondition(format!(
                         "Podman sandbox is already running generation {}",
                         metadata.generation
                     ))));
                 }
-                // A non-empty bundle for the same generation comes from
-                // gateway startup recovery. Restart both containers so the
-                // in-memory launch session changes atomically on both sides.
+                // A validated fresh bundle comes from gateway startup recovery
+                // and may adopt a new driver generation. Restart both existing
+                // containers so launch authentication changes on both sides,
+                // preserving their identity, writable layers and volumes.
+                // Match ordinary stop ordering: end the supervisor's mediated
+                // requests before terminating the workload. Killing the
+                // workload first can leave Libpod waiting on pending boundary
+                // operations until the old supervisor finally disconnects.
+                let supervisor = crate::isolation::supervisor_name(sandbox_id);
+                self.client
+                    .stop_container(&supervisor, self.config.stop_timeout_secs)
+                    .await?;
+                self.wait_for_container_stopped(sandbox_id, &supervisor)
+                    .await?;
             }
             self.client.stop_container(&container.id, 0).await?;
             self.wait_for_container_stopped(sandbox_id, &container.id)
@@ -1447,6 +1464,7 @@ impl PodmanComputeDriver {
             ));
         }
 
+        let _transition = self.lifecycle_event_fences.transition(sandbox_id).await;
         let supervisor = crate::isolation::supervisor_name(sandbox_id);
         match self
             .client
@@ -1547,6 +1565,7 @@ impl PodmanComputeDriver {
         &self,
         sandbox_id: &str,
     ) -> Result<Option<DriverSandbox>, ComputeDriverError> {
+        let _transition = self.lifecycle_event_fences.transition(sandbox_id).await;
         let id_filter = format!("{LABEL_SANDBOX_ID}={sandbox_id}");
         let entries = self
             .client
@@ -1584,6 +1603,12 @@ impl PodmanComputeDriver {
 
         let mut sandboxes = Vec::with_capacity(entries.len());
         for entry in &entries {
+            let sandbox_id = entry
+                .labels
+                .get(LABEL_SANDBOX_ID)
+                .cloned()
+                .unwrap_or_default();
+            let _transition = self.lifecycle_event_fences.transition(&sandbox_id).await;
             if entry.state == "running" {
                 // Running containers need inspect for health check status.
                 match watcher::inspect_workload(&self.client, &entry.id).await {
@@ -2030,6 +2055,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn running_sandbox_adopts_new_generation_only_with_valid_launch_authentication() {
+        for invalid in [&b""[..], &b"invalid"[..]] {
+            let error = test_driver(PathBuf::from("/nonexistent/podman.sock"))
+                .start_sandbox("sandbox-1", "generation-2", invalid)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("launch authentication"));
+        }
+        let mut responses = vec![
+            StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"running"}]"#),
+            StubResponse::new(
+                StatusCode::OK,
+                r#"{"Id":"supervisor","Name":"supervisor","State":{"Status":"running","Running":true},"Config":{}}"#,
+            ),
+            restart_responses().remove(2), // existing generation-1 metadata
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor stop first
+            StubResponse::new(
+                StatusCode::OK,
+                r#"{"Id":"supervisor","Name":"supervisor","State":{"Status":"exited","Running":false},"Config":{}}"#,
+            ),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // workload stop
+        ];
+        for _ in 0..2 {
+            responses.push(StubResponse::new(
+                StatusCode::OK,
+                r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false},"Config":{}}"#,
+            ));
+        }
+        responses.extend(restart_responses());
+        let (socket, requests, handle) = spawn_podman_stub("generation-adoption", responses);
+        test_driver(socket.clone())
+            .start_sandbox(
+                "sandbox-1",
+                "generation-2",
+                &encoded_launch_authentication(),
+            )
+            .await
+            .expect("a valid fresh gateway bundle must recover the existing container");
+        handle.await.unwrap();
+        let requests = requests.lock().unwrap();
+        let supervisor_stop = requests
+            .iter()
+            .position(|r| r.contains("supervisor-sandbox-1/stop"))
+            .unwrap();
+        let workload_stop = requests
+            .iter()
+            .position(|r| r.contains("ctr-1/stop"))
+            .unwrap();
+        assert!(supervisor_stop < workload_stop);
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.contains("/containers/ctr-1/start"))
+        );
+        assert!(requests.iter().all(|r| !r.starts_with("DELETE ")));
+        let _ = fs::remove_file(socket);
+    }
+
+    #[tokio::test]
     async fn stop_and_start_target_the_existing_container() {
         let (stop_socket, stop_requests, stop_handle) = spawn_podman_stub(
             "lifecycle-stop",
@@ -2328,6 +2412,7 @@ mod tests {
             [
                 "/libpod/containers/workload/archive?path=%2F.openshell%2Fchannel",
                 "/libpod/containers/workload/archive?path=%2Fsandbox",
+                "/libpod/containers/workload/archive?path=%2Fetc",
                 "/libpod/containers/supervisor/archive?path=%2F",
             ]
             .map(|path| format!("PUT {}", api_path(path)))
@@ -3581,6 +3666,7 @@ mod tests {
             fence_response(),
             StubResponse::new(StatusCode::OK, "").with_archive_members(channel_archive_members()),
             StubResponse::new(StatusCode::OK, "").with_archive_members(&["."]),
+            StubResponse::new(StatusCode::OK, "").with_archive_members(&["resolv.conf"]),
             created_response("supervisor"),
             StubResponse::new(StatusCode::OK, ""), // supervisor archive
             StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start

@@ -279,6 +279,10 @@ fn map_session_stream_message<T>(
 ///
 /// The task runs for the lifetime of the sandbox process, reconnecting with
 /// exponential backoff on failures.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit boundary handles preserve the existing session API"
+)]
 pub fn spawn(
     endpoint: String,
     sandbox_id: String,
@@ -303,6 +307,10 @@ pub fn spawn(
 }
 
 /// Spawn the supervisor session and expose when the gateway has accepted it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "same boundary handles as spawn plus a readiness receiver"
+)]
 pub fn spawn_with_readiness(
     endpoint: String,
     sandbox_id: String,

@@ -26,17 +26,16 @@ identity, DNS, TCP, and loopback-forwarding semantics.
 Podman creates the namespaces and volume ownership before the workload runs.
 Rootless operation uses the operator's Podman service and subordinate-ID
 configuration; it does not require adding capabilities to either container.
-The supervisor joins the workload's **user namespace only** to preserve UID/GID
-mapping for shared-volume access. PID, mount, and network namespaces remain
-separate. The channel volume uses shared SELinux relabeling (`:z`).
+The supervisor uses the Podman host user namespace. It shares neither the
+workload's PID, mount, network nor user namespace. The channel volume uses
+shared SELinux relabeling (`:z`); workload mapping must permit the admitted
+supervisor identity to read it.
 
 Before starting either container, the driver uploads volume-relative archives
 directly to the channel and workspace volume destinations. A rootfs upload on a
 stopped Podman container does not populate nested named volumes. Restart restores
 only the channel bootstrap into the existing channel volume, preserving the
-workspace. The workload starts before the supervisor so its user namespace exists
-when the supervisor joins it; a stopped supervisor resolves that namespace again
-on its next start.
+workspace. The workload starts before the supervisor can confirm its boundary.
 
 The runtime must pass the sandbox's unprivileged enforcement probe, including
 nested seccomp notification and Landlock. Unsupported runtime defaults fail
@@ -52,6 +51,13 @@ agent -> openshell-sandbox === authenticated gRPC / private UDS === supervisor -
 The workload has no external interface or published port. Seccomp socket
 mediation carries TCP and DNS through one authenticated gRPC connection.
 DNS remains supervisor-mediated; general UDP is unsupported. The driver sets
+`use_image_resolve_conf` on the network-none workload and provisions
+`nameserver 127.0.0.53` in its private `/etc/resolv.conf`. Podman otherwise
+generates an empty resolver and rejects custom DNS servers with network=none.
+That exact sandbox-local relay enters authenticated DNS mediation; it creates
+no external interface or direct upstream DNS route. The supervisor retains ordinary host
+resolver configuration.
+The driver sets
 `net.ipv4.ip_unprivileged_port_start=0` in the isolated workload network
 namespace so the sandbox's loopback DNS relay can bind port 53 without a
 capability. No nftables or nested network namespace setup runs in the sandbox.
@@ -94,9 +100,16 @@ driver-owned volumes and secrets.
 
 Stop retains both containers, workspace, channel, and secrets. Start restores
 the consumed sandbox bootstrap from a copy in the supervisor's private
-filesystem, verifies the fence, and starts the same pair. A failed supervisor
+filesystem, verifies the fence, and starts the same pair. Gateway recovery may
+adopt a new generation only with validated fresh launch authentication. It
+restarts the existing pair and preserves writable layers and volumes. A failed supervisor
 start stops the workload. Delete removes the companion first, then the workload,
 channel, workspace, and driver-owned secrets. User-owned volumes are retained.
+
+Create, start, stop and delete serialize with watch and status inspection for
+each sandbox. Watch containment still stops a workload whose supervisor is
+lost, but cannot race the intentional gap while its pair is being restarted.
+These guards add no worker task or persistent process.
 
 Only workload containers appear in sandbox list/watch results. Readiness uses
 the supervisor's private health socket; there is no shell, legacy marker, or

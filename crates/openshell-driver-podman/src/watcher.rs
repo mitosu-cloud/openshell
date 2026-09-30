@@ -43,9 +43,31 @@ pub type WatchStream =
 #[derive(Clone, Debug, Default)]
 pub struct LifecycleEventFences {
     previous_finished_at: Arc<Mutex<HashMap<String, String>>>,
+    transitions: Arc<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 impl LifecycleEventFences {
+    /// Keep observation and containment outside a container-pair transition.
+    /// Weak entries expire when no operation or observer uses that sandbox.
+    pub async fn transition(&self, sandbox_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut transitions = self
+                .transitions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            transitions.retain(|_, lock| lock.strong_count() > 0);
+            transitions
+                .get(sandbox_id)
+                .and_then(std::sync::Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    transitions.insert(sandbox_id.to_string(), Arc::downgrade(&lock));
+                    lock
+                })
+        };
+        lock.lock_owned().await
+    }
+
     pub fn record_previous_exit(&self, sandbox_id: &str, finished_at: Option<&str>) {
         let mut fences = self
             .previous_finished_at
@@ -144,6 +166,12 @@ pub async fn start_watch(
         .await?;
 
     for entry in &existing {
+        let sandbox_id = entry
+            .labels
+            .get(LABEL_SANDBOX_ID)
+            .cloned()
+            .unwrap_or_default();
+        let _transition = lifecycle_event_fences.transition(&sandbox_id).await;
         // For running containers, use inspect to get full state including
         // health check status — matching the same condition derivation used
         // for live events.
@@ -247,6 +275,8 @@ async fn map_podman_event(
         );
         return None;
     }
+
+    let _transition = lifecycle_event_fences.transition(&sandbox_id).await;
 
     if event
         .actor
@@ -584,6 +614,57 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn watch_event_waits_for_pair_transition_before_containment() {
+        use crate::test_utils::{StubResponse, spawn_podman_stub};
+        use hyper::StatusCode;
+        let (path, requests, handle) = spawn_podman_stub(
+            "transition-observation",
+            vec![
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/sandbox-name":"test","openshell.ai/sandbox-workspace":"default","openshell.io/isolation-role":"sandbox"}}}"#,
+                ),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"supervisor","Name":"supervisor","State":{"Status":"running","Running":true},"Config":{}}"#,
+                ),
+            ],
+        );
+        let fences = LifecycleEventFences::default();
+        let transition = fences.transition("sandbox-1").await;
+        let observer_fences = fences.clone();
+        let client = PodmanClient::new(path.clone());
+        let observing = tokio::spawn(async move {
+            map_podman_event(
+                &podman_event("start", "sandbox-1", 200),
+                &client,
+                &observer_fences,
+            )
+            .await
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "watch must not contain a workload during its deliberate supervisor restart gap"
+        );
+        let other = fences.transition("sandbox-2").await;
+        drop(other);
+        drop(transition);
+        assert!(observing.await.unwrap().is_some());
+        handle.await.unwrap();
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| !r.contains("/stop"))
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn missing_supervisor_stops_workload_during_reconciliation() {

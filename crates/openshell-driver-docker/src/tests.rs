@@ -3333,6 +3333,11 @@ fn docker_supervisor_image_tag_sanitizes_build_metadata_for_docker() {
 
 #[test]
 fn docker_supervisor_image_refreshes_mutable_tags_only() {
+    let image_id = "0123456789abcdef".repeat(4);
+    assert!(!supervisor_image_should_refresh(&image_id));
+    assert!(!supervisor_image_should_refresh(&format!(
+        "sha256:{image_id}"
+    )));
     assert!(supervisor_image_should_refresh(
         "ghcr.io/nvidia/openshell/supervisor:dev"
     ));

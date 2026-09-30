@@ -2058,7 +2058,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_shutdown_or_sleep_stops_when_signaled() {
         let (tx, mut rx) = watch::channel(false);
-        let wait = super::wait_for_shutdown_or_sleep(&mut rx, Duration::from_secs(60));
+        let wait = super::wait_for_shutdown_or_sleep(&mut rx, Duration::from_mins(1));
         tx.send(true).unwrap();
         assert!(!wait.await);
     }

@@ -118,7 +118,7 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "e927ed6696a6080d90317ed6ea8c3c5aab17180d58a9910fceae906c8453cfac";
+        "31973d235395d9b32b12c60be924b586e18b53afe89ccf1cf4ac78c28d1829fc";
     const DURABLE_SCHEMA_SHA256: &str =
         "654649c8f65f44ac2ba04290f49c56de2f488271f99bc0fd4c6d025039c05128";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -152,6 +152,11 @@ mod tests {
     const PROVIDER_READINESS_RPC_SIGNATURES: [&str; 2] = [
         "openshell.v1.OpenShell/GetSandboxProviderStatus|.openshell.v1.GetSandboxProviderStatusRequest|.openshell.v1.GetSandboxProviderStatusResponse|false|false",
         "openshell.v1.OpenShell/ReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
+    ];
+    // Private provisioning carries bytes over the live supervisor session;
+    // none of these four messages belongs to durable database storage.
+    const PRIVATE_PROVISIONING_RPC_SIGNATURES: [&str; 1] = [
+        "openshell.v1.OpenShell/ProvisionSandboxFile|.openshell.v1.ProvisionSandboxFileRequest|.openshell.v1.ProvisionSandboxFileResponse|false|false",
     ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
@@ -505,20 +510,25 @@ mod tests {
             }
         }
         methods.sort();
-        for signature in PROVIDER_READINESS_RPC_SIGNATURES {
+        for signature in PROVIDER_READINESS_RPC_SIGNATURES
+            .iter()
+            .chain(PRIVATE_PROVISIONING_RPC_SIGNATURES.iter())
+        {
             assert!(
                 methods.iter().any(|method| method == signature),
-                "provider readiness RPC is missing or changed: {signature}"
+                "reviewed RPC is missing or changed: {signature}"
             );
         }
         assert_eq!(
             compiled_method_count,
-            102 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
+            102 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PRIVATE_PROVISIONING_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            76 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
+            76 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PRIVATE_PROVISIONING_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -527,12 +537,23 @@ mod tests {
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
             76 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PRIVATE_PROVISIONING_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
         let public_closure = schema_closure(&index, public_roots);
         let durable_closure =
             schema_closure(&index, DURABLE_ROOTS.iter().copied().map(str::to_string));
+        for name in [
+            "ProvisionSandboxFileRequest",
+            "ProvisionSandboxFileResponse",
+            "ProvisionSandboxFileCommand",
+            "ProvisionSandboxFileResult",
+        ] {
+            let name = format!(".openshell.v1.{name}");
+            assert!(public_closure.messages.contains(&name));
+            assert!(!durable_closure.messages.contains(&name));
+        }
         let overlap_messages = public_closure
             .messages
             .intersection(&durable_closure.messages)
@@ -570,7 +591,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (300, 23),
+                (304, 23),
                 (92, 16),
                 (80, 16),
                 PUBLIC_RPC_SCHEMA_SHA256,

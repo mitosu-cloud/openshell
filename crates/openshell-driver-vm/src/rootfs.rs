@@ -431,7 +431,7 @@ pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
                 unavailable.push(format!("{label} not found"));
             }
             Err(error) => failures.push(format!("run {label}: {error}")),
-        };
+        }
         let _ = fs::remove_file(&staged);
     }
 

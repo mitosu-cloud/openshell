@@ -244,6 +244,9 @@ pub struct ContainerSpec {
     dns_search: Vec<String>,
     /// Resolver options written to `/etc/resolv.conf` by Podman.
     dns_option: Vec<String>,
+    /// Keep the driver-provisioned workload resolver under network=none.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    use_image_resolve_conf: bool,
     netns: NetNS,
     // Matches libpod's network spec format, which is `{name: {opts}}` where
     // empty opts is a unit struct rather than `()`. Keep as a map so JSON
@@ -1231,6 +1234,7 @@ fn build_base_spec(
         // not depend on a libc-specific option or alter short-name searches.
         dns_search: Vec::new(),
         dns_option: Vec::new(),
+        use_image_resolve_conf: false,
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
@@ -1446,6 +1450,10 @@ pub fn build_isolation_specs(
         .sysctl
         .insert("net.ipv4.ip_unprivileged_port_start".into(), "0".into());
     workload.netns.nsmode = "none".into();
+    // Podman generates an empty resolver for network=none and rejects custom
+    // DNS servers in that mode. Keep our provisioned resolver in the rootfs;
+    // its exact sandbox-local relay is mediated by the sandbox boundary.
+    workload.use_image_resolve_conf = true;
     workload.networks.clear();
     workload.portmappings.clear();
     workload.hostadd.clear();
@@ -1734,6 +1742,8 @@ mod tests {
             assert!(spec.no_new_privileges);
         }
         assert_eq!(specs.workload.netns.nsmode, "none");
+        assert!(specs.workload.use_image_resolve_conf);
+        assert!(!specs.supervisor.use_image_resolve_conf);
         assert_eq!(
             specs
                 .workload
