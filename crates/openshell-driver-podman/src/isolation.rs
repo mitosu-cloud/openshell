@@ -179,6 +179,7 @@ pub struct BootstrapArchives {
     pub control: Option<Vec<u8>>,
     pub workspace: Vec<u8>,
     pub supervisor: Vec<u8>,
+    pub resolver: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,11 +357,17 @@ pub fn bootstrap_archives(
     } else {
         None
     };
+    let mut resolver = Archive::new(identity);
+    // This is the exact sandbox-local DNS relay endpoint. The broker admits
+    // sockets to it and sends queries through authenticated DNS mediation;
+    // arbitrary loopback servers and external DNS destinations are not relays.
+    resolver.file("resolv.conf", b"nameserver 127.0.0.53\n")?;
     Ok(BootstrapArchives {
         control,
         channel,
         workspace: workspace.finish()?,
         supervisor: supervisor.finish()?,
+        resolver: resolver.finish()?,
     })
 }
 
@@ -561,6 +568,12 @@ mod tests {
         .unwrap();
         let workload = files(&archives.channel);
         let supervisor = files(&archives.supervisor);
+        let resolver = files(&archives.resolver);
+        assert_eq!(resolver.len(), 1);
+        assert_eq!(
+            resolver[&PathBuf::from("resolv.conf")],
+            b"nameserver 127.0.0.53\n"
+        );
         let mut workspace = tar::Archive::new(archives.workspace.as_slice());
         let mut entries = workspace.entries().unwrap();
         let root = entries.next().unwrap().unwrap();

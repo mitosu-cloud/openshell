@@ -2209,7 +2209,7 @@ mod linux {
                 if uid == 0 {
                     return Err("workload identity must not be root".into());
                 }
-                return Ok(uid);
+                Ok(uid)
             }
             #[cfg(not(unix))]
             {

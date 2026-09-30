@@ -213,6 +213,11 @@ mod tests {
     const PEER_CONFIG_RPC_SIGNATURES: [&str; 1] = [
         "openshell.v1.OpenShell/PeerNotifyConfigUpdate|.openshell.v1.PeerNotifyConfigUpdateRequest|.openshell.v1.PeerNotifyConfigUpdateResponse|false|false",
     ];
+    // Private provisioning carries bytes over the live supervisor session;
+    // none of these four messages belongs to durable database storage.
+    const PRIVATE_PROVISIONING_RPC_SIGNATURES: [&str; 1] = [
+        "openshell.v1.OpenShell/ProvisionSandboxFile|.openshell.v1.ProvisionSandboxFileRequest|.openshell.v1.ProvisionSandboxFileResponse|false|false",
+    ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
     const PRE_READINESS_SANDBOX_SPEC: &str =
@@ -598,10 +603,13 @@ mod tests {
             sandbox_protocol_methods,
             BTreeSet::from(["Exchange", "Mediate"])
         );
-        for signature in PROVIDER_READINESS_RPC_SIGNATURES {
+        for signature in PROVIDER_READINESS_RPC_SIGNATURES
+            .iter()
+            .chain(PRIVATE_PROVISIONING_RPC_SIGNATURES.iter())
+        {
             assert!(
                 methods.iter().any(|method| method == signature),
-                "provider readiness RPC is missing or changed: {signature}"
+                "reviewed RPC is missing or changed: {signature}"
             );
         }
         for signature in PEER_OWNER_RPC_SIGNATURES {
@@ -618,7 +626,8 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            104 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            103 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PRIVATE_PROVISIONING_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -627,7 +636,8 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            79 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PRIVATE_PROVISIONING_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -637,7 +647,8 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            79 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PRIVATE_PROVISIONING_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
@@ -646,6 +657,16 @@ mod tests {
         let public_closure = schema_closure(&index, public_roots);
         let durable_closure =
             schema_closure(&index, DURABLE_ROOTS.iter().copied().map(str::to_string));
+        for name in [
+            "ProvisionSandboxFileRequest",
+            "ProvisionSandboxFileResponse",
+            "ProvisionSandboxFileCommand",
+            "ProvisionSandboxFileResult",
+        ] {
+            let name = format!(".openshell.v1.{name}");
+            assert!(public_closure.messages.contains(&name));
+            assert!(!durable_closure.messages.contains(&name));
+        }
         let overlap_messages = public_closure
             .messages
             .intersection(&durable_closure.messages)
