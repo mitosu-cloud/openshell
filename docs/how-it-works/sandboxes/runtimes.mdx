@@ -25,6 +25,21 @@ replacing only the supervisor is insufficient. An empty-bundle duplicate start
 is idempotent only for the generation already running. Explicitly stopped
 sandboxes and completed main commands are not automatically restarted.
 
+### Recovery Holds in Embedded Gateways
+
+A product embedding the gateway can install a `SandboxStartGuard` to hold
+automatic restoration while it reviews product-owned recovery state. The
+gateway checks the guard under the sandbox lifecycle gate before restored
+running intent, interrupted `Starting` recovery, or an authenticated explicit
+start can reach the driver.
+
+A verified inactive hold persists the sandbox as `Stopped` with a
+`RecoveryHold` condition without issuing a driver stop. Resolving the product's
+recovery record does not restart the sandbox; the owner must issue a separate
+start, which is checked again. Unknown recovery metadata blocks admission
+without rewriting or stopping a potentially running guest. Standalone gateways
+do not apply product recovery-journal policy.
+
 | Runtime | Driver | Use when |
 |---|---|---|
 | [Docker](#docker-driver) | `docker` | Local development and single-machine gateways. |
