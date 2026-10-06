@@ -7,6 +7,7 @@ pub mod driver_config;
 pub mod lease;
 pub mod provisioning_deadline;
 pub mod rootfs_tar;
+pub mod start_guard;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
@@ -639,6 +640,7 @@ pub struct ComputeRuntime {
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
     sync_lock: Arc<Mutex<()>>,
     lifecycle_gates: Arc<LifecycleGateRegistry>,
+    start_guard: Arc<StdMutex<Option<Arc<dyn start_guard::SandboxStartGuard>>>>,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
     replica_id: String,
     /// Gateway-issued staging slots for rootfs tar archives. Shared across
@@ -771,10 +773,71 @@ impl ComputeRuntime {
             supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
+            start_guard: Arc::new(StdMutex::new(None)),
             gateway_listener_requirements,
             replica_id: lease::replica_id(),
             rootfs_tar_staging,
         })
+    }
+
+    pub(crate) fn install_start_guard(&self, guard: Arc<dyn start_guard::SandboxStartGuard>) {
+        *self.start_guard.lock().expect("start guard lock poisoned") = Some(guard);
+    }
+
+    // Called with the sandbox lifecycle gate held. A hold never calls the driver.
+    async fn check_start_guard(&self, sandbox: &Sandbox, automatic: bool) -> Result<bool, Status> {
+        let guard = self
+            .start_guard
+            .lock()
+            .expect("start guard lock poisoned")
+            .clone();
+        let Some(guard) = guard else { return Ok(true) };
+        let context = start_guard::StartContext {
+            driver: self.driver_info.name.clone(),
+            sandbox_id: sandbox.object_id().to_string(),
+            labels: sandbox
+                .metadata
+                .as_ref()
+                .map(|m| m.labels.clone())
+                .unwrap_or_default(),
+            automatic,
+        };
+        let decision = match guard.check(context).await {
+            Ok(decision) => decision,
+            Err(reason) if automatic => start_guard::StartDecision::Hold {
+                reason,
+                stopped: false,
+            },
+            Err(reason) => return Err(Status::failed_precondition(reason)),
+        };
+        match decision {
+            start_guard::StartDecision::Allow => Ok(true),
+            start_guard::StartDecision::Hold { reason, stopped } => {
+                if !automatic {
+                    return Err(Status::failed_precondition(reason));
+                }
+                let already_held = sandbox.phase() == SandboxPhase::Stopped as i32
+                    && sandbox.status.as_ref().is_some_and(|status| {
+                        status.conditions.iter().any(|condition| {
+                            condition.r#type == "Ready" && condition.reason == "RecoveryHold"
+                        })
+                    });
+                if stopped && !already_held {
+                    let updated = self
+                        .write_lifecycle_phase(
+                            sandbox,
+                            SandboxPhase::Stopped,
+                            "RecoveryHold",
+                            &reason,
+                        )
+                        .await?;
+                    self.sandbox_index.update_from_sandbox(&updated);
+                    self.sandbox_watch_bus.notify(updated.object_id());
+                }
+                info!(sandbox_id = %sandbox.object_id(), %reason, "Sandbox restart held for owner review");
+                Ok(false)
+            }
+        }
     }
 
     /// Serializes sandbox/provider-profile invariant checks and object writes
@@ -1311,6 +1374,7 @@ impl ComputeRuntime {
             ));
         }
 
+        self.check_start_guard(&current, false).await?;
         let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
         if phase == SandboxPhase::Ready {
             return Ok(current);
@@ -2527,6 +2591,13 @@ impl ComputeRuntime {
                 continue;
             }
 
+            if !self
+                .check_start_guard(&sandbox, true)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                continue;
+            }
             let sandbox_name = sandbox.object_name().to_string();
             let generation_id = match sandbox_runtime_generation(&sandbox) {
                 Ok(generation) => generation.into_string(),
@@ -2687,6 +2758,18 @@ impl ComputeRuntime {
                 }
             };
             let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+            // Already-stopped guests need the product latch too: reviewed Keep
+            // must not turn subsequent orphan cleanup into an implicit delete.
+            if matches!(
+                phase,
+                SandboxPhase::Stopped | SandboxPhase::Completed | SandboxPhase::Starting
+            ) && !self
+                .check_start_guard(&sandbox, true)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                continue;
+            }
             match phase {
                 SandboxPhase::Stopped | SandboxPhase::Completed => {
                     if let Err(err) = self.cleanup_stopped_sandbox_sessions(&sandbox).await {
@@ -5483,6 +5566,7 @@ pub fn new_test_runtime_with_driver(
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
         sync_lock: Arc::new(Mutex::new(())),
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
+        start_guard: Arc::new(StdMutex::new(None)),
         gateway_listener_requirements: Vec::new(),
         replica_id: "test-replica".to_string(),
         rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
@@ -6466,6 +6550,7 @@ mod tests {
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
             sync_lock: Arc::new(Mutex::new(())),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
+            start_guard: Arc::new(StdMutex::new(None)),
             gateway_listener_requirements: Vec::new(),
             replica_id: "test-replica".to_string(),
             rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
@@ -11461,6 +11546,151 @@ mod tests {
                 "{driver_name} should retain operator-owned lifecycle"
             );
         }
+    }
+
+    #[derive(Debug)]
+    struct RecoveryTestGuard {
+        release: AtomicBool,
+        verified_stopped: bool,
+    }
+    #[async_trait::async_trait]
+    impl start_guard::SandboxStartGuard for RecoveryTestGuard {
+        async fn check(
+            &self,
+            context: start_guard::StartContext,
+        ) -> Result<start_guard::StartDecision, String> {
+            if context.sandbox_id != "held"
+                || (!context.automatic && self.release.load(Ordering::SeqCst))
+            {
+                return Ok(start_guard::StartDecision::Allow);
+            }
+            Ok(start_guard::StartDecision::Hold {
+                reason: "owner review and explicit resume required".into(),
+                stopped: self.verified_stopped,
+            })
+        }
+    }
+    #[tokio::test]
+    async fn embedder_restart_hold_precedes_interrupted_start_and_survives_sweeps() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime_with_gateway_managed_lifecycle(driver.clone(), "docker").await;
+        let guard = Arc::new(RecoveryTestGuard {
+            release: AtomicBool::new(false),
+            verified_stopped: true,
+        });
+        runtime.install_start_guard(guard.clone());
+        runtime
+            .store
+            .put_message(&sandbox_record("held", "held-name", SandboxPhase::Starting))
+            .await
+            .unwrap();
+        runtime
+            .store
+            .put_message(&sandbox_record(
+                "independent",
+                "other-name",
+                SandboxPhase::Ready,
+            ))
+            .await
+            .unwrap();
+        runtime.start_persisted_sandboxes().await.unwrap();
+        assert_eq!(driver.start_calls(), 1);
+        assert_eq!(driver.stop_calls(), 0);
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>("held")
+                .await
+                .unwrap()
+                .unwrap()
+                .phase(),
+            SandboxPhase::Stopped as i32
+        );
+        runtime.start_persisted_sandboxes().await.unwrap();
+        assert_eq!(driver.start_calls(), 2); // Only the independent guest.
+        assert_eq!(
+            runtime
+                .start_sandbox("default", "held-name")
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(driver.start_calls(), 2);
+        guard.release.store(true, Ordering::SeqCst);
+        runtime.start_sandbox("default", "held-name").await.unwrap();
+        assert_eq!(driver.start_calls(), 3);
+    }
+    #[tokio::test]
+    async fn embedder_restart_hold_also_reviews_already_stopped_guests() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime_with_gateway_managed_lifecycle(driver.clone(), "docker").await;
+        runtime.install_start_guard(Arc::new(RecoveryTestGuard {
+            release: AtomicBool::new(false),
+            verified_stopped: true,
+        }));
+        runtime
+            .store
+            .put_message(&sandbox_record("held", "held-name", SandboxPhase::Stopped))
+            .await
+            .unwrap();
+        runtime.start_persisted_sandboxes().await.unwrap();
+        let held = runtime
+            .store
+            .get_message::<Sandbox>("held")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            held.status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == "RecoveryHold")
+        );
+        runtime.start_persisted_sandboxes().await.unwrap();
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>("held")
+                .await
+                .unwrap()
+                .unwrap(),
+            held
+        );
+        assert_eq!(driver.start_calls(), 0);
+        assert_eq!(driver.stop_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn embedder_unknown_restart_hold_never_stops_or_rewrites_running_intent() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime_with_gateway_managed_lifecycle(driver.clone(), "docker").await;
+        runtime.install_start_guard(Arc::new(RecoveryTestGuard {
+            release: AtomicBool::new(false),
+            verified_stopped: false,
+        }));
+        let original = sandbox_record("held", "held-name", SandboxPhase::Ready);
+        runtime.store.put_message(&original).await.unwrap();
+        let before = runtime
+            .store
+            .get_message::<Sandbox>("held")
+            .await
+            .unwrap()
+            .unwrap();
+        runtime.start_persisted_sandboxes().await.unwrap();
+        assert_eq!(driver.start_calls(), 0);
+        assert_eq!(driver.stop_calls(), 0);
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>("held")
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
     }
 
     #[tokio::test]

@@ -528,3 +528,14 @@ namespace.
 
 When runtime infrastructure changes, validate the relevant sandbox e2e path and
 update the matching driver README if a maintainer-facing constraint changes.
+
+## Embedded recovery admission
+
+An embedder may install a `SandboxStartGuard` before serving. The gateway calls
+it under the sandbox lifecycle gate before restored running intent, interrupted
+`Starting` recovery, or an authenticated explicit Start can reach the driver.
+A failed check holds admission without changing unknown runtime state. A
+verified inactive hold persists `Stopped` with a `RecoveryHold` condition,
+without issuing a driver stop; only a separate admitted Start changes that
+intent. Products retain and validate their own private recovery receipts. The
+standalone gateway has no product journal policy by default.

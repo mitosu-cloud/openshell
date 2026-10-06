@@ -3,6 +3,7 @@
 
 //! In-process gateway embedding API for host products such as Mitosu.
 
+pub use crate::compute::start_guard::{SandboxStartGuard, StartContext, StartDecision};
 use crate::config_file::ConfigFile;
 use crate::tracing_bus::TracingLogBus;
 use crate::{
@@ -10,6 +11,7 @@ use crate::{
     shutdown_and_cleanup,
 };
 use openshell_core::{Config, Result};
+use std::sync::Arc;
 use tokio::sync::watch;
 
 pub use crate::compute::driver_config::GuestTlsPaths;
@@ -22,6 +24,7 @@ pub struct EmbeddedServerConfig {
     config_file: Option<ConfigFile>,
     guest_tls: Option<GuestTlsPaths>,
     compute_driver: Option<String>,
+    start_guard: Option<Arc<dyn SandboxStartGuard>>,
 }
 
 impl EmbeddedServerConfig {
@@ -33,6 +36,7 @@ impl EmbeddedServerConfig {
             config_file: None,
             guest_tls: None,
             compute_driver: None,
+            start_guard: None,
         }
     }
 
@@ -54,6 +58,13 @@ impl EmbeddedServerConfig {
     #[must_use]
     pub fn with_compute_driver(mut self, name: impl Into<String>) -> Self {
         self.compute_driver = Some(name.into());
+        self
+    }
+
+    /// Add product-owned recovery admission without a separate service.
+    #[must_use]
+    pub fn with_start_guard(mut self, guard: Arc<dyn SandboxStartGuard>) -> Self {
+        self.start_guard = Some(guard);
         self
     }
 
@@ -95,8 +106,12 @@ pub async fn run_embedded(
     tracing_bus: TracingLogBus,
     shutdown: watch::Receiver<bool>,
 ) -> Result<EmbeddedServer> {
+    let start_guard = config.start_guard.clone();
     let startup = config.into_startup(&drivers)?;
     let bootstrapped = bootstrap_state(startup, drivers, tracing_bus, shutdown.clone()).await?;
+    if let Some(guard) = start_guard {
+        bootstrapped.state.compute.install_start_guard(guard);
+    }
     let serving = serve(bootstrapped, shutdown).await?;
     Ok(EmbeddedServer { serving })
 }
