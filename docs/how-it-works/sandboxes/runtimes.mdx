@@ -156,6 +156,15 @@ OpenShell discovers Docker's host address automatically in bridge mode. Set `hos
 
 The sandbox must pass its Landlock and seccomp qualification in either network mode. For GPU sandboxes, configure Docker CDI before starting the gateway.
 
+Docker startup discovers namespace-labeled resources without deleting
+auxiliary containers or channel volumes. A shared namespace label does not
+grant ownership to a gateway. Cleanup follows exact sandbox start, stop, and
+delete requests after persisted-intent and recovery-admission checks. Polling
+enforces the outer network fence only for guests whose supervisors this driver
+instance controls; an explicit start also rejects and stops its exact running
+guest if that fence is broken. Unclaimed resources remain available for
+operator review.
+
 ### Docker Corporate Proxy Egress
 
 For proxy-required networks, the Docker driver accepts `https_proxy`,
