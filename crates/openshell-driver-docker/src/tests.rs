@@ -229,9 +229,15 @@ impl Drop for DiscoveryEngine {
 }
 
 async fn discovery_engine() -> DiscoveryEngine {
+    discovery_engine_with_late_stager(None).await
+}
+
+async fn discovery_engine_with_late_stager(
+    late_stager_owner: Option<&'static str>,
+) -> DiscoveryEngine {
     use tokio::io::AsyncReadExt as _;
 
-    let summaries = [
+    let mut summaries = [
         (
             "foreign-running",
             "foreign-running-container",
@@ -267,12 +273,28 @@ async fn discovery_engine() -> DiscoveryEngine {
                 LABEL_ISOLATION_ROLE: role,
             }
         })
-    });
+    })
+    .to_vec();
+    if let Some(owner) = late_stager_owner {
+        summaries.push(serde_json::json!({
+            "Id": "late-stage", "Names": ["/late-stage"], "State": "created",
+            "Labels": {
+                LABEL_MANAGED_BY: LABEL_MANAGED_BY_VALUE,
+                LABEL_SANDBOX_NAMESPACE: "default",
+                LABEL_SANDBOX_ID: owner,
+                LABEL_SANDBOX_NAME: owner,
+                LABEL_ISOLATION_ROLE: LABEL_ISOLATION_ROLE_STAGING,
+            }
+        }));
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let request_log = requests.clone();
+    let supervisor_volume = docker_supervisor_volume_name_by_id("owned", &runtime_config());
     let server = tokio::spawn(async move {
+        let mut volume_requested = false;
+        let mut removed = HashSet::new();
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut headers = Vec::new();
@@ -303,6 +325,10 @@ async fn discovery_engine() -> DiscoveryEngine {
                 let selected = summaries
                     .iter()
                     .filter(|summary| {
+                        let id = summary["Id"].as_str().unwrap();
+                        if removed.contains(id) || (id == "late-stage" && !volume_requested) {
+                            return false;
+                        }
                         labels.iter().all(|filter| {
                             let (key, value) = filter.split_once('=').unwrap();
                             summary["Labels"][key].as_str() == Some(value)
@@ -320,9 +346,24 @@ async fn discovery_engine() -> DiscoveryEngine {
                     })
                     .to_string(),
                 )
-            } else if method == "POST" && url.path().ends_with("/stop")
-                || method == "DELETE" && url.path().contains("/containers/")
+            } else if method == "DELETE" && url.path().contains("/containers/") {
+                removed.insert(url.path().rsplit('/').next().unwrap().to_string());
+                (204, String::new())
+            } else if method == "DELETE"
+                && url.path().contains("/volumes/")
+                && late_stager_owner.is_some()
             {
+                if url.path().ends_with(&supervisor_volume) && !removed.contains("late-stage") {
+                    volume_requested = true;
+                    (
+                        409,
+                        serde_json::json!({"message": "volume is in use - [late-stage]"})
+                            .to_string(),
+                    )
+                } else {
+                    (204, String::new())
+                }
+            } else if method == "POST" && url.path().ends_with("/stop") {
                 (204, String::new())
             } else {
                 (
@@ -345,6 +386,64 @@ async fn discovery_engine() -> DiscoveryEngine {
         requests,
         server,
     }
+}
+
+#[tokio::test]
+async fn volume_cleanup_rescans_late_stager_only_for_the_exact_sandbox() {
+    let fixture = discovery_engine_with_late_stager(Some("owned")).await;
+    fixture
+        .driver
+        .remove_auxiliary_containers_for_sandbox("owned")
+        .await
+        .unwrap();
+    fixture
+        .driver
+        .remove_sandbox_runtime_volumes("owned")
+        .await
+        .unwrap();
+    let requests = fixture.requests.lock().await;
+    let deletions = requests
+        .iter()
+        .filter(|(method, path)| method == "DELETE" && path.contains("/containers/"))
+        .map(|(_, path)| path.split('?').next().unwrap().rsplit('/').next().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(deletions, ["owned-supervisor", "late-stage"]);
+    let supervisor_volume = docker_supervisor_volume_name_by_id("owned", &runtime_config());
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(method, path)| method == "DELETE"
+                && path
+                    .split('?')
+                    .next()
+                    .unwrap()
+                    .ends_with(&supervisor_volume))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn volume_cleanup_keeps_unknown_references_and_returns_the_conflict() {
+    let fixture = discovery_engine_with_late_stager(Some("foreign-running")).await;
+    fixture
+        .driver
+        .remove_auxiliary_containers_for_sandbox("owned")
+        .await
+        .unwrap();
+    let error = fixture
+        .driver
+        .remove_sandbox_runtime_volumes("owned")
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("409"));
+    let requests = fixture.requests.lock().await;
+    let deletions = requests
+        .iter()
+        .filter(|(method, path)| method == "DELETE" && path.contains("/containers/"))
+        .map(|(_, path)| path.split('?').next().unwrap().rsplit('/').next().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(deletions, ["owned-supervisor"]);
 }
 
 #[tokio::test]

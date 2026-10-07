@@ -97,6 +97,24 @@ shortly after carrying a stale `Provisioning` or `Unknown` backend phase. The
 composition rule treats a connected session as the stronger signal and keeps `Ready`
 in that case, preventing a lagging snapshot from undoing the session-driven promotion.
 
+Start admission and launch-credential preparation share the per-sandbox lifecycle
+gate and reconciliation lock. The gateway persists the authorization identity and
+`Starting` phase in one version-checked update. A Ready replay or rejected start
+does not rotate credentials; restoring the previous phase after a failed driver
+call retains the committed authorization epoch.
+
+The gateway rereads terminal container watch snapshots under the lifecycle gate
+when a sandbox is Starting, Provisioning, or Ready. An old exit event cannot undo
+readiness after the replacement supervisor connects. A current exit still takes
+terminal precedence; an unverified terminal event for a stable Ready sandbox
+fails closed.
+
+Deleting a Docker sandbox joins its canceled provisioning worker before cleanup.
+If a volume remains busy because a staging create completed after the first
+scan, cleanup rescans only that exact sandbox's auxiliaries. It retries at most
+three times and only after removing a matching auxiliary. Unknown references
+and persistent conflicts remain errors; volume removal is never forced.
+
 **Known HA limitation:** Supervisor sessions are process-local while the public
 sandbox phase is shared. A replica that reconciles a driver snapshot without owning
 the active supervisor session can demote the shared phase to `Provisioning`. The

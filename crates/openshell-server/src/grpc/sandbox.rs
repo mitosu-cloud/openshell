@@ -1548,27 +1548,22 @@ async fn handle_start_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-    let current = sandbox_by_name(state, &workspace, &req.name).await?;
-    let current_phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
-    let launch_authentication = if current_phase == SandboxPhase::Ready {
-        Vec::new()
-    } else if state.sandbox_session_jwt_authority.is_some() {
-        let authentication = if matches!(
-            current_phase,
-            SandboxPhase::Stopped | SandboxPhase::Completed
-        ) {
-            mint_next_runtime_authentication(state, &current).await?
-        } else {
-            mint_persisted_authentication(state, &current)?
-        };
-        serde_json::to_vec(&authentication)
-            .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))?
-    } else {
-        Vec::new()
-    };
     let mut sandbox = state
         .compute
-        .start_sandbox_authenticated(&workspace, &req.name, launch_authentication)
+        .start_sandbox_authenticated(&workspace, &req.name, |sandbox| {
+            if state.sandbox_session_jwt_authority.is_none() {
+                return Ok(Vec::new());
+            }
+            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+            let authentication = if matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
+            {
+                mint_next_runtime_authentication(state, sandbox)?
+            } else {
+                mint_persisted_authentication(state, sandbox)?
+            };
+            serde_json::to_vec(&authentication)
+                .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))
+        })
         .await?;
     state
         .supervisor_sessions
@@ -1597,17 +1592,18 @@ pub fn mint_persisted_authentication(
     authority.mint_persisted_launch(sandbox.object_id(), &identity)
 }
 
-async fn mint_next_runtime_authentication(
-    state: &Arc<ServerState>,
-    sandbox: &Sandbox,
+fn mint_next_runtime_authentication(
+    state: &ServerState,
+    sandbox: &mut Sandbox,
 ) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
     let authority = state
         .sandbox_session_jwt_authority
         .as_ref()
         .ok_or_else(|| Status::failed_precondition("sandbox session authority is unavailable"))?;
+    let sandbox_id = sandbox.object_id().to_string();
     let metadata = sandbox
         .metadata
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| Status::failed_precondition("sandbox metadata is missing"))?;
     let current =
         crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
@@ -1624,20 +1620,8 @@ async fn mint_next_runtime_authentication(
         gateway_token_id: uuid::Uuid::new_v4(),
         refresh_replay: None,
     };
-    let authentication = authority.mint_persisted_launch(sandbox.object_id(), &next)?;
-    state
-        .store
-        .update_message_cas::<Sandbox, _>(
-            sandbox.object_id(),
-            metadata.resource_version,
-            |updated| {
-                if let Some(metadata) = updated.metadata.as_mut() {
-                    next.write(&mut metadata.annotations);
-                }
-            },
-        )
-        .await
-        .map_err(|error| Status::aborted(format!("persist sandbox runtime identity: {error}")))?;
+    let authentication = authority.mint_persisted_launch(&sandbox_id, &next)?;
+    next.write(&mut metadata.annotations);
     Ok(authentication)
 }
 

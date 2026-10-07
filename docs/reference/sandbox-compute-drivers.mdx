@@ -203,6 +203,17 @@ Docker containers through the driver RPC without recording an explicit
 sandbox stop. On startup, the gateway reconciles that retained intent with an
 idempotent start request. Explicitly stopped sandboxes remain stopped.
 
+Concurrent Start requests use the current lifecycle state and credentials.
+Starting an already Ready sandbox leaves its credentials unchanged. The gateway
+checks queued container exit events against the live driver state before letting
+them replace a restarted sandbox's readiness. A current runtime failure still
+makes the sandbox unavailable.
+
+Delete can reclaim a staging container whose creation finishes during canceled
+provisioning. Cleanup stays scoped to that sandbox. A volume held by an unknown
+container remains an error; OpenShell does not force its removal or delete the
+unknown container.
+
 For GPU-backed Docker sandboxes, configure Docker CDI before starting the gateway so OpenShell can detect the daemon capability.
 
 ### Docker Driver Config Mounts

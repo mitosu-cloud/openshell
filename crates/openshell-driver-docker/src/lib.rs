@@ -1852,6 +1852,50 @@ impl DockerComputeDriver {
         Ok(removed)
     }
 
+    /// An aborted create request can finish in Docker after the first auxiliary
+    /// scan. On a busy volume, rescan only this sandbox's auxiliaries and retry
+    /// only when that scan actually removed an admitted resource. Unknown
+    /// references and persistent conflicts remain errors; never force a volume.
+    async fn remove_sandbox_runtime_volumes(&self, sandbox_id: &str) -> Result<(), Status> {
+        for name in [
+            docker_channel_volume_name_by_id(sandbox_id, &self.config),
+            docker_supervisor_volume_name_by_id(sandbox_id, &self.config),
+        ] {
+            for attempt in 0..3 {
+                match self
+                    .docker
+                    .remove_volume(
+                        &name,
+                        None::<bollard::query_parameters::RemoveVolumeOptions>,
+                    )
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(error) if is_not_found_error(&error) => break,
+                    Err(error) => {
+                        if !matches!(
+                            &error,
+                            BollardError::DockerResponseServerError {
+                                status_code: 409,
+                                ..
+                            }
+                        ) || attempt == 2
+                            || !self
+                                .remove_auxiliary_containers_for_sandbox(sandbox_id)
+                                .await?
+                        {
+                            return Err(internal_status(
+                                "remove Docker sandbox runtime volume",
+                                error,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn ensure_control_process_for_container(
         &self,
         container: &ContainerSummary,
@@ -1925,13 +1969,12 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<bool, Status> {
-        let pending = self
+        let mut pending = self
             .remove_pending_sandbox(sandbox_id, sandbox_name)
             .await?;
-        if let Some(record) = pending.as_ref()
-            && let Some(task) = record.task.as_ref()
-        {
+        if let Some(task) = pending.as_mut().and_then(|record| record.task.take()) {
             task.abort();
+            let _ = task.await;
         }
         if let Some(record) = pending.as_ref() {
             self.stop_control_process(&record.sandbox.id).await;
@@ -1955,23 +1998,15 @@ impl DockerComputeDriver {
                 {
                     Ok(()) => {
                         self.clear_runtime_failure(&record.sandbox.id).await;
-                        remove_docker_channel_volume_by_id(
-                            &self.docker,
-                            &record.sandbox.id,
-                            &self.config,
-                        )
-                        .await?;
+                        self.remove_sandbox_runtime_volumes(&record.sandbox.id)
+                            .await?;
                         cleanup_docker_boundary_state(&record.sandbox, &self.config);
                         return Ok(true);
                     }
                     Err(err) if is_not_found_error(&err) => {
                         self.clear_runtime_failure(&record.sandbox.id).await;
-                        let _ = remove_docker_channel_volume_by_id(
-                            &self.docker,
-                            &record.sandbox.id,
-                            &self.config,
-                        )
-                        .await;
+                        self.remove_sandbox_runtime_volumes(&record.sandbox.id)
+                            .await?;
                         cleanup_docker_boundary_state(&record.sandbox, &self.config);
                         return Ok(true);
                     }
@@ -1985,7 +2020,7 @@ impl DockerComputeDriver {
                 let removed = self
                     .remove_auxiliary_containers_for_sandbox(sandbox_id)
                     .await?;
-                remove_docker_channel_volume_by_id(&self.docker, sandbox_id, &self.config).await?;
+                self.remove_sandbox_runtime_volumes(sandbox_id).await?;
                 cleanup_docker_boundary_state_by_id(sandbox_id, &self.config);
                 self.clear_runtime_failure(sandbox_id).await;
                 return Ok(removed);
@@ -2014,19 +2049,15 @@ impl DockerComputeDriver {
         {
             Ok(()) => {
                 self.clear_runtime_failure(resolved_sandbox_id).await;
-                remove_docker_channel_volume_by_id(&self.docker, resolved_sandbox_id, &self.config)
+                self.remove_sandbox_runtime_volumes(resolved_sandbox_id)
                     .await?;
                 cleanup_docker_boundary_state_by_id(resolved_sandbox_id, &self.config);
                 Ok(true)
             }
             Err(err) if is_not_found_error(&err) => {
                 self.clear_runtime_failure(resolved_sandbox_id).await;
-                let _ = remove_docker_channel_volume_by_id(
-                    &self.docker,
-                    resolved_sandbox_id,
-                    &self.config,
-                )
-                .await;
+                self.remove_sandbox_runtime_volumes(resolved_sandbox_id)
+                    .await?;
                 cleanup_docker_boundary_state_by_id(resolved_sandbox_id, &self.config);
                 Ok(pending.is_some())
             }
@@ -2054,7 +2085,7 @@ impl DockerComputeDriver {
                 self.remove_auxiliary_containers_for_sandbox(&record.sandbox.id)
                     .await?;
                 self.clear_runtime_failure(&record.sandbox.id).await;
-                remove_docker_channel_volume_by_id(&self.docker, &record.sandbox.id, &self.config)
+                self.remove_sandbox_runtime_volumes(&record.sandbox.id)
                     .await?;
                 cleanup_docker_boundary_state(&record.sandbox, &self.config);
                 self.publish_deleted(record.sandbox.id);

@@ -244,7 +244,15 @@ build_component_for_arch() {
   fi
 
   mkdir -p "$stage"
-  install -m 0755 "$binary_path" "${stage}/${binary}"
+  # Parallel image builds read this shared path. install can unlink an
+  # existing destination before copying, so publish a complete executable
+  # with a same-directory rename instead of exposing a missing/partial file.
+  (
+    staged_binary="$(mktemp "${stage}/.${binary}.XXXXXXXX")"
+    trap 'rm -f -- "$staged_binary"' EXIT
+    install -m 0755 "$binary_path" "$staged_binary"
+    mv -f -- "$staged_binary" "${stage}/${binary}"
+  )
   ls -lh "${stage}/${binary}"
 }
 

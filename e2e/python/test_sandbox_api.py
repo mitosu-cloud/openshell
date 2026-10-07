@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from google.protobuf import duration_pb2
@@ -80,6 +81,50 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         with contextlib.suppress(Exception):
             sandbox_client.delete(name, workspace="default", allow_missing=True)
             sandbox_client.wait_deleted(name, workspace="default", timeout_seconds=120)
+
+
+def test_concurrent_starts_preserve_runtime_authentication(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    scope = datamodel_pb2.WorkspaceSelector(workspace="default")
+    with sandbox(delete_on_exit=True) as sb:
+        for _ in range(3):
+            sandbox_client._stub.StopSandbox(
+                openshell_pb2.StopSandboxRequest(
+                    name=sb.sandbox.name,
+                    workspace_scope=scope,
+                    request_id=str(uuid.uuid4()),
+                ),
+                timeout=60,
+            )
+            sandbox_client.wait_stopped(
+                sb.sandbox.name, workspace="default", timeout_seconds=120
+            )
+            barrier = threading.Barrier(3)
+
+            def start():
+                barrier.wait(timeout=10)
+                return sandbox_client._stub.StartSandbox(
+                    openshell_pb2.StartSandboxRequest(
+                        name=sb.sandbox.name,
+                        workspace_scope=scope,
+                        request_id=str(uuid.uuid4()),
+                    ),
+                    timeout=60,
+                ).sandbox.metadata.id
+
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                starts = [workers.submit(start) for _ in range(2)]
+                barrier.wait(timeout=10)
+                assert [request.result(timeout=65) for request in starts] == [sb.id] * 2
+
+            sandbox_client.wait_ready(
+                sb.sandbox.name, workspace="default", timeout_seconds=300
+            )
+            result = sb.exec(["sh", "-c", "printf concurrent-start-ok"])
+            assert result.exit_code == 0
+            assert result.stdout == "concurrent-start-ok"
 
 
 def test_sandbox_api_crud_and_exec(

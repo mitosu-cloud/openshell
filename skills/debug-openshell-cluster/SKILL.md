@@ -282,6 +282,21 @@ not follow this local gateway lifecycle. Internal and external drivers follow
 the same rule: `GetCapabilities.gateway_manages_lifecycle` must be true for the
 gateway to run shutdown and startup sweeps.
 
+When a sandbox becomes Error immediately after a successful Start, compare the
+watch event with current engine state and the replacement supervisor session.
+Queued `ContainerExited`, `ContainerStopped`, and `ContainerRuntimeRestart`
+events are revalidated even after the replacement reaches Ready. A live exit or
+unverified terminal event for a stable Ready sandbox still fails closed. Start
+credential preparation runs after lifecycle admission and commits with Starting;
+Ready replays and recovery-held starts do not rotate the authorization identity.
+Do not work around revision conflicts by disabling CAS or authentication.
+
+A Docker volume-in-use conflict during delete can indicate a staging container
+created after cancellation. Delete joins the canceled provisioner and performs a
+bounded exact-sandbox auxiliary rescan on that conflict. A reference outside the
+admitted sandbox remains an error. Inspect the original container IDs and labels;
+do not force volume removal or expand cleanup to the whole namespace.
+
 Docker driver startup preserves auxiliary containers and channel volumes until
 an exact sandbox lifecycle request authorizes cleanup. Namespace labels alone
 do not identify the owning gateway. A stopped or unclaimed supervisor left
