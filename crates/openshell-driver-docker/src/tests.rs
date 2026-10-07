@@ -214,6 +214,311 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
     }
 }
 
+/// Minimal Docker API fixture with a request log, so discovery tests assert on
+/// actual engine mutations rather than only the returned sandbox status.
+struct DiscoveryEngine {
+    driver: DockerComputeDriver,
+    requests: Arc<Mutex<Vec<(String, String)>>>,
+    server: JoinHandle<()>,
+}
+
+impl Drop for DiscoveryEngine {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+async fn discovery_engine() -> DiscoveryEngine {
+    use tokio::io::AsyncReadExt as _;
+
+    let summaries = [
+        (
+            "foreign-running",
+            "foreign-running-container",
+            "sandbox",
+            "running",
+        ),
+        (
+            "held-stopped",
+            "held-stopped-container",
+            "sandbox",
+            "exited",
+        ),
+        ("owned", "owned-container", "sandbox", "running"),
+        (
+            "foreign-running",
+            "foreign-supervisor",
+            "supervisor",
+            "running",
+        ),
+        ("held-stopped", "held-supervisor", "supervisor", "exited"),
+        ("owned", "owned-supervisor", "supervisor", "running"),
+    ]
+    .map(|(id, container, role, state)| {
+        serde_json::json!({
+            "Id": container,
+            "Names": [format!("/{container}")],
+            "State": state,
+            "Labels": {
+                LABEL_MANAGED_BY: LABEL_MANAGED_BY_VALUE,
+                LABEL_SANDBOX_NAMESPACE: "default",
+                LABEL_SANDBOX_ID: id,
+                LABEL_SANDBOX_NAME: id,
+                LABEL_ISOLATION_ROLE: role,
+            }
+        })
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let request_log = requests.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut part = [0; 2048];
+                let read = stream.read(&mut part).await.unwrap();
+                assert!(read > 0 && headers.len() < 16384);
+                headers.extend_from_slice(&part[..read]);
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            let mut words = headers.lines().next().unwrap().split_whitespace();
+            let method = words.next().unwrap().to_string();
+            let target = words.next().unwrap().to_string();
+            request_log
+                .lock()
+                .await
+                .push((method.clone(), target.clone()));
+            let url = Url::parse(&format!("http://fixture{target}")).unwrap();
+            let (status, body) = if method == "GET" && url.path().ends_with("/containers/json") {
+                let filters = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "filters")
+                    .map(|(_, value)| {
+                        serde_json::from_str::<HashMap<String, Vec<String>>>(&value).unwrap()
+                    })
+                    .unwrap_or_default();
+                let labels = filters.get("label").cloned().unwrap_or_default();
+                let selected = summaries
+                    .iter()
+                    .filter(|summary| {
+                        labels.iter().all(|filter| {
+                            let (key, value) = filter.split_once('=').unwrap();
+                            summary["Labels"][key].as_str() == Some(value)
+                        })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (200, serde_json::to_string(&selected).unwrap())
+            } else if method == "GET" && url.path().ends_with("/json") {
+                (
+                    200,
+                    serde_json::json!({
+                        "HostConfig": {"NetworkMode": "bridge"},
+                        "State": {"Status": "exited", "ExitCode": 137}
+                    })
+                    .to_string(),
+                )
+            } else if method == "POST" && url.path().ends_with("/stop")
+                || method == "DELETE" && url.path().contains("/containers/")
+            {
+                (204, String::new())
+            } else {
+                (
+                    404,
+                    serde_json::json!({"message": "unsupported fixture request"}).to_string(),
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let mut driver = test_driver_with_config(runtime_config());
+    driver.docker =
+        Arc::new(Docker::connect_with_http(&endpoint, 2, bollard::API_DEFAULT_VERSION).unwrap());
+    DiscoveryEngine {
+        driver,
+        requests,
+        server,
+    }
+}
+
+#[tokio::test]
+async fn namespace_discovery_does_not_stop_unclaimed_running_or_held_guests() {
+    let fixture = discovery_engine().await;
+    let response =
+        ComputeDriver::list_sandboxes(&fixture.driver, Request::new(ListSandboxesRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+    assert_eq!(response.sandboxes.len(), 3);
+    let held = response
+        .sandboxes
+        .iter()
+        .find(|sandbox| sandbox.id == "held-stopped")
+        .unwrap();
+    assert!(
+        held.status
+            .as_ref()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.reason == CONDITION_RUNTIME_RESTART && condition.message.contains("137")
+            })
+    );
+    let response = ComputeDriver::get_sandbox(
+        &fixture.driver,
+        Request::new(GetSandboxRequest {
+            sandbox_id: "foreign-running".to_string(),
+            sandbox_name: String::new(),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(response.sandbox.unwrap().id, "foreign-running");
+    let _watch =
+        ComputeDriver::watch_sandboxes(&fixture.driver, Request::new(WatchSandboxesRequest {}))
+            .await
+            .unwrap();
+    fixture.driver.current_snapshot_map().await.unwrap();
+    assert!(
+        fixture
+            .requests
+            .lock()
+            .await
+            .iter()
+            .all(|(method, _)| method == "GET")
+    );
+    assert!(fixture.driver.runtime_failures.lock().await.is_empty());
+    assert!(fixture.driver.control_processes.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn namespace_poll_enforces_outer_fence_only_for_its_controlled_guest() {
+    let fixture = discovery_engine().await;
+    let (shutdown, shutdown_rx) = oneshot::channel();
+    fixture.driver.control_processes.lock().await.insert(
+        "owned".to_string(),
+        DockerControlProcess {
+            shutdown: Some(shutdown),
+            intentional_shutdown: Arc::new(AtomicBool::new(false)),
+            task: tokio::spawn(async move {
+                let _ = shutdown_rx.await;
+            }),
+        },
+    );
+    let snapshots = fixture.driver.current_snapshots().await.unwrap();
+    assert!(
+        fixture
+            .driver
+            .runtime_failures
+            .lock()
+            .await
+            .contains_key("owned")
+    );
+    assert!(
+        !fixture
+            .driver
+            .runtime_failures
+            .lock()
+            .await
+            .contains_key("foreign-running")
+    );
+    let owned = snapshots
+        .iter()
+        .find(|sandbox| sandbox.id == "owned")
+        .unwrap();
+    assert!(
+        owned
+            .status
+            .as_ref()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| condition.reason == "OuterFenceViolation")
+    );
+    let mutations = fixture
+        .requests
+        .lock()
+        .await
+        .iter()
+        .filter(|(method, _)| method != "GET")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(mutations.len(), 1);
+    assert!(mutations[0].1.contains("/containers/owned-container/stop"));
+    fixture.driver.stop_control_process("owned").await;
+    fixture.requests.lock().await.clear();
+    fixture.driver.current_snapshots().await.unwrap();
+    assert!(
+        fixture
+            .requests
+            .lock()
+            .await
+            .iter()
+            .all(|(method, _)| method == "GET")
+    );
+}
+
+#[tokio::test]
+async fn explicit_start_stops_exact_running_guest_with_invalid_outer_fence() {
+    let fixture = discovery_engine().await;
+    let error = fixture
+        .driver
+        .start_sandbox("owned", "owned", "generation-1", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("network_mode=none"));
+    let mutations = fixture
+        .requests
+        .lock()
+        .await
+        .iter()
+        .filter(|(method, _)| method != "GET")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(mutations.len(), 1);
+    assert!(mutations[0].1.contains("/containers/owned-container/stop"));
+    assert!(
+        !fixture
+            .driver
+            .runtime_failures
+            .lock()
+            .await
+            .contains_key("foreign-running")
+    );
+}
+
+#[tokio::test]
+async fn exact_auxiliary_cleanup_preserves_other_gateway_and_held_supervisors() {
+    let fixture = discovery_engine().await;
+    assert!(
+        fixture
+            .driver
+            .remove_auxiliary_containers_for_sandbox("owned")
+            .await
+            .unwrap()
+    );
+    let mutations = fixture
+        .requests
+        .lock()
+        .await
+        .iter()
+        .filter(|(method, _)| method != "GET")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(mutations.len(), 1);
+    assert_eq!(mutations[0].0, "DELETE");
+    assert!(mutations[0].1.contains("/containers/owned-supervisor?"));
+}
+
 #[test]
 fn capabilities_report_static_resource_support() {
     let mut config = runtime_config();

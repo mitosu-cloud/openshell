@@ -32,6 +32,14 @@ already-running resources are unchanged, retained stopped compute is restarted,
 and explicitly stopped sandboxes remain stopped. Kubernetes workloads continue
 running independently of the gateway process.
 
+Docker startup discovers namespace-labeled resources without deleting auxiliary
+containers or channel volumes. The shared label does not grant ownership to a
+gateway. Cleanup follows exact sandbox Start, Stop and Delete requests from the
+gateway's persisted records. Polling enforces the outer network fence only for
+guests whose supervisors this driver instance controls; an explicit Start also
+rejects and stops its exact running guest if that fence is broken. Unclaimed
+resources remain available for operator review.
+
 The gateway forwards one exact, persisted main-process specification to every
 driver. Drivers serialize that specification in
 `OPENSHELL_MAIN_PROCESS_SPEC`; they do not install an idle `sleep` workload or

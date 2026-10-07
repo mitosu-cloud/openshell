@@ -217,6 +217,19 @@ running. Explicitly `Stopped` sandboxes are excluded from both sweeps. Kubernete
 cluster-owned and continue running without gateway shutdown or startup
 lifecycle calls.
 
+Docker namespace discovery does not establish gateway ownership. Driver
+construction leaves auxiliary containers and channel volumes untouched;
+gateway-directed lifecycle requests clean resources for an exact sandbox after
+persisted-intent and recovery-admission checks. The Docker poller applies
+mutating outer-fence enforcement only to sandbox IDs in this driver instance's
+control-process registry, populated by Create and admitted Start. Discovery of
+another gateway's running guest or an inactive held guest is read-only. An
+explicit Start stops its exact already-running guest when its fence is invalid,
+even before control-process registration. Unclaimed auxiliaries and volumes
+remain for explicit operator review; namespace-wide garbage collection is not
+an ownership proof. This uses the existing registry and RPC contract and adds
+no service, worker, database table or resource-label migration.
+
 The driver reports this behavior through
 `GetCapabilities.gateway_manages_lifecycle`. The same declaration works for
 in-process and external drivers. Older drivers omit the field and retain the

@@ -18,8 +18,8 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
-    ListContainersOptionsBuilder, ListVolumesOptionsBuilder, LogsOptionsBuilder,
-    RemoveContainerOptionsBuilder, StopContainerOptionsBuilder, UploadToContainerOptionsBuilder,
+    ListContainersOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+    StopContainerOptionsBuilder, UploadToContainerOptionsBuilder,
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -993,15 +993,9 @@ impl DockerComputeDriver {
             runtime_failures: Arc::new(Mutex::new(HashMap::new())),
         };
 
-        Box::pin(driver.reconcile_runtime_resources_at_startup())
-            .await
-            .map_err(|error| {
-                Error::config(format!(
-                    "failed to reconcile Docker isolation resources: {}",
-                    error.message()
-                ))
-            })?;
-
+        // Namespace labels identify discoverable resources, not this gateway's
+        // ownership. Cleanup belongs to exact sandbox lifecycle requests after
+        // the gateway has checked its persisted intent and recovery admission.
         let poll_driver = driver.clone();
         tokio::spawn(async move {
             poll_driver.poll_loop().await;
@@ -1303,6 +1297,14 @@ impl DockerComputeDriver {
                 continue;
             };
             if let Some(container_id) = summary.id.as_deref() {
+                // A shared namespace can contain another gateway's workloads.
+                // Discovery must not acquire control of them. Only successful
+                // Create/Start installs a supervisor owned by this driver.
+                let supervised = self
+                    .control_processes
+                    .lock()
+                    .await
+                    .contains_key(&sandbox.id);
                 match self.docker.inspect_container(container_id, None).await {
                     Ok(inspected) if summary.state == Some(ContainerSummaryStateEnum::EXITED) => {
                         // Docker's list summary carries no exit code. Inspect
@@ -1312,7 +1314,10 @@ impl DockerComputeDriver {
                             apply_docker_exit_classification(&mut sandbox, state);
                         }
                     }
-                    Ok(inspected) if summary.state == Some(ContainerSummaryStateEnum::RUNNING) => {
+                    Ok(inspected)
+                        if summary.state == Some(ContainerSummaryStateEnum::RUNNING)
+                            && supervised =>
+                    {
                         if let Err(status) = validate_docker_outer_fence(&inspected) {
                             let context = self
                                 .control_failure_context(sandbox.clone(), container_id.to_string());
@@ -1847,106 +1852,6 @@ impl DockerComputeDriver {
         Ok(removed)
     }
 
-    async fn reconcile_runtime_resources_at_startup(&self) -> Result<(), Status> {
-        let sandboxes = self.list_managed_container_summaries().await?;
-        let sandbox_ids = sandboxes
-            .iter()
-            .filter_map(|container| {
-                container
-                    .labels
-                    .as_ref()
-                    .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
-                    .cloned()
-            })
-            .collect::<HashSet<_>>();
-
-        let filters = managed_resource_label_filters(&self.config.sandbox_namespace, []);
-        let auxiliary = self
-            .docker
-            .list_containers(Some(
-                ListContainersOptionsBuilder::default()
-                    .all(true)
-                    .filters(&filters)
-                    .build(),
-            ))
-            .await
-            .map_err(|error| internal_status("list Docker startup resources", error))?;
-        for container in auxiliary {
-            let role = container
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get(LABEL_ISOLATION_ROLE))
-                .map(String::as_str);
-            if !matches!(
-                role,
-                Some(
-                    LABEL_ISOLATION_ROLE_SUPERVISOR
-                        | LABEL_ISOLATION_ROLE_STAGING
-                        | LABEL_ISOLATION_ROLE_IDENTITY
-                )
-            ) {
-                continue;
-            }
-            let Some(target) = summary_container_target(&container) else {
-                continue;
-            };
-            self.docker
-                .remove_container(
-                    &target,
-                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-                )
-                .await
-                .or_else(|error| {
-                    if is_not_found_error(&error) {
-                        Ok(())
-                    } else {
-                        Err(error)
-                    }
-                })
-                .map_err(|error| internal_status("remove stale Docker auxiliary", error))?;
-        }
-
-        let volume_filters = label_filters([
-            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}"),
-            format!(
-                "{LABEL_SANDBOX_NAMESPACE}={}",
-                self.config.sandbox_namespace
-            ),
-            format!("{LABEL_ISOLATION_BACKEND}={LABEL_ISOLATION_BACKEND_OPEN_SHELL}"),
-        ]);
-        let volumes = self
-            .docker
-            .list_volumes(Some(
-                ListVolumesOptionsBuilder::default()
-                    .filters(&volume_filters)
-                    .build(),
-            ))
-            .await
-            .map_err(|error| internal_status("list Docker startup volumes", error))?;
-        for volume in volumes.volumes.unwrap_or_default() {
-            let sandbox_id = volume.labels.get(LABEL_SANDBOX_ID);
-            if sandbox_id.is_some_and(|id| sandbox_ids.contains(id)) {
-                continue;
-            }
-            self.docker
-                .remove_volume(
-                    &volume.name,
-                    None::<bollard::query_parameters::RemoveVolumeOptions>,
-                )
-                .await
-                .or_else(|error| {
-                    if is_not_found_error(&error) {
-                        Ok(())
-                    } else {
-                        Err(error)
-                    }
-                })
-                .map_err(|error| internal_status("remove orphan Docker channel volume", error))?;
-        }
-
-        Ok(())
-    }
-
     async fn ensure_control_process_for_container(
         &self,
         container: &ContainerSummary,
@@ -2263,7 +2168,22 @@ impl DockerComputeDriver {
             .inspect_container(&target, None)
             .await
             .map_err(|error| internal_status("inspect Docker sandbox outer fence", error))?;
-        validate_docker_outer_fence(&inspected)?;
+        if let Err(status) = validate_docker_outer_fence(&inspected) {
+            // An explicit Start grants control of this exact sandbox. Refuse
+            // adoption and stop an already-running workload whose outer fence
+            // is broken, even before a supervisor has been installed.
+            if container.state == Some(ContainerSummaryStateEnum::RUNNING)
+                && let Some(sandbox) = sandbox_from_container_summary(&container)
+            {
+                handle_docker_runtime_failure(
+                    self.control_failure_context(sandbox, target.clone()),
+                    "OuterFenceViolation",
+                    status.message().to_string(),
+                )
+                .await;
+            }
+            return Err(status);
+        }
         let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
         let mut previous_finished_at = if state == ContainerSummaryStateEnum::EXITED {
             inspected
