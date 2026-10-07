@@ -15,8 +15,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, ProvisionSandboxFileCommand, ProvisionSandboxFileResult,
-    ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen, ReportMainProcessExitRequest,
+    GatewayMessage, ProviderReadinessObservation, ProvisionSandboxFileCommand,
+    ProvisionSandboxFileResult, RelayFrame, RelayInit, RelayOpen, ReportMainProcessExitRequest,
     ReportMainProcessExitResponse, Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget,
     SupervisorMessage, gateway_message, relay_open, supervisor_message,
 };

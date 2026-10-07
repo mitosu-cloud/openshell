@@ -8,8 +8,6 @@ mod accept_interrupt;
 pub mod boundary_exec;
 pub mod boundary_io;
 mod boundary_server;
-#[cfg(unix)]
-mod provision_file;
 pub mod child_env;
 #[cfg(target_os = "linux")]
 pub(crate) mod delegated;
@@ -24,6 +22,8 @@ mod network_broker;
 pub mod perf;
 #[cfg(unix)]
 pub mod process;
+#[cfg(unix)]
+mod provision_file;
 mod pty;
 pub mod sandbox;
 

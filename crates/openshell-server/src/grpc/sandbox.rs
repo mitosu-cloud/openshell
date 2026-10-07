@@ -1983,7 +1983,9 @@ pub(super) async fn handle_provision_sandbox_file(
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
     if request.mode != 0o600 {
-        return Err(Status::invalid_argument("credential files must be mode 0600"));
+        return Err(Status::invalid_argument(
+            "credential files must be mode 0600",
+        ));
     }
     if request.contents.is_empty() || request.contents.len() > MAX_PRIVATE_FILE_BYTES {
         return Err(Status::invalid_argument(format!(
@@ -2028,9 +2030,11 @@ fn validate_private_file_path(path: &str) -> Result<(), Status> {
             "private file path must be absolute",
         ));
     }
-    if path.split('/').skip(1).any(|part| {
-        part.is_empty() || part == "." || part == ".." || part.contains(['\\', '\n'])
-    }) {
+    if path
+        .split('/')
+        .skip(1)
+        .any(|part| part.is_empty() || part == "." || part == ".." || part.contains(['\\', '\n']))
+    {
         return Err(Status::invalid_argument(
             "private file path must not contain '.' or '..'",
         ));

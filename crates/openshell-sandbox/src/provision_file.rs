@@ -135,8 +135,9 @@ fn create_private_parents(parent: &Path) -> Result<(), String> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 fs::create_dir(&prefix)
                     .map_err(|error| format!("creating {}: {error}", prefix.display()))?;
-                fs::set_permissions(&prefix, fs::Permissions::from_mode(0o700))
-                    .map_err(|error| format!("setting permissions on {}: {error}", prefix.display()))?;
+                fs::set_permissions(&prefix, fs::Permissions::from_mode(0o700)).map_err(
+                    |error| format!("setting permissions on {}: {error}", prefix.display()),
+                )?;
             }
             Err(error) => return Err(format!("reading {}: {error}", prefix.display())),
         }
@@ -191,8 +192,8 @@ fn write_exclusive(path: &Path, contents: &[u8]) -> Result<(), String> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), String> {
-    let directory = fs::File::open(path)
-        .map_err(|error| format!("opening {}: {error}", path.display()))?;
+    let directory =
+        fs::File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
     directory
         .sync_all()
         .map_err(|error| format!("syncing {}: {error}", path.display()))?;
@@ -253,7 +254,8 @@ mod tests {
         fs::write(&target, b"x").unwrap();
         let link = root.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let error = provision_private_file(link.to_str().unwrap(), b"secret", true, uid()).unwrap_err();
+        let error =
+            provision_private_file(link.to_str().unwrap(), b"secret", true, uid()).unwrap_err();
         assert!(error.contains("symbolic link"), "{error}");
         assert_eq!(fs::read(&target).unwrap(), b"x");
     }
