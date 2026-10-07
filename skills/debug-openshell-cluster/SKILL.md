@@ -408,6 +408,14 @@ the deadline passes without a transition to `Ready`. Docker, Podman,
 Kubernetes, and VM native restart policies remain disabled; the gateway owns
 the replacement.
 
+Docker driver startup preserves auxiliary containers and channel volumes until
+an exact sandbox lifecycle request authorizes cleanup. Namespace labels alone
+do not identify the owning gateway. A stopped or unclaimed supervisor left
+under that label is not evidence that startup should remove it. Check the
+owning gateway's sandbox record and recovery state before any manual cleanup.
+Discovery does not stop another gateway's workload for an outer-fence violation;
+enforcement belongs to the driver controlling that guest or an explicit Start.
+
 ### Step 5: Check Podman-Backed Gateways
 
 ```bash
