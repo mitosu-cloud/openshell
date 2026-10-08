@@ -11,10 +11,11 @@ use crate::lifecycle::{
     RestoreContext, extension_state_dir,
 };
 use crate::rootfs::{
-    clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    extract_host_supervisor, extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root,
-    recover_rootfs_image, remove_rootfs_image_file, sandbox_guest_init_path,
-    sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
+    RootfsOwnership, clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size,
+    create_rootfs_image_with_ownership, extract_host_supervisor, extract_rootfs_archive_to,
+    merge_layer_ownership, prepare_sandbox_rootfs_from_image_root, read_archive_ownership,
+    read_rootfs_archive_ownership, recover_rootfs_image, remove_rootfs_image_file,
+    sandbox_guest_init_path, sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
     sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode,
     validate_host_supervisor, write_rootfs_image_file,
 };
@@ -3758,6 +3759,8 @@ impl VmDriver {
 
         let image_ref_owned = image_ref.to_string();
         let image_identity_owned = image_identity.to_string();
+        let owners =
+            read_rootfs_archive_ownership(&exported_rootfs).map_err(Status::failed_precondition)?;
         let exported_rootfs_for_build = exported_rootfs.clone();
         let prepared_rootfs_for_build = prepared_rootfs.clone();
         let (sandbox_uid, sandbox_gid) = configured_sandbox_identity(&self.config)
@@ -3809,7 +3812,11 @@ impl VmDriver {
         let prepared_rootfs_for_build = prepared_rootfs.clone();
         let prepared_image_for_build = prepared_image.clone();
         let build_result = tokio::task::spawn_blocking(move || {
-            create_rootfs_image_from_dir(&prepared_rootfs_for_build, &prepared_image_for_build)
+            create_rootfs_image_with_ownership(
+                &prepared_rootfs_for_build,
+                &prepared_image_for_build,
+                &owners,
+            )
         })
         .await
         .map_err(|err| Status::internal(format!("rootfs image build panicked: {err}")))?;
@@ -3874,7 +3881,7 @@ impl VmDriver {
             staging_dir = %staging_dir.display(),
             "vm driver: pulling registry image layers"
         );
-        if let Err(err) = self
+        let owners = match self
             .pull_registry_image_rootfs(
                 sandbox_id,
                 client,
@@ -3886,14 +3893,17 @@ impl VmDriver {
             )
             .await
         {
-            warn!(
-                image_ref = %image_ref,
-                error = %err.message(),
-                "vm driver: pull_registry_image_rootfs failed"
-            );
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(err);
-        }
+            Ok(owners) => owners,
+            Err(err) => {
+                warn!(
+                    image_ref = %image_ref,
+                    error = %err.message(),
+                    "vm driver: pull_registry_image_rootfs failed"
+                );
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                return Err(err);
+            }
+        };
         info!(
             image_ref = %image_ref,
             "vm driver: image layers pulled, preparing rootfs image"
@@ -3955,7 +3965,11 @@ impl VmDriver {
         let prepared_rootfs_for_build = prepared_rootfs.clone();
         let prepared_image_for_build = prepared_image.clone();
         let build_result = tokio::task::spawn_blocking(move || {
-            create_rootfs_image_from_dir(&prepared_rootfs_for_build, &prepared_image_for_build)
+            create_rootfs_image_with_ownership(
+                &prepared_rootfs_for_build,
+                &prepared_image_for_build,
+                &owners,
+            )
         })
         .await
         .map_err(|err| Status::internal(format!("image rootfs build panicked: {err}")))?;
@@ -4925,7 +4939,7 @@ impl VmDriver {
         image_ref: &str,
         staging_dir: &Path,
         rootfs: &Path,
-    ) -> Result<(), Status> {
+    ) -> Result<RootfsOwnership, Status> {
         retry_registry_request("authenticate with registry", || {
             client.auth(reference, auth, RegistryOperation::Pull)
         })
@@ -4979,13 +4993,15 @@ impl VmDriver {
             .await?;
         layers.sort_by_key(|layer| layer.index);
 
+        let mut owners = RootfsOwnership::new();
         for layer in &layers {
             apply_registry_layer_blob(image_ref, rootfs, layer).await?;
+            merge_layer_ownership(&mut owners, layer.ownership.clone());
         }
 
         remove_registry_layer_staging(staging_dir).await?;
 
-        Ok(())
+        Ok(owners)
     }
 
     fn publish_registry_layer_progress(
@@ -5042,6 +5058,7 @@ impl VmDriver {
 }
 
 struct DownloadedRegistryLayer {
+    ownership: RootfsOwnership,
     index: usize,
     digest: String,
     layer_root: PathBuf,
@@ -5101,8 +5118,16 @@ async fn download_registry_layer_blob(
     let blob_path_for_unpack = blob_path.clone();
     let layer_root_for_unpack = layer_root.clone();
     let media_type = layer.media_type.clone();
-    tokio::task::spawn_blocking(move || {
-        extract_layer_blob_to_dir(&blob_path_for_unpack, &media_type, &layer_root_for_unpack)
+    let ownership = tokio::task::spawn_blocking(move || {
+        extract_layer_blob_to_dir(&blob_path_for_unpack, &media_type, &layer_root_for_unpack)?;
+        let file = fs::File::open(&blob_path_for_unpack).map_err(|e| e.to_string())?;
+        match layer_compression_from_media_type(&media_type)? {
+            LayerCompression::None => read_archive_ownership(file),
+            LayerCompression::Gzip => read_archive_ownership(GzDecoder::new(file)),
+            LayerCompression::Zstd => read_archive_ownership(
+                zstd::stream::read::Decoder::new(file).map_err(|e| e.to_string())?,
+            ),
+        }
     })
     .await
     .map_err(|err| Status::internal(format!("layer extraction panicked: {err}")))?
@@ -5114,6 +5139,7 @@ async fn download_registry_layer_blob(
     })?;
 
     Ok(DownloadedRegistryLayer {
+        ownership,
         index,
         digest: layer.digest,
         layer_root,

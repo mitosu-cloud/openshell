@@ -51,6 +51,11 @@ TCP mediation accepts use the same authenticated transport recovery as process w
 
 A renewed Sandbox Protocol bearer is authenticated even when its credential epoch is unchanged. The supervisor confirms that bearer on the active physical connection and records its fingerprint only after confirmation succeeds, preserving pending streams and the mediation session. Changing the credential epoch still requires an authenticated replacement connection.
 
+Control frames are bounded at 2 MiB, including JSON encoding overhead. This
+admits bundled CA roots in `StartAgent` on native macOS supervisors. Private
+file provisioning retains its separate 256 KiB content limit. The supervisor
+and sandbox must ship with matching protocol bounds.
+
 Unauthenticated TLS handshakes have a separate bounded asynchronous pool and
 five-second deadline, never consuming authenticated control slots or threads.
 The socket broker reserves the TCP control-listener port against workload

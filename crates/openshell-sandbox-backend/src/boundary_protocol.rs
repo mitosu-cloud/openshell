@@ -32,7 +32,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
+// StartAgent carries the public CA bundle as a JSON byte array. Bundled roots
+// can exceed 1 MiB after encoding even though the PEM itself is much smaller.
+// Keep the protocol bounded; provisioning's independent file limit is unchanged.
+pub const MAX_CONTROL_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const STREAM_STDIN: u8 = 0;
 pub const STREAM_STDOUT: u8 = 1;
 pub const STREAM_STDERR: u8 = 2;
@@ -1330,7 +1333,9 @@ mod tests {
                     process: ProcessPolicy::default(),
                 })),
                 ca_cert: Some(b"test certificate".to_vec()),
-                ca_bundle: Some(b"test bundle".to_vec()),
+                // A representative bundled PEM expands beyond the former
+                // 1 MiB framing limit when serialized as a JSON byte array.
+                ca_bundle: Some(vec![b'e'; 300 * 1024]),
                 provider_env_revision: 7,
                 provider_env: std::collections::HashMap::from([(
                     "OPENAI_API_KEY".to_string(),
