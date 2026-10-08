@@ -31,7 +31,9 @@ use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePu
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
+// StartAgent carries a public CA bundle. Keep the protocol bounded while
+// allowing large platform trust stores; private provisioning has its own limit.
+pub const MAX_CONTROL_FRAME_BYTES: usize = 2 * 1024 * 1024;
 /// Exec admission and recovery share one deadline; it never limits process runtime.
 pub const EXEC_REQUEST_RETRY_WINDOW: Duration = Duration::from_secs(30);
 pub const STREAM_STDIN: u8 = 0;
@@ -1681,6 +1683,7 @@ mod tests {
 
     #[test]
     fn request_round_trips_and_redacts_secrets() {
+        let ca_bundle = "e".repeat(1024 * 1024);
         let request = RequestEnvelope {
             request_id: "4e94636d-54f8-4d85-8e4e-58954fb5af0a".to_string(),
             payload_digest: String::new(),
@@ -1696,7 +1699,7 @@ mod tests {
                     interactive: false,
                 },
                 ca_cert: Some("test certificate".to_string()),
-                ca_bundle: Some("test bundle".to_string()),
+                ca_bundle: Some(ca_bundle),
                 provider_env_revision: 7,
                 provider_env: std::collections::HashMap::from([(
                     "OPENAI_API_KEY".to_string(),
@@ -1710,12 +1713,14 @@ mod tests {
             ..request
         };
         let frame = encode_frame(&request).expect("encode request");
+        assert!(frame.len() > 1024 * 1024);
+        assert!(frame.len() <= MAX_CONTROL_FRAME_BYTES + size_of::<u32>());
         let decoded: RequestEnvelope = decode_frame(&frame).expect("decode request");
         assert_eq!(decoded, request);
         let debug = format!("{request:?}");
         assert!(!debug.contains("test credential"));
         assert!(!debug.contains("test certificate"));
-        assert!(!debug.contains("test bundle"));
+        assert!(!debug.contains(&"e".repeat(1024)));
         assert!(debug.contains("OPENAI_API_KEY"));
         assert!(request.validate_payload_digest().is_ok());
     }

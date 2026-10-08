@@ -9396,6 +9396,10 @@ network_policies:
     endpoints:
       - host: "{upstream_ip}"
         port: {upstream_port}
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {{ method: GET, path: /ws }}
     binaries:
       - {{ path: "{executable}" }}
 "#,
@@ -9519,6 +9523,10 @@ network_policies:
     endpoints:
       - host: "{upstream_ip}"
         port: {upstream_port}
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {{ method: GET, path: /ws }}
     binaries:
       - {{ path: "{executable}" }}
 "#,
