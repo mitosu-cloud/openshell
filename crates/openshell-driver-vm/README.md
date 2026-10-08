@@ -12,7 +12,7 @@ unchanged. Running legacy generations retain their original descriptors;
 newly booted generations require matching embedded runtime and supervisor
 binaries.
 
-The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest sandbox, and the custom kernel runtime. Each sandbox boots from a cached immutable bootstrap ext4 root disk plus a per-sandbox writable overlay disk. A preserved overlay is journal-checked on a sparse copy before restart; only a successful check replaces the original disk. An unrecoverable overlay stays intact for manual recovery. When the requested sandbox image differs from the bootstrap image, the driver prepares a read-only image ext4 disk inside a bootstrap VM and mounts that unpacked rootfs as the sandbox lowerdir.
+The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest sandbox, and the custom kernel runtime. Each sandbox boots from a cached immutable bootstrap ext4 root disk plus a per-sandbox writable overlay disk. Image conversion preserves the verified OCI numeric UID/GID records independently of the extracting host user; injected runtime files remain root-owned. Ownership changes invalidate the prepared-image cache. A preserved overlay is journal-checked on a sparse copy before restart; only a successful check replaces the original disk. An unrecoverable overlay stays intact for manual recovery. When the requested sandbox image differs from the bootstrap image, the driver prepares a read-only image ext4 disk inside a bootstrap VM and mounts that unpacked rootfs as the sandbox lowerdir.
 
 ## How it fits together
 

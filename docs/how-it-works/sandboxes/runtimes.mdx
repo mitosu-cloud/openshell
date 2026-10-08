@@ -299,9 +299,19 @@ The driver looks up sandbox images in local Docker or Podman before pulling from
 
 Registry downloads must match the resolved image digest, including the selected platform for multi-platform images. A mismatch fails image preparation. After upgrading, the driver rebuilds older bootstrap and prepared-image cache entries on first use, so the first sandbox start can take longer.
 
+Image conversion preserves verified numeric OCI UID/GID ownership independently
+of the unprivileged host user that extracts the layers. Injected OpenShell
+runtime files remain root-owned, and ownership-format changes invalidate the
+prepared-image cache.
+
 VM sandboxes have no network interface. All traffic flows through the OpenShell supervisor on the host. For networks that require a corporate proxy, the VM driver accepts the same `https_proxy` and `proxy_*` options as Podman. To reach a proxy on the gateway host, use `http://host.openshell.internal:<port>`.
 
 If the gateway is briefly unavailable while a VM starts, its supervisor retries the session connection. The sandbox stays in provisioning until the gateway accepts the session.
+
+Supervisor-to-guest control frames are bounded at 2 MiB, including JSON
+encoding overhead, so platform CA bundles fit without leaving the protocol
+unbounded. Private file provisioning retains its separate 256 KiB content
+limit. The supervisor and sandbox must use matching protocol bounds.
 
 Before restarting a MicroVM, the driver journal-checks a sparse copy of its
 preserved writable overlay. The repaired copy replaces the original only when
