@@ -726,8 +726,19 @@ impl russh::server::Handler for SshHandler {
         {
             Ok(()) => session.channel_success(channel)?,
             Err(error) => {
-                warn!(%error, ?channel, "failed to start boundary exec");
-                session.channel_failure(channel)?;
+                warn!(%error, ?channel, "failed to start boundary exec process");
+                session.channel_success(channel)?;
+                let handle = session.handle();
+                let _ = handle
+                    .extended_data(
+                        channel,
+                        1,
+                        b"openshell: command could not be started\n".to_vec(),
+                    )
+                    .await;
+                let _ = handle.exit_status_request(channel, 126).await;
+                let _ = handle.eof(channel).await;
+                let _ = handle.close(channel).await;
             }
         }
         Ok(())
@@ -1757,6 +1768,82 @@ mod tests {
         .await
     }
 
+    struct CompletingExec;
+
+    struct CompletingProcess;
+
+    #[async_trait::async_trait]
+    impl rpc_test::BoundaryProcess for CompletingProcess {
+        async fn wait(
+            &self,
+        ) -> std::result::Result<
+            openshell_isolation_interface::contract::BoundaryExitStatus,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            Ok(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(23))
+        }
+
+        async fn signal(
+            &self,
+            _signal: openshell_isolation_interface::contract::BoundarySignal,
+        ) -> std::result::Result<(), openshell_isolation_interface::contract::BackendError>
+        {
+            Ok(())
+        }
+
+        async fn terminate(
+            &self,
+        ) -> std::result::Result<(), openshell_isolation_interface::contract::BackendError>
+        {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rpc_test::BoundaryExec for CompletingExec {
+        async fn exec(
+            &self,
+            _spec: openshell_isolation_interface::contract::ExecSpec,
+        ) -> std::result::Result<
+            rpc_test::ExecSession,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            use tokio::io::AsyncReadExt as _;
+
+            let (stdin, mut stdin_peer) = tokio::io::duplex(64);
+            let (stdout, stdout_peer) = tokio::io::duplex(64);
+            let (stderr, stderr_peer) = tokio::io::duplex(64);
+            let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let mut input = Vec::new();
+                let _ = stdin_peer.read_to_end(&mut input).await;
+                drop(stdout_peer);
+                drop(stderr_peer);
+                let _ = status_tx
+                    .send(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(23));
+            });
+            Ok(rpc_test::ExecSession {
+                process: Arc::new(CompletingProcess),
+                stdin: Some(Box::new(stdin)),
+                stdout: Box::new(stdout),
+                stderr: Some(Box::new(stderr)),
+                terminal: None,
+                output_status: Some(status_rx),
+            })
+        }
+    }
+
+    async fn authenticated_test_client_with_exec(
+        boundary_exec: Arc<dyn rpc_test::BoundaryExec>,
+    ) -> russh::client::Handle<AcceptAnyServerKey> {
+        test_client(
+            Some(MainSession::inert()),
+            rpc_test::exec(boundary_exec),
+            russh::client::Config::default(),
+        )
+        .await
+    }
+
     pub(super) async fn test_client(
         main_session: Option<Arc<MainSession>>,
         boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
@@ -2163,6 +2250,78 @@ mod tests {
             assert_eq!(forwarded, data);
         }
         channel.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_reports_status_after_client_closes_stdin() {
+        let client = authenticated_test_client_with_exec(Arc::new(CompletingExec)).await;
+        let mut channel = client
+            .channel_open_session()
+            .await
+            .expect("open exec channel");
+        channel.exec(true, b"true").await.expect("start exec");
+        channel.eof().await.expect("close exec stdin");
+
+        let mut exit_status = None;
+        let mut close_seen = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = channel.wait().await {
+                match message {
+                    russh::ChannelMsg::ExitStatus {
+                        exit_status: status,
+                    } => {
+                        exit_status = Some(status);
+                    }
+                    russh::ChannelMsg::Close => {
+                        close_seen = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("exec channel completion timeout");
+
+        assert_eq!(exit_status, Some(23));
+        assert!(close_seen);
+    }
+
+    #[tokio::test]
+    async fn exec_start_failure_reports_stderr_and_status() {
+        let client = authenticated_test_client().await;
+        let mut channel = client
+            .channel_open_session()
+            .await
+            .expect("open exec channel");
+        channel.exec(true, b"missing").await.expect("submit exec");
+
+        let mut stderr = Vec::new();
+        let mut exit_status = None;
+        let mut close_seen = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = channel.wait().await {
+                match message {
+                    russh::ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
+                    russh::ChannelMsg::ExitStatus {
+                        exit_status: status,
+                    } => {
+                        exit_status = Some(status);
+                    }
+                    russh::ChannelMsg::Close => {
+                        close_seen = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("exec failure response timeout");
+
+        assert_eq!(stderr, b"openshell: command could not be started\n");
+        assert_eq!(exit_status, Some(126));
+        assert!(close_seen);
     }
 
     #[tokio::test]
