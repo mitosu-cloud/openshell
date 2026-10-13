@@ -110,6 +110,7 @@ pub async fn start_boundary_access(
     let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
     let listen_path = ssh_socket_path.clone();
     let ssh_port_forward = port_forward.clone();
+    let session_exec = Arc::clone(&boundary_exec);
     let ssh_main_session = main_session.clone();
     let ssh_task = tokio::spawn(async move {
         if let Err(error) = crate::ssh::run_ssh_server(
@@ -161,6 +162,7 @@ pub async fn start_boundary_access(
                 id.to_string(),
                 ssh_socket_path,
                 port_forward,
+                session_exec,
                 None,
                 terminating.clone(),
                 crate::supervisor_session::SessionRuntimeContext {

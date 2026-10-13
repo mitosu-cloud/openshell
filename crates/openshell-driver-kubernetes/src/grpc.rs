@@ -8,7 +8,8 @@ use openshell_core::proto::compute::v1::{
     AuthenticateSandboxRequest, AuthenticateSandboxResponse, CreateSandboxRequest,
     CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse, DeleteWorkspaceRequest,
     DeleteWorkspaceResponse, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
@@ -88,6 +89,22 @@ impl ComputeDriver for ComputeDriverService {
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
                 Ok(Response::new(capabilities))
             })
+            .await
+    }
+
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::GET_GATEWAY_LISTENER_REQUIREMENTS,
+                async {
+                    Ok(Response::new(
+                        GetGatewayListenerRequirementsResponse::default(),
+                    ))
+                },
+            )
             .await
     }
 

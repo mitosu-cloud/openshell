@@ -7,7 +7,7 @@
 //! to either the gRPC service or HTTP endpoints based on the request headers.
 
 use bytes::{Bytes, BytesMut};
-use http::{Extensions, HeaderValue, Request, Response};
+use http::{Extensions, HeaderValue, Request, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited, StreamBody};
 use hyper::body::Incoming;
@@ -49,6 +49,7 @@ use crate::{
     auth::oidc::{self, OidcAuthenticator},
     auth::principal::{Principal, UserPrincipal},
     auth::workspace_authz::{MinWorkspaceRole, authorize_workspace},
+    gateway_listener::GatewayListenerScope,
     http_router, service_http_router,
 };
 
@@ -234,7 +235,20 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_with_peer_identity(stream, None).await
+        self.serve_on_listener(stream, GatewayListenerScope::Primary)
+            .await
+    }
+
+    pub(crate) async fn serve_on_listener<S>(
+        &self,
+        stream: S,
+        listener_scope: GatewayListenerScope,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_with_peer_identity_on_listener(stream, None, listener_scope)
+            .await
     }
 
     /// Serve a TLS connection with an optional mTLS peer identity.
@@ -242,6 +256,23 @@ impl MultiplexService {
         &self,
         stream: S,
         peer_identity: Option<Identity>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_with_peer_identity_on_listener(
+            stream,
+            peer_identity,
+            GatewayListenerScope::Primary,
+        )
+        .await
+    }
+
+    pub(crate) async fn serve_with_peer_identity_on_listener<S>(
+        &self,
+        stream: S,
+        peer_identity: Option<Identity>,
+        listener_scope: GatewayListenerScope,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -279,7 +310,10 @@ impl MultiplexService {
         let grpc_service = request_id_middleware!(grpc_service);
         let http_service = request_id_middleware!(http_service);
 
-        let service = MultiplexedService::new(grpc_service, http_service);
+        let service = GatewayListenerContextService::new(
+            MultiplexedService::new(grpc_service, http_service),
+            listener_scope,
+        );
 
         let mut builder = Builder::new(TokioExecutor::new());
         // Server-side HTTP/2 keepalive: supervisors hold long-lived sessions, and without
@@ -313,15 +347,60 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let http_service = TowerToHyperService::new(request_id_middleware!(service_http_router(
-            self.state.clone()
-        )));
+        self.serve_service_http_on_listener(stream, GatewayListenerScope::Primary)
+            .await
+    }
+
+    pub(crate) async fn serve_service_http_on_listener<S>(
+        &self,
+        stream: S,
+        listener_scope: GatewayListenerScope,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let http_service = GatewayListenerContextService::new(
+            TowerToHyperService::new(request_id_middleware!(service_http_router(
+                self.state.clone()
+            ))),
+            listener_scope,
+        );
 
         Builder::new(TokioExecutor::new())
             .serve_connection_with_upgrades(TokioIo::new(stream), http_service)
             .await?;
 
         Ok(())
+    }
+}
+
+/// Adds the immutable listener authorization scope to every served request.
+#[derive(Clone)]
+struct GatewayListenerContextService<S> {
+    inner: S,
+    listener_scope: GatewayListenerScope,
+}
+
+impl<S> GatewayListenerContextService<S> {
+    fn new(inner: S, listener_scope: GatewayListenerScope) -> Self {
+        Self {
+            inner,
+            listener_scope,
+        }
+    }
+}
+
+impl<S, B> hyper::service::Service<Request<B>> for GatewayListenerContextService<S>
+where
+    S: hyper::service::Service<Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn call(&self, mut request: Request<B>) -> Self::Future {
+        request.extensions_mut().insert(self.listener_scope);
+        self.inner.call(request)
     }
 }
 
@@ -1104,6 +1183,38 @@ impl<G, H> MultiplexedService<G, H> {
     }
 }
 
+fn listener_allows_request(
+    listener_scope: Option<&GatewayListenerScope>,
+    is_grpc: bool,
+    path: &str,
+) -> bool {
+    match listener_scope {
+        Some(GatewayListenerScope::ComputeDriverCallback) => {
+            is_grpc && crate::auth::method_authz::is_sandbox_callable(path)
+        }
+        Some(GatewayListenerScope::Primary) | None => true,
+    }
+}
+
+fn callback_listener_rejection(is_grpc: bool) -> Response<BoxBody> {
+    if is_grpc {
+        let response: Response<tonic::body::Body> = tonic::Status::permission_denied(
+            "compute-driver callback listeners accept sandbox callback RPCs only",
+        )
+        .into_http();
+        let (parts, body) = response.into_parts();
+        let body = body.map_err(Into::into).boxed_unsync();
+        Response::from_parts(parts, BoxBody(body))
+    } else {
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(boxed_body_from_bytes(Bytes::from_static(
+                b"compute-driver callback listeners accept gRPC callbacks only",
+            )))
+            .expect("static callback listener rejection response must be valid")
+    }
+}
+
 impl<G, H, GBody, HBody> hyper::service::Service<Request<Incoming>> for MultiplexedService<G, H>
 where
     G: tower::Service<Request<BoxBody>, Response = Response<GBody>> + Clone + Send + 'static,
@@ -1126,6 +1237,15 @@ where
             .headers()
             .get("content-type")
             .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
+
+        if !listener_allows_request(
+            req.extensions().get::<GatewayListenerScope>(),
+            is_grpc,
+            req.uri().path(),
+        ) {
+            let response = callback_listener_rejection(is_grpc);
+            return Box::pin(async move { Ok(response) });
+        }
 
         if is_grpc {
             let method = grpc_method_from_path(req.uri().path());

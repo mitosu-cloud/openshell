@@ -210,7 +210,8 @@ Inspect sandbox OCSF configuration and finding events for the validation
 rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
-The published supervisor image uses a shell-free distroless Debian 13 base.
+The published supervisor image uses a shell-free distroless Debian 13 base
+with glibc and the GCC unwind runtime for its GNU-linked executable.
 Use container logs, engine inspection and the configured exec health probe for
 diagnostics; `exec ... sh`, package installation and in-container shell scripts
 are unavailable. Workload shells belong to the separate sandbox image. Preserve
@@ -328,10 +329,38 @@ During a graceful gateway restart, Docker, Podman, and VM sandboxes with
 running intent should stop before the gateway exits and restart after it
 returns. Check for `Stopped sandbox during gateway shutdown` and `Started
 sandbox during gateway startup` in gateway logs. A sandbox explicitly stopped
-through the CLI remains stopped. Kubernetes sandboxes are cluster-owned and do
+through the CLI remains stopped. After an abrupt gateway exit, Docker and VM
+recovery must restart a still-running boundary with the new launch credentials.
+Replacing only the supervisor produces repeated boundary exchange failures:
+a new supervisor instance cannot claim the old authenticated generation.
+Docker keeps the same container and its storage, but running processes restart.
+Kubernetes sandboxes are cluster-owned and do
 not follow this local gateway lifecycle. Internal and external drivers follow
 the same rule: `GetCapabilities.gateway_manages_lifecycle` must be true for the
 gateway to run shutdown and startup sweeps.
+
+When a sandbox becomes Error immediately after a successful Start, compare the
+watch event with current engine state and the replacement supervisor session.
+Queued `ContainerExited`, `ContainerStopped`, and `ContainerRuntimeRestart`
+events are revalidated even after the replacement reaches Ready. A live exit or
+unverified terminal event for a stable Ready sandbox still fails closed. Start
+credential preparation runs after lifecycle admission and commits with Starting;
+Ready replays and recovery-held starts do not rotate the authorization identity.
+Do not work around revision conflicts by disabling CAS or authentication.
+
+A Docker volume-in-use conflict during delete can indicate a staging container
+created after cancellation. Delete joins the canceled provisioner and performs a
+bounded exact-sandbox auxiliary rescan on that conflict. A reference outside the
+admitted sandbox remains an error. Inspect the original container IDs and labels;
+do not force volume removal or expand cleanup to the whole namespace.
+
+Docker driver startup preserves auxiliary containers and channel volumes until
+an exact sandbox lifecycle request authorizes cleanup. Namespace labels alone
+do not identify the owning gateway. A stopped or unclaimed supervisor left
+under that label is not evidence that startup should remove it. Check the
+owning gateway's sandbox record and recovery state before any manual cleanup.
+Discovery does not stop another gateway's workload for an outer-fence violation;
+enforcement belongs to the driver controlling that guest or an explicit Start.
 
 The gateway also drains supervisor-session ownership cleanup before exiting.
 If shutdown reports `Gateway supervisor session cleanup incomplete`, inspect
@@ -643,8 +672,8 @@ helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage
 The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes.
 
 For vulnerability reports, record the running image digest and scan that exact
-artifact. The gateway includes a pinned Distroless base; the supervisor includes
-Alpine packages updated at image build time. A dependency or base-image fix only
+artifact. The gateway and supervisor include pinned Distroless Debian bases;
+the sandbox runtime image includes Alpine packages updated at image build time. A dependency or base-image fix only
 reaches deployed containers after rebuilding, publishing, and redeploying the
 images. Compare findings against the SBOM for that digest, not just its mutable
 `latest` or `dev` tag.

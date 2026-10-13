@@ -3,6 +3,7 @@
 
 use flate2::read::MultiGzDecoder;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
 #[cfg(test)]
@@ -42,6 +43,7 @@ pub const fn sandbox_guest_init_path() -> &'static str {
 /// changes invalidate the cache even when the `OpenShell` version is unchanged.
 pub fn sandbox_guest_runtime_identity() -> String {
     let mut hasher = Sha256::new();
+    hasher.update(b"oci-numeric-ownership-v1");
     hasher.update(SANDBOX);
     hasher.update(VM_INIT);
     hasher.update(UMOCI);
@@ -243,10 +245,80 @@ pub fn create_rootfs_archive_from_dir(source: &Path, archive_path: &Path) -> Res
         .map_err(|e| format!("finalize {}: {e}", archive_path.display()))
 }
 
-pub fn create_rootfs_image_from_dir(source: &Path, image_path: &Path) -> Result<(), String> {
+pub type RootfsOwnership = BTreeMap<PathBuf, (u32, u32)>;
+
+/// Numeric OCI owners are independent of the unprivileged host extraction user.
+pub fn read_archive_ownership(reader: impl Read) -> Result<RootfsOwnership, String> {
+    let mut owners = RootfsOwnership::new();
+    let mut archive = tar::Archive::new(reader);
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let raw = entry.path().map_err(|e| e.to_string())?;
+        let mut path = PathBuf::new();
+        for component in raw.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(part) => path.push(part),
+                _ => return Err("OCI ownership path escapes rootfs".into()),
+            }
+        }
+        if path.as_os_str().len() > 4096 || owners.len() >= 1_000_000 {
+            return Err("OCI ownership manifest exceeds its bounds".into());
+        }
+        let uid = u32::try_from(entry.header().uid().map_err(|e| e.to_string())?)
+            .map_err(|_| "OCI uid exceeds u32")?;
+        let gid = u32::try_from(entry.header().gid().map_err(|e| e.to_string())?)
+            .map_err(|_| "OCI gid exceeds u32")?;
+        owners.insert(path, (uid, gid));
+    }
+    Ok(owners)
+}
+
+pub fn read_rootfs_archive_ownership(path: &Path) -> Result<RootfsOwnership, String> {
+    let mut reader = BufReader::new(File::open(path).map_err(|e| e.to_string())?);
+    let compressed = reader
+        .fill_buf()
+        .map_err(|e| e.to_string())?
+        .starts_with(&GZIP_MAGIC);
+    if compressed {
+        read_archive_ownership(MultiGzDecoder::new(reader))
+    } else {
+        read_archive_ownership(reader)
+    }
+}
+
+pub fn merge_layer_ownership(owners: &mut RootfsOwnership, layer: RootfsOwnership) {
+    // Whiteouts remove inherited owners before entries in this layer are applied.
+    for path in layer.keys() {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        if name == ".wh..wh..opq" {
+            owners.retain(|candidate, _| candidate == parent || !candidate.starts_with(parent));
+        } else if let Some(hidden) = name.strip_prefix(".wh.") {
+            let removed = parent.join(hidden);
+            owners.retain(|candidate, _| !candidate.starts_with(&removed));
+        }
+    }
+    owners.extend(layer.into_iter().filter(|(path, _)| {
+        !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".wh."))
+    }));
+}
+
+pub fn create_rootfs_image_with_ownership(
+    source: &Path,
+    image_path: &Path,
+    owners: &RootfsOwnership,
+) -> Result<(), String> {
     let image_size = rootfs_image_size_bytes(source)?;
     create_ext4_image_from_dir_with_size(source, image_path, image_size)?;
-    if let Err(err) = normalize_sandbox_owner_in_rootfs_image(source, image_path) {
+    if let Err(err) = normalize_image_owners(source, image_path, owners)
+        .and_then(|()| normalize_sandbox_owner_in_rootfs_image(source, image_path))
+    {
         let _ = fs::remove_file(image_path);
         return Err(err);
     }
@@ -368,20 +440,59 @@ pub fn set_rootfs_image_file_mode(
 }
 
 /// Replay the ext4 journal and repair automatically correctable filesystem
-/// state before the driver mutates a preserved guest disk offline.
+/// state before the driver mutates a preserved guest disk offline. Check a
+/// sparse copy: e2fsck can partially change an image even when it returns an
+/// error, and the original must remain available for manual recovery.
 pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
+    let parent = image_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| format!("rootfs image has no parent: {}", image_path.display()))?;
     let mut failures = Vec::new();
     let mut unavailable = Vec::new();
 
     for candidate in e2fs_tool_candidates("e2fsck") {
         let label = candidate.display().to_string();
-        match Command::new(&candidate)
+        let staged = parent.join(format!(
+            ".openshell-overlay-recovery-{}-{}",
+            std::process::id(),
+            INJECTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        if let Err(error) = clone_or_copy_sparse_file(image_path, &staged) {
+            let _ = fs::remove_file(&staged);
+            return Err(error);
+        }
+        let check = Command::new(&candidate)
             .arg("-p")
             .arg("-f")
-            .arg(image_path)
-            .output()
-        {
-            Ok(output) if matches!(output.status.code(), Some(0..=2)) => return Ok(()),
+            .arg(&staged)
+            .output();
+        match check {
+            Ok(output) if matches!(output.status.code(), Some(0..=2)) => {
+                let commit = (|| {
+                    File::open(&staged)
+                        .and_then(|file| file.sync_all())
+                        .map_err(|error| {
+                            format!("sync repaired overlay {}: {error}", staged.display())
+                        })?;
+                    fs::rename(&staged, image_path).map_err(|error| {
+                        format!(
+                            "commit repaired overlay {} to {}: {error}",
+                            staged.display(),
+                            image_path.display()
+                        )
+                    })?;
+                    File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|error| {
+                            format!("sync overlay directory {}: {error}", parent.display())
+                        })
+                })();
+                if commit.is_err() {
+                    let _ = fs::remove_file(&staged);
+                }
+                return commit;
+            }
             Ok(output) => failures.push(format!(
                 "{label} failed with status {}\nstdout: {}\nstderr: {}",
                 output.status,
@@ -393,6 +504,7 @@ pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
             }
             Err(error) => failures.push(format!("run {label}: {error}")),
         }
+        let _ = fs::remove_file(&staged);
     }
 
     Err(if failures.is_empty() {
@@ -755,6 +867,33 @@ fn ensure_rootfs_image_parent_dirs(image_path: &Path, guest_path: &str) {
     }
 }
 
+fn normalize_image_owners(
+    source: &Path,
+    image_path: &Path,
+    owners: &RootfsOwnership,
+) -> Result<(), String> {
+    let mut commands = Vec::new();
+    // Embedded runtime files and implicit parents belong to root, never the host user.
+    if !collect_sandbox_owner_commands(source, "/", 0, 0, &mut commands)? {
+        return Err("rootfs contains an unrepresentable ownership path".into());
+    }
+    for (relative, (uid, gid)) in owners {
+        // Removed/replaced layer members need no inode update. Never follow a final symlink.
+        let Ok(metadata) = fs::symlink_metadata(source.join(relative)) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let guest_path = format!("/{}", relative.to_string_lossy());
+        let quoted = debugfs_quote_absolute_path(&guest_path)
+            .ok_or_else(|| "OCI ownership path is not representable by debugfs".to_string())?;
+        commands.push(format!("set_inode_field {quoted} uid {uid}"));
+        commands.push(format!("set_inode_field {quoted} gid {gid}"));
+    }
+    run_debugfs_batch(image_path, &commands)
+}
+
 fn normalize_sandbox_owner_in_rootfs_image(source: &Path, image_path: &Path) -> Result<(), String> {
     let sandbox_dir = source.join("sandbox");
     if !sandbox_dir.exists() {
@@ -824,7 +963,7 @@ fn collect_sandbox_owner_commands(
         let Some(file_name) = file_name.to_str() else {
             return Ok(false);
         };
-        let child_guest_path = format!("{guest_path}/{file_name}");
+        let child_guest_path = format!("{}/{file_name}", guest_path.trim_end_matches('/'));
         if !collect_sandbox_owner_commands(&entry.path(), &child_guest_path, uid, gid, commands)? {
             return Ok(false);
         }
@@ -1335,6 +1474,45 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn archive_ownership_survives_host_extraction_and_whiteouts() {
+        let mut bytes = Vec::new();
+        {
+            let mut tar = tar::Builder::new(&mut bytes);
+            for (path, uid, gid) in [("mitosu/home", 1000, 1000), ("etc/secret", 0, 42)] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(0);
+                header.set_mode(0o600);
+                header.set_uid(uid);
+                header.set_gid(gid);
+                header.set_cksum();
+                tar.append_data(&mut header, path, std::io::empty())
+                    .unwrap();
+            }
+            tar.finish().unwrap();
+        }
+        let mut owners = read_archive_ownership(Cursor::new(bytes)).unwrap();
+        assert_eq!(owners[Path::new("mitosu/home")], (1000, 1000));
+        assert_eq!(owners[Path::new("etc/secret")], (0, 42));
+        owners.insert("cache/old/member".into(), (1000, 1000));
+        merge_layer_ownership(
+            &mut owners,
+            BTreeMap::from([
+                ("etc/.wh.secret".into(), (0, 0)),
+                ("cache/.wh..wh..opq".into(), (0, 0)),
+                ("cache/new".into(), (123, 456)),
+            ]),
+        );
+        assert!(!owners.contains_key(Path::new("etc/secret")));
+        assert!(!owners.contains_key(Path::new("cache/old/member")));
+        assert_eq!(owners[Path::new("cache/new")], (123, 456));
+        assert!(
+            !owners
+                .keys()
+                .any(|path| path.to_string_lossy().contains(".wh."))
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn host_supervisor_cache_rejects_wrong_content_and_installs_atomically() {
@@ -1575,6 +1753,45 @@ mod tests {
 
         recover_rootfs_image(&image).expect("recover clean ext4 image");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_rootfs_image_preserves_original_when_fsck_cannot_repair() {
+        if !e2fs_tool_candidates("e2fsck")
+            .iter()
+            .any(|candidate| Command::new(candidate).arg("-V").output().is_ok())
+        {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        let image = dir.join("overlay.ext4");
+        fs::create_dir_all(source.join("upper")).expect("create source upperdir");
+        fs::create_dir_all(source.join("work")).expect("create source workdir");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create ext4 image");
+        run_debugfs(&image, "mkdir /upper/orphan").expect("create orphan directory");
+        run_debugfs(&image, "unlink /upper/orphan").expect("unlink orphan directory");
+        let before = sha256_reader(File::open(&image).expect("open image")).expect("hash image");
+
+        let error = recover_rootfs_image(&image).expect_err("orphan directory needs manual repair");
+        assert!(error.contains("UNEXPECTED INCONSISTENCY"), "{error}");
+        let after = sha256_reader(File::open(&image).expect("reopen image")).expect("hash image");
+        assert_eq!(after, before, "failed recovery changed original image");
+        assert_eq!(
+            fs::read_dir(&dir)
+                .expect("read test directory")
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".openshell-overlay-recovery-"))
+                .count(),
+            0,
+            "failed recovery left a staging image"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

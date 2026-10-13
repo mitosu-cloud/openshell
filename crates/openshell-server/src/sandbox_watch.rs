@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use openshell_core::proto::SandboxStreamWarning;
 use tokio::sync::{broadcast, watch};
+use tokio::task::JoinHandle;
 
 use crate::persistence::Store;
 use openshell_core::proto::Sandbox;
@@ -88,7 +89,7 @@ pub fn spawn_store_poller(
     bus: SandboxWatchBus,
     interval: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut known_versions: HashMap<String, Option<u64>> = HashMap::new();
         let mut timer = tokio::time::interval(interval);
@@ -130,7 +131,7 @@ pub fn spawn_store_poller(
                 }
             }
         }
-    });
+    })
 }
 
 /// Build the warning payload emitted when a watch broadcast receiver lags.
@@ -261,7 +262,8 @@ mod tests {
 
         let mut rx = bus.subscribe("sb-1");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        spawn_store_poller(store.clone(), bus, Duration::from_millis(10), shutdown_rx);
+        let _poller =
+            spawn_store_poller(store.clone(), bus, Duration::from_millis(10), shutdown_rx);
 
         tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await

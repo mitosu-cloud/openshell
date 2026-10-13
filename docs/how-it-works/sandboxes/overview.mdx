@@ -12,6 +12,16 @@ A sandbox is the OpenShell data plane: a safe, private execution environment whe
 
 <Info>You need an active gateway before creating a sandbox.</Info>
 
+## Recovery holds in embedded gateways
+
+A product embedding the gateway can hold automatic sandbox restart while it
+reviews an interrupted transfer. A verified inactive sandbox appears as
+`Stopped` with a `RecoveryHold` condition. Resolving the product's transfer
+receipt does not start it; use the product's separate owner Start control after
+review. The product rechecks identity and receipt state before accepting Start.
+Unknown recovery metadata blocks admission without stopping a running guest.
+Standalone gateways do not read product recovery journals.
+
 ## Create a Sandbox
 
 Create a sandbox with a single command. For example, to create a sandbox with Claude, run:
@@ -981,3 +991,11 @@ For Docker, Podman, MicroVM, and Kubernetes behavior, refer to [Sandbox Runtimes
 - To supply API keys or tokens, refer to [Manage Providers](/how-it-works/providers/overview).
 - To control what the agent can access, refer to [Policies](/how-it-works/policies/overview).
 - To use the default runtime image, refer to [Default Workload Image](#default-workload-image).
+
+### Local gateway recovery
+
+Docker and VM sandboxes with running intent restart their processes when the
+local gateway recovers. After an abrupt gateway exit, recovery installs fresh
+credentials on both the sandbox runtime and its supervisor. Docker retains the
+same container, writable layer, and volumes. Explicitly stopped sandboxes remain
+stopped; completed main commands are not automatically replayed.

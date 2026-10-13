@@ -13,13 +13,13 @@ use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary,
     ContainerSummaryStateEnum, CreateImageInfo, DeviceRequest, HealthConfig, HealthStatusEnum,
-    HostConfig, Mount, MountTmpfsOptions, MountTypeEnum, MountVolumeOptions, ProgressDetail,
+    HostConfig, Mount, MountTmpfsOptions, MountType, MountVolumeOptions, ProgressDetail,
     SystemInfo, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
-    ListContainersOptionsBuilder, ListVolumesOptionsBuilder, LogsOptionsBuilder,
-    RemoveContainerOptionsBuilder, StopContainerOptionsBuilder, UploadToContainerOptionsBuilder,
+    ListContainersOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+    StopContainerOptionsBuilder, UploadToContainerOptionsBuilder,
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -44,8 +44,9 @@ use openshell_core::proto::compute::v1::{
     DeleteSandboxResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition,
     DriverPlatformEvent, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
     EnsureWorkspaceRequest, EnsureWorkspaceResponse, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse, GpuResourceCapabilities,
-    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
+    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
+    GpuResourceCapabilities, GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
     MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
@@ -963,15 +964,9 @@ impl DockerComputeDriver {
             runtime_failures: Arc::new(Mutex::new(HashMap::new())),
         };
 
-        Box::pin(driver.reconcile_runtime_resources_at_startup())
-            .await
-            .map_err(|error| {
-                Error::config(format!(
-                    "failed to reconcile Docker isolation resources: {}",
-                    error.message()
-                ))
-            })?;
-
+        // Namespace labels identify discoverable resources, not this gateway's
+        // ownership. Cleanup belongs to exact sandbox lifecycle requests after
+        // the gateway has checked its persisted intent and recovery admission.
         let poll_driver = driver.clone();
         tokio::spawn(async move {
             poll_driver.poll_loop().await;
@@ -1219,8 +1214,8 @@ impl DockerComputeDriver {
             .and_then(|value| serde_json::from_str(value).ok())
             .unwrap_or_default();
         for mount in container.mounts.as_deref().unwrap_or_default() {
-            match mount.typ {
-                Some(bollard::models::MountPointTypeEnum::VOLUME) => {
+            match mount.typ.as_deref() {
+                Some("volume") => {
                     let name = mount
                         .name
                         .as_deref()
@@ -1275,7 +1270,7 @@ impl DockerComputeDriver {
                         }
                     }
                 }
-                Some(bollard::models::MountPointTypeEnum::TMPFS) => {}
+                Some("tmpfs") => {}
                 _ => self
                     .config
                     .resource_admission
@@ -1418,6 +1413,14 @@ impl DockerComputeDriver {
                 continue;
             };
             if let Some(container_id) = summary.id.as_deref() {
+                // A shared namespace can contain another gateway's workloads.
+                // Discovery must not acquire control of them. Only successful
+                // Create/Start installs a supervisor owned by this driver.
+                let supervised = self
+                    .control_processes
+                    .lock()
+                    .await
+                    .contains_key(&sandbox.id);
                 match self.docker.inspect_container(container_id, None).await {
                     Ok(inspected) if summary.state == Some(ContainerSummaryStateEnum::EXITED) => {
                         // Docker's list summary carries no exit code. Inspect
@@ -1427,7 +1430,10 @@ impl DockerComputeDriver {
                             apply_docker_exit_classification(&mut sandbox, state);
                         }
                     }
-                    Ok(inspected) if summary.state == Some(ContainerSummaryStateEnum::RUNNING) => {
+                    Ok(inspected)
+                        if summary.state == Some(ContainerSummaryStateEnum::RUNNING)
+                            && supervised =>
+                    {
                         let admission = match validate_docker_outer_fence(&inspected) {
                             Ok(()) => self.admit_container_resources(&inspected).await,
                             Err(error) => Err(error),
@@ -1992,103 +1998,47 @@ impl DockerComputeDriver {
         Ok(removed)
     }
 
-    async fn reconcile_runtime_resources_at_startup(&self) -> Result<(), Status> {
-        let sandboxes = self.list_managed_container_summaries().await?;
-        let sandbox_ids = sandboxes
-            .iter()
-            .filter_map(|container| {
-                container
-                    .labels
-                    .as_ref()
-                    .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
-                    .cloned()
-            })
-            .collect::<HashSet<_>>();
-
-        let filters = managed_resource_label_filters(&self.config.sandbox_namespace, []);
-        let auxiliary = self
-            .docker
-            .list_containers(Some(
-                ListContainersOptionsBuilder::default()
-                    .all(true)
-                    .filters(&filters)
-                    .build(),
-            ))
-            .await
-            .map_err(|error| internal_status("list Docker startup resources", error))?;
-        for container in auxiliary {
-            let role = container
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get(LABEL_ISOLATION_ROLE))
-                .map(String::as_str);
-            if !matches!(
-                role,
-                Some(
-                    LABEL_ISOLATION_ROLE_SUPERVISOR
-                        | LABEL_ISOLATION_ROLE_STAGING
-                        | LABEL_ISOLATION_ROLE_IDENTITY
-                )
-            ) {
-                continue;
-            }
-            let Some(target) = summary_container_target(&container) else {
-                continue;
-            };
-            self.docker
-                .remove_container(
-                    &target,
-                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-                )
-                .await
-                .or_else(|error| {
-                    if is_not_found_error(&error) {
-                        Ok(())
-                    } else {
-                        Err(error)
+    /// An aborted create request can finish in Docker after the first auxiliary
+    /// scan. On a busy volume, rescan only this sandbox's auxiliaries and retry
+    /// only when that scan actually removed an admitted resource. Unknown
+    /// references and persistent conflicts remain errors; never force a volume.
+    async fn remove_sandbox_runtime_volumes(&self, sandbox_id: &str) -> Result<(), Status> {
+        for name in [
+            docker_channel_volume_name_by_id(sandbox_id, &self.config),
+            docker_supervisor_volume_name_by_id(sandbox_id, &self.config),
+        ] {
+            for attempt in 0..3 {
+                match self
+                    .docker
+                    .remove_volume(
+                        &name,
+                        None::<bollard::query_parameters::RemoveVolumeOptions>,
+                    )
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(error) if is_not_found_error(&error) => break,
+                    Err(error) => {
+                        if !matches!(
+                            &error,
+                            BollardError::DockerResponseServerError {
+                                status_code: 409,
+                                ..
+                            }
+                        ) || attempt == 2
+                            || !self
+                                .remove_auxiliary_containers_for_sandbox(sandbox_id)
+                                .await?
+                        {
+                            return Err(internal_status(
+                                "remove Docker sandbox runtime volume",
+                                error,
+                            ));
+                        }
                     }
-                })
-                .map_err(|error| internal_status("remove stale Docker auxiliary", error))?;
-        }
-
-        let volume_filters = label_filters([
-            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}"),
-            format!(
-                "{LABEL_SANDBOX_NAMESPACE}={}",
-                self.config.sandbox_namespace
-            ),
-            format!("{LABEL_ISOLATION_BACKEND}={LABEL_ISOLATION_BACKEND_OPEN_SHELL}"),
-        ]);
-        let volumes = self
-            .docker
-            .list_volumes(Some(
-                ListVolumesOptionsBuilder::default()
-                    .filters(&volume_filters)
-                    .build(),
-            ))
-            .await
-            .map_err(|error| internal_status("list Docker startup volumes", error))?;
-        for volume in volumes.volumes.unwrap_or_default() {
-            let sandbox_id = volume.labels.get(LABEL_SANDBOX_ID);
-            if sandbox_id.is_some_and(|id| sandbox_ids.contains(id)) {
-                continue;
+                }
             }
-            self.docker
-                .remove_volume(
-                    &volume.name,
-                    None::<bollard::query_parameters::RemoveVolumeOptions>,
-                )
-                .await
-                .or_else(|error| {
-                    if is_not_found_error(&error) {
-                        Ok(())
-                    } else {
-                        Err(error)
-                    }
-                })
-                .map_err(|error| internal_status("remove orphan Docker channel volume", error))?;
         }
-
         Ok(())
     }
 
@@ -2165,13 +2115,12 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<bool, Status> {
-        let pending = self
+        let mut pending = self
             .remove_pending_sandbox(sandbox_id, sandbox_name)
             .await?;
-        if let Some(record) = pending.as_ref()
-            && let Some(task) = record.task.as_ref()
-        {
+        if let Some(task) = pending.as_mut().and_then(|record| record.task.take()) {
             task.abort();
+            let _ = task.await;
         }
         if let Some(record) = pending.as_ref() {
             self.stop_control_process(&record.sandbox.id).await;
@@ -2195,23 +2144,15 @@ impl DockerComputeDriver {
                 {
                     Ok(()) => {
                         self.clear_runtime_failure(&record.sandbox.id).await;
-                        remove_docker_channel_volume_by_id(
-                            &self.docker,
-                            &record.sandbox.id,
-                            &self.config,
-                        )
-                        .await?;
+                        self.remove_sandbox_runtime_volumes(&record.sandbox.id)
+                            .await?;
                         cleanup_docker_boundary_state(&record.sandbox, &self.config);
                         return Ok(true);
                     }
                     Err(err) if is_not_found_error(&err) => {
                         self.clear_runtime_failure(&record.sandbox.id).await;
-                        let _ = remove_docker_channel_volume_by_id(
-                            &self.docker,
-                            &record.sandbox.id,
-                            &self.config,
-                        )
-                        .await;
+                        self.remove_sandbox_runtime_volumes(&record.sandbox.id)
+                            .await?;
                         cleanup_docker_boundary_state(&record.sandbox, &self.config);
                         return Ok(true);
                     }
@@ -2225,7 +2166,7 @@ impl DockerComputeDriver {
                 let removed = self
                     .remove_auxiliary_containers_for_sandbox(sandbox_id)
                     .await?;
-                remove_docker_channel_volume_by_id(&self.docker, sandbox_id, &self.config).await?;
+                self.remove_sandbox_runtime_volumes(sandbox_id).await?;
                 cleanup_docker_boundary_state_by_id(sandbox_id, &self.config);
                 self.clear_runtime_failure(sandbox_id).await;
                 return Ok(removed);
@@ -2254,19 +2195,15 @@ impl DockerComputeDriver {
         {
             Ok(()) => {
                 self.clear_runtime_failure(resolved_sandbox_id).await;
-                remove_docker_channel_volume_by_id(&self.docker, resolved_sandbox_id, &self.config)
+                self.remove_sandbox_runtime_volumes(resolved_sandbox_id)
                     .await?;
                 cleanup_docker_boundary_state_by_id(resolved_sandbox_id, &self.config);
                 Ok(true)
             }
             Err(err) if is_not_found_error(&err) => {
                 self.clear_runtime_failure(resolved_sandbox_id).await;
-                let _ = remove_docker_channel_volume_by_id(
-                    &self.docker,
-                    resolved_sandbox_id,
-                    &self.config,
-                )
-                .await;
+                self.remove_sandbox_runtime_volumes(resolved_sandbox_id)
+                    .await?;
                 cleanup_docker_boundary_state_by_id(resolved_sandbox_id, &self.config);
                 Ok(pending.is_some())
             }
@@ -2294,7 +2231,7 @@ impl DockerComputeDriver {
                 self.remove_auxiliary_containers_for_sandbox(&record.sandbox.id)
                     .await?;
                 self.clear_runtime_failure(&record.sandbox.id).await;
-                remove_docker_channel_volume_by_id(&self.docker, &record.sandbox.id, &self.config)
+                self.remove_sandbox_runtime_volumes(&record.sandbox.id)
                     .await?;
                 cleanup_docker_boundary_state(&record.sandbox, &self.config);
                 self.publish_deleted(record.sandbox.id);
@@ -2408,10 +2345,28 @@ impl DockerComputeDriver {
             .inspect_container(&target, None)
             .await
             .map_err(|error| internal_status("inspect Docker sandbox outer fence", error))?;
-        validate_docker_outer_fence(&inspected)?;
-        self.admit_container_resources(&inspected).await?;
+        let admission = match validate_docker_outer_fence(&inspected) {
+            Ok(()) => self.admit_container_resources(&inspected).await,
+            Err(error) => Err(error),
+        };
+        if let Err(status) = admission {
+            // An explicit Start grants control of this exact sandbox. Refuse
+            // adoption and stop an already-running workload whose outer fence
+            // is broken, even before a supervisor has been installed.
+            if container.state == Some(ContainerSummaryStateEnum::RUNNING)
+                && let Some(sandbox) = sandbox_from_container_summary(&container)
+            {
+                handle_docker_runtime_failure(
+                    self.control_failure_context(sandbox, target.clone()),
+                    "OuterFenceViolation",
+                    status.message().to_string(),
+                )
+                .await;
+            }
+            return Err(status);
+        }
         let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-        let previous_finished_at = if state == ContainerSummaryStateEnum::EXITED {
+        let mut previous_finished_at = if state == ContainerSummaryStateEnum::EXITED {
             inspected
                 .state
                 .as_ref()
@@ -2427,27 +2382,32 @@ impl DockerComputeDriver {
             .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
             .map_or(sandbox_id, String::as_str);
         if !container_state_needs_start(state) {
-            adopt_or_verify_docker_start_generation(resolved_sandbox_id, &self.config, generation)
-                .await?;
             if launch_authentication.is_empty() {
+                adopt_or_verify_docker_start_generation(
+                    resolved_sandbox_id,
+                    &self.config,
+                    generation,
+                )
+                .await?;
                 self.ensure_control_process_for_container(&container)
                     .await?;
                 return Ok(true);
             }
 
-            // A gateway restart refreshes the supervisor-facing credentials.
-            // The running sandbox keeps its driver-owned channel identity,
-            // TLS identity, and process tree.
-            self.stop_control_process(resolved_sandbox_id).await;
-            refresh_docker_supervisor_authentication(
-                resolved_sandbox_id,
-                &self.config,
-                launch_authentication,
-            )
-            .await?;
-            self.ensure_control_process_for_container(&container)
+            // A new supervisor cannot claim the old boundary generation. As
+            // with VM recovery, validate the fresh launch bundle before
+            // stopping compute, then rotate both sides of the channel. Keep
+            // the exact container and its writable layer and mounts.
+            decode_docker_launch_authentication(launch_authentication)?;
+            self.stop_sandbox_inner(resolved_sandbox_id, sandbox_name)
                 .await?;
-            return Ok(true);
+            previous_finished_at = self
+                .docker
+                .inspect_container(&target, None)
+                .await
+                .map_err(|error| internal_status("inspect stopped Docker sandbox", error))?
+                .state
+                .and_then(|state| state.finished_at);
         }
 
         // Fence a poll that observed this stopped run but has not published it
@@ -3061,6 +3021,18 @@ impl ComputeDriver for ComputeDriverService {
             .await
     }
 
+    async fn get_gateway_listener_requirements(
+        &self,
+        request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::GET_GATEWAY_LISTENER_REQUIREMENTS,
+                ComputeDriver::get_gateway_listener_requirements(&self.driver, request),
+            )
+            .await
+    }
+
     async fn validate_sandbox_create(
         &self,
         request: Request<ValidateSandboxCreateRequest>,
@@ -3212,6 +3184,17 @@ impl ComputeDriver for DockerComputeDriver {
         )
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
         Ok(Response::new(capabilities))
+    }
+
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        // The supervisor uses Docker host networking and reaches the gateway's
+        // primary loopback listener directly.
+        Ok(Response::new(
+            GetGatewayListenerRequirementsResponse::default(),
+        ))
     }
 
     async fn validate_sandbox_create(
@@ -3800,7 +3783,7 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Option<M
             read_only,
             subpath,
         } => Ok(Some(Mount {
-            typ: Some(MountTypeEnum::VOLUME),
+            typ: Some(MountType::VOLUME),
             source: Some(source.clone()),
             target: Some(target.clone()),
             read_only: Some(*read_only),
@@ -3816,7 +3799,7 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Option<M
             size_bytes,
             mode,
         } => Ok(Some(Mount {
-            typ: Some(MountTypeEnum::TMPFS),
+            typ: Some(MountType::TMPFS),
             target: Some(target.clone()),
             tmpfs_options: Some(MountTmpfsOptions {
                 size_bytes: validate_optional_positive_integral_i64(
@@ -4819,35 +4802,6 @@ async fn refresh_docker_boundary_authentication(
     .await
 }
 
-async fn refresh_docker_supervisor_authentication(
-    sandbox_id: &str,
-    config: &DockerDriverRuntimeConfig,
-    encoded_authentication: &[u8],
-) -> Result<(), Status> {
-    let authentication = decode_docker_launch_authentication(encoded_authentication)?;
-    let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
-    let Some(runtime_descriptor) = read_docker_runtime_descriptor(sandbox_id, config).await? else {
-        return Err(Status::failed_precondition(
-            "Docker sandbox runtime descriptor is missing during supervisor authentication rotation",
-        ));
-    };
-    let descriptor = runtime_descriptor
-        .backend_descriptor()
-        .map_err(|error| Status::internal(error.to_string()))?;
-    let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
-        .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
-    write_docker_boundary_file(
-        &directory.join(RUNTIME_DESCRIPTOR_FILE),
-        &descriptor.payload,
-    )
-    .await?;
-    write_docker_boundary_file(
-        &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
-        &supervisor_auth,
-    )
-    .await
-}
-
 async fn read_docker_runtime_descriptor(
     sandbox_id: &str,
     config: &DockerDriverRuntimeConfig,
@@ -4908,7 +4862,7 @@ async fn stage_docker_supervisor_bundle(
                     mounts: Some(vec![Mount {
                         target: Some(SUPERVISOR_STATE_MOUNT_PATH.to_string()),
                         source: Some(docker_supervisor_volume_name(sandbox, config)),
-                        typ: Some(MountTypeEnum::VOLUME),
+                        typ: Some(MountType::VOLUME),
                         read_only: Some(false),
                         volume_options: Some(MountVolumeOptions {
                             no_copy: Some(true),
@@ -5152,7 +5106,7 @@ async fn spawn_docker_control_process(
         Mount {
             target: Some(BOUNDARY_MOUNT_PATH.to_string()),
             source: Some(docker_channel_volume_name(sandbox, config)),
-            typ: Some(MountTypeEnum::VOLUME),
+            typ: Some(MountType::VOLUME),
             read_only: Some(true),
             volume_options: Some(MountVolumeOptions {
                 no_copy: Some(true),
@@ -5163,7 +5117,7 @@ async fn spawn_docker_control_process(
         Mount {
             target: Some(SUPERVISOR_STATE_MOUNT_PATH.to_string()),
             source: Some(docker_supervisor_volume_name(sandbox, config)),
-            typ: Some(MountTypeEnum::VOLUME),
+            typ: Some(MountType::VOLUME),
             read_only: Some(true),
             volume_options: Some(MountVolumeOptions {
                 no_copy: Some(true),
@@ -5179,7 +5133,7 @@ async fn spawn_docker_control_process(
         supervisor_mounts.push(Mount {
             target: Some(PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR.to_string()),
             source: Some(parent.display().to_string()),
-            typ: Some(MountTypeEnum::BIND),
+            typ: Some(MountType::BIND),
             read_only: Some(true),
             ..Default::default()
         });
@@ -5713,7 +5667,7 @@ fn build_container_create_body_for_image(
     user_mounts.push(Mount {
         target: Some(BOUNDARY_MOUNT_PATH.to_string()),
         source: Some(docker_channel_volume_name(sandbox, config)),
-        typ: Some(MountTypeEnum::VOLUME),
+        typ: Some(MountType::VOLUME),
         read_only: Some(false),
         volume_options: Some(MountVolumeOptions {
             no_copy: Some(true),
@@ -6175,6 +6129,9 @@ fn container_ready_condition(
         }
         ContainerSummaryStateEnum::REMOVING => {
             ("False", "Deleting", "Container is being removed", true)
+        }
+        ContainerSummaryStateEnum::STOPPING => {
+            ("False", "Stopping", "Container is stopping", false)
         }
         ContainerSummaryStateEnum::PAUSED => {
             ("False", "ContainerPaused", "Container is paused", false)

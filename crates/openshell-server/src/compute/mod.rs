@@ -7,6 +7,7 @@ pub mod driver_config;
 pub mod lease;
 pub mod provisioning_deadline;
 pub mod rootfs_tar;
+pub mod start_guard;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
@@ -31,13 +32,16 @@ use openshell_core::proto::compute::v1::{
     AuthenticateSandboxRequest, CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest,
     DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent, DriverResourceRequirements,
     DriverSandbox, DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate,
-    EnsureWorkspaceRequest, EnsureWorkspaceResponse, GetCapabilitiesRequest, GetSandboxRequest,
-    GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
-    ResourceCapabilities as DriverResourceCapabilities,
+    EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    GatewayListenerRequirement as ProtoGatewayListenerRequirement, GetCapabilitiesRequest,
+    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
+    GetSandboxRequest, GpuResourceRequirements as DriverGpuResourceRequirements,
+    ListSandboxesRequest, ResourceCapabilities as DriverResourceCapabilities,
     ResourceRequirements as DriverSandboxResourceRequirements, StartSandboxRequest,
     StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
     WorkloadIdentityRequest, compute_driver_client::ComputeDriverClient,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxRestartPolicy, SandboxSpec,
@@ -49,6 +53,7 @@ use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -183,6 +188,41 @@ mod traced_driver {
 const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
 const START_PHASE_CAS_RETRY_LIMIT: usize = 3;
 const SUPERVISOR_SESSION_CAS_RETRY_LIMIT: usize = 3;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GatewayListenerRequirement {
+    Exact {
+        address: SocketAddr,
+        driver_name: String,
+        reason: String,
+    },
+    DefaultRouteInterface {
+        driver_name: String,
+        reason: String,
+    },
+    LoopbackInterface {
+        driver_name: String,
+        reason: String,
+    },
+}
+
+impl GatewayListenerRequirement {
+    pub fn driver_name(&self) -> &str {
+        match self {
+            Self::Exact { driver_name, .. }
+            | Self::DefaultRouteInterface { driver_name, .. }
+            | Self::LoopbackInterface { driver_name, .. } => driver_name,
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Exact { reason, .. }
+            | Self::DefaultRouteInterface { reason, .. }
+            | Self::LoopbackInterface { reason, .. } => reason,
+        }
+    }
+}
 
 /// Serializes request-side lifecycle mutations for the same stable sandbox ID.
 ///
@@ -540,6 +580,14 @@ impl ComputeDriver for RemoteComputeDriver {
         client.authenticate_sandbox(request).await
     }
 
+    async fn get_gateway_listener_requirements(
+        &self,
+        request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<tonic::Response<GetGatewayListenerRequirementsResponse>, Status> {
+        let mut client = self.client();
+        client.get_gateway_listener_requirements(request).await
+    }
+
     async fn validate_sandbox_create(
         &self,
         request: Request<ValidateSandboxCreateRequest>,
@@ -651,6 +699,8 @@ pub struct ComputeRuntime {
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
     sync_lock: Arc<Mutex<()>>,
     lifecycle_gates: Arc<LifecycleGateRegistry>,
+    start_guard: Arc<StdMutex<Option<Arc<dyn start_guard::SandboxStartGuard>>>>,
+    gateway_listener_requirements: Vec<GatewayListenerRequirement>,
     replica_id: String,
     /// Gateway-issued staging slots for rootfs tar archives. Shared across
     /// clones: `ServerState` holds `ComputeRuntime` by value, so a per-clone
@@ -731,6 +781,59 @@ impl ComputeRuntime {
             rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
         };
         let default_image = capabilities.default_image;
+        let gateway_listener_requirements = match driver
+            .get_gateway_listener_requirements(Request::new(
+                GetGatewayListenerRequirementsRequest {},
+            ))
+            .await
+        {
+            Ok(response) => response
+                .into_inner()
+                .requirements
+                .into_iter()
+                .map(|requirement: ProtoGatewayListenerRequirement| {
+                    let Some(selector) = requirement.selector else {
+                        return Err(ComputeError::Message(format!(
+                            "compute driver '{driver_name}' returned a gateway listener requirement without a selector"
+                        )));
+                    };
+                    match selector {
+                        Selector::ExactBindAddress(bind_address) => {
+                            let address = bind_address.parse::<SocketAddr>().map_err(|err| {
+                                ComputeError::Message(format!(
+                                    "compute driver '{driver_name}' returned invalid gateway listener address '{bind_address}': {err}"
+                                ))
+                            })?;
+                            Ok(GatewayListenerRequirement::Exact {
+                                address,
+                                driver_name: driver_name.clone(),
+                                reason: requirement.reason,
+                            })
+                        }
+                        Selector::DefaultRouteInterface(_) => {
+                            Ok(GatewayListenerRequirement::DefaultRouteInterface {
+                                driver_name: driver_name.clone(),
+                                reason: requirement.reason,
+                            })
+                        }
+                        Selector::LoopbackInterface(_) => {
+                            Ok(GatewayListenerRequirement::LoopbackInterface {
+                                driver_name: driver_name.clone(),
+                                reason: requirement.reason,
+                            })
+                        }
+                    }
+                })
+                .collect::<Result<Vec<_>, ComputeError>>()?,
+            Err(status) if status.code() == Code::Unimplemented => {
+                debug!(
+                    driver = %driver_name,
+                    "Compute driver does not implement gateway listener requirements"
+                );
+                Vec::new()
+            }
+            Err(status) => return Err(compute_error_from_status(status)),
+        };
         let rootfs_tar_staging = Arc::new(rootfs_tar::RootfsTarStagingRegistry::new(
             (!driver_info.rootfs_tar_staging_dir.is_empty())
                 .then(|| PathBuf::from(&driver_info.rootfs_tar_staging_dir)),
@@ -752,11 +855,73 @@ impl ComputeRuntime {
             supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
+            start_guard: Arc::new(StdMutex::new(None)),
+            gateway_listener_requirements,
             replica_id: lease::replica_id(),
             rootfs_tar_staging,
             restart_authority: Arc::new(OnceLock::new()),
             restart_notify: Arc::new(Notify::new()),
         })
+    }
+
+    pub(crate) fn install_start_guard(&self, guard: Arc<dyn start_guard::SandboxStartGuard>) {
+        *self.start_guard.lock().expect("start guard lock poisoned") = Some(guard);
+    }
+
+    // Called with the sandbox lifecycle gate held. A hold never calls the driver.
+    async fn check_start_guard(&self, sandbox: &Sandbox, automatic: bool) -> Result<bool, Status> {
+        let guard = self
+            .start_guard
+            .lock()
+            .expect("start guard lock poisoned")
+            .clone();
+        let Some(guard) = guard else { return Ok(true) };
+        let context = start_guard::StartContext {
+            driver: self.driver_info.name.clone(),
+            sandbox_id: sandbox.object_id().to_string(),
+            labels: sandbox
+                .metadata
+                .as_ref()
+                .map(|m| m.labels.clone())
+                .unwrap_or_default(),
+            automatic,
+        };
+        let decision = match guard.check(context).await {
+            Ok(decision) => decision,
+            Err(reason) if automatic => start_guard::StartDecision::Hold {
+                reason,
+                stopped: false,
+            },
+            Err(reason) => return Err(Status::failed_precondition(reason)),
+        };
+        match decision {
+            start_guard::StartDecision::Allow => Ok(true),
+            start_guard::StartDecision::Hold { reason, stopped } => {
+                if !automatic {
+                    return Err(Status::failed_precondition(reason));
+                }
+                let already_held = sandbox.phase() == SandboxPhase::Stopped as i32
+                    && sandbox.status.as_ref().is_some_and(|status| {
+                        status.conditions.iter().any(|condition| {
+                            condition.r#type == "Ready" && condition.reason == "RecoveryHold"
+                        })
+                    });
+                if stopped && !already_held {
+                    let updated = self
+                        .write_lifecycle_phase(
+                            sandbox,
+                            SandboxPhase::Stopped,
+                            "RecoveryHold",
+                            &reason,
+                        )
+                        .await?;
+                    self.sandbox_index.update_from_sandbox(&updated);
+                    self.sandbox_watch_bus.notify(updated.object_id());
+                }
+                info!(sandbox_id = %sandbox.object_id(), %reason, "Sandbox restart held for owner review");
+                Ok(false)
+            }
+        }
     }
 
     /// Serializes sandbox/provider-profile invariant checks and object writes
@@ -911,6 +1076,11 @@ impl ComputeRuntime {
     ) -> Self {
         self.telemetry_compute_driver = telemetry_compute_driver;
         self
+    }
+
+    #[must_use]
+    pub(crate) fn gateway_listener_requirements(&self) -> &[GatewayListenerRequirement] {
+        &self.gateway_listener_requirements
     }
 
     pub(crate) async fn ensure_workspace(&self, workspace: &str) -> Result<(), Status> {
@@ -1494,6 +1664,10 @@ impl ComputeRuntime {
             .await
     }
 
+    /// Prepare credentials only after start admission, under the lifecycle and
+    /// reconciliation locks. Annotation changes commit with `Starting` in one
+    /// CAS, so cancellation or a revision conflict cannot rotate credentials
+    /// without committing the corresponding lifecycle transition.
     pub(crate) async fn start_sandbox_authenticated(
         &self,
         workspace: &str,
@@ -1533,6 +1707,7 @@ impl ComputeRuntime {
             ));
         }
 
+        self.check_start_guard(&current, false).await?;
         self.validate_caller_driver_config(
             current
                 .spec
@@ -1584,7 +1759,6 @@ impl ComputeRuntime {
                 break (current.clone(), current, authentication);
             }
 
-            let previous = current.clone();
             let next_identity = if authority.is_some()
                 && matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
             {
@@ -1592,6 +1766,15 @@ impl ComputeRuntime {
             } else {
                 None
             };
+            // A failed or ambiguous driver start may restore the old phase,
+            // but must not roll back credentials that were minted and may
+            // already have reached the runtime.
+            let mut previous = current.clone();
+            if let Some(identity) = &next_identity
+                && let Some(metadata) = previous.metadata.as_mut()
+            {
+                identity.write(&mut metadata.annotations);
+            }
             let launch_authentication =
                 if let (Some(authority), Some(identity)) = (authority, next_identity.as_ref()) {
                     serialize_launch_authentication(
@@ -2095,6 +2278,21 @@ impl ComputeRuntime {
         reason: &str,
         message: &str,
     ) -> Result<Sandbox, Status> {
+        self.write_lifecycle_phase_with(sandbox, phase, reason, message, |_| {})
+            .await
+    }
+
+    async fn write_lifecycle_phase_with<Mutation>(
+        &self,
+        sandbox: &Sandbox,
+        phase: SandboxPhase,
+        reason: &str,
+        message: &str,
+        mut mutate: Mutation,
+    ) -> Result<Sandbox, Status>
+    where
+        Mutation: FnMut(&mut Sandbox),
+    {
         let sandbox_id = sandbox.object_id().to_string();
         let expected_resource_version = sandbox_resource_version(sandbox);
         let reason = reason.to_string();
@@ -2104,6 +2302,7 @@ impl ComputeRuntime {
                 &sandbox_id,
                 expected_resource_version,
                 move |sandbox| {
+                    mutate(sandbox);
                     apply_lifecycle_phase(sandbox, phase, &reason, &message);
                 },
             )
@@ -3003,6 +3202,13 @@ impl ComputeRuntime {
                 continue;
             }
 
+            if !self
+                .check_start_guard(&sandbox, true)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                continue;
+            }
             if let Err(error) = self.validate_caller_driver_config(
                 sandbox
                     .spec
@@ -3227,6 +3433,18 @@ impl ComputeRuntime {
                 }
             };
             let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+            // Already-stopped guests need the product latch too: reviewed Keep
+            // must not turn subsequent orphan cleanup into an implicit delete.
+            if matches!(
+                phase,
+                SandboxPhase::Stopped | SandboxPhase::Completed | SandboxPhase::Starting
+            ) && !self
+                .check_start_guard(&sandbox, true)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                continue;
+            }
             match phase {
                 SandboxPhase::Stopped | SandboxPhase::Completed => {
                     if let Err(err) = self.cleanup_stopped_sandbox_sessions(&sandbox).await {
@@ -4192,7 +4410,14 @@ impl ComputeRuntime {
                 SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown)
             });
 
-        if existing_phase != SandboxPhase::Starting {
+        let terminal_container_snapshot = driver_snapshot_confirms_stopped(&incoming)
+            || driver_snapshot_reports_runtime_restart(&incoming);
+        if existing_phase != SandboxPhase::Starting
+            && !(matches!(
+                existing_phase,
+                SandboxPhase::Ready | SandboxPhase::Provisioning
+            ) && terminal_container_snapshot)
+        {
             return self.apply_sandbox_update_locked(incoming, existing).await;
         }
 
@@ -4202,9 +4427,10 @@ impl ComputeRuntime {
         // stop the new generation before the replacement supervisor connects.
         // Release the global watch lock, wait for that lifecycle operation,
         // and then reread both the driver and store before applying an
-        // authoritative observation. Taking the per-sandbox gate only for
-        // this ambiguous phase avoids delaying unrelated watch events behind
-        // slow lifecycle operations.
+        // authoritative observation. Revalidate terminal container events
+        // after promotion too: the replacement supervisor can reach Ready
+        // before an old exit event leaves the queue. Other stable-phase watch
+        // events do not wait behind slow lifecycle operations.
         let existing_name = existing_sandbox.as_ref().map_or_else(
             || incoming.name.clone(),
             |sandbox| sandbox.object_name().to_string(),
@@ -4229,7 +4455,9 @@ impl ComputeRuntime {
         match observed {
             Ok(Some(live)) if live.id == incoming.id && live.status.is_some() => incoming = live,
             Ok(Some(_) | None) | Err(_)
-                if matches!(current_phase, SandboxPhase::Starting | SandboxPhase::Ready) =>
+                if current_phase == SandboxPhase::Starting
+                    || (existing_phase == SandboxPhase::Starting
+                        && current_phase == SandboxPhase::Ready) =>
             {
                 warn!(
                     sandbox_id = %incoming.id,
@@ -6713,6 +6941,15 @@ impl ComputeDriver for NoopTestDriver {
         ))
     }
 
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<tonic::Response<GetGatewayListenerRequirementsResponse>, Status> {
+        Ok(tonic::Response::new(
+            GetGatewayListenerRequirementsResponse::default(),
+        ))
+    }
+
     async fn validate_sandbox_create(
         &self,
         _request: Request<ValidateSandboxCreateRequest>,
@@ -6897,6 +7134,8 @@ pub fn new_test_runtime_with_driver(
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
         sync_lock: Arc::new(Mutex::new(())),
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
+        start_guard: Arc::new(StdMutex::new(None)),
+        gateway_listener_requirements: Vec::new(),
         replica_id: "test-replica".to_string(),
         rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
         restart_authority: Arc::new(OnceLock::new()),
@@ -7315,6 +7554,15 @@ mod tests {
             }))
         }
 
+        async fn get_gateway_listener_requirements(
+            &self,
+            _request: Request<GetGatewayListenerRequirementsRequest>,
+        ) -> Result<tonic::Response<GetGatewayListenerRequirementsResponse>, Status> {
+            Ok(tonic::Response::new(
+                GetGatewayListenerRequirementsResponse::default(),
+            ))
+        }
+
         async fn validate_sandbox_create(
             &self,
             _request: Request<ValidateSandboxCreateRequest>,
@@ -7700,6 +7948,15 @@ mod tests {
             }))
         }
 
+        async fn get_gateway_listener_requirements(
+            &self,
+            _request: Request<GetGatewayListenerRequirementsRequest>,
+        ) -> Result<tonic::Response<GetGatewayListenerRequirementsResponse>, Status> {
+            Ok(tonic::Response::new(
+                GetGatewayListenerRequirementsResponse::default(),
+            ))
+        }
+
         async fn validate_sandbox_create(
             &self,
             _request: Request<ValidateSandboxCreateRequest>,
@@ -7946,6 +8203,8 @@ mod tests {
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
             sync_lock: Arc::new(Mutex::new(())),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
+            start_guard: Arc::new(StdMutex::new(None)),
+            gateway_listener_requirements: Vec::new(),
             replica_id: "test-replica".to_string(),
             rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
             restart_authority: Arc::new(OnceLock::new()),
@@ -10270,6 +10529,14 @@ mod tests {
                 self.0.get_capabilities(request).await
             }
 
+            async fn get_gateway_listener_requirements(
+                &self,
+                request: Request<GetGatewayListenerRequirementsRequest>,
+            ) -> Result<tonic::Response<GetGatewayListenerRequirementsResponse>, Status>
+            {
+                self.0.get_gateway_listener_requirements(request).await
+            }
+
             async fn validate_sandbox_create(
                 &self,
                 request: Request<ValidateSandboxCreateRequest>,
@@ -11072,6 +11339,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_authentication_waits_for_admission_and_commits_with_starting() {
+        let driver = ControlledDriver::new();
+        driver.block_start();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-auth", "sandbox-auth", SandboxPhase::Stopped);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let gate = runtime.lifecycle_gates.lock_for(sandbox.object_id()).await;
+        let authority = Arc::new(test_session_authority());
+        let start_runtime = runtime.clone();
+        let mut start = tokio::spawn(async move {
+            start_runtime
+                .start_sandbox_authenticated("default", "sandbox-auth", Some(authority.as_ref()))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut start)
+                .await
+                .is_err()
+        );
+        // The watch can advance the revision while the RPC waits for its gate.
+        let mut stopped = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        stopped.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "stopped",
+        )));
+        runtime.apply_sandbox_update(stopped).await.unwrap();
+        let before = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let before_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &before.metadata.as_ref().unwrap().annotations,
+        )
+        .unwrap();
+        assert_eq!(before_identity.auth_epoch.get(), 1);
+        drop(gate);
+        tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+            .await
+            .unwrap();
+        let committed = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let committed_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &committed.metadata.as_ref().unwrap().annotations,
+        )
+        .unwrap();
+        assert_eq!(committed.phase(), SandboxPhase::Starting as i32);
+        assert_eq!(committed_identity.auth_epoch.get(), 2);
+        assert_eq!(
+            committed_identity.runtime_generation,
+            before_identity.runtime_generation
+        );
+        assert_eq!(
+            sandbox_resource_version(&committed),
+            sandbox_resource_version(&before) + 1
+        );
+        let authentications = driver.start_authentications();
+        assert_eq!(authentications.len(), 1);
+        let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
+            serde_json::from_slice(&authentications[0]).unwrap();
+        assert_eq!(authentication.supervisor.auth_epoch.get(), 2);
+        driver.release_start();
+        start.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_authentication_is_not_prepared_for_ready_or_rejected_sandboxes() {
+        for phase in [
+            SandboxPhase::Ready,
+            SandboxPhase::Provisioning,
+            SandboxPhase::Stopped,
+        ] {
+            let driver = ControlledDriver::new();
+            let runtime = test_runtime(driver.clone()).await;
+            let sandbox = sandbox_record("held", "held-name", phase);
+            let authority = test_session_authority();
+            runtime.store.put_message(&sandbox).await.unwrap();
+            if phase == SandboxPhase::Stopped {
+                runtime.install_start_guard(Arc::new(RecoveryTestGuard {
+                    release: AtomicBool::new(false),
+                    verified_stopped: true,
+                }));
+            }
+            let result = runtime
+                .start_sandbox_authenticated("default", "held-name", Some(&authority))
+                .await;
+            if phase == SandboxPhase::Ready {
+                assert_eq!(result.unwrap().phase(), SandboxPhase::Ready as i32);
+            } else {
+                assert_eq!(result.unwrap_err().code(), Code::FailedPrecondition);
+            }
+            assert_eq!(driver.start_calls(), 0);
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.metadata.unwrap().annotations,
+                sandbox.metadata.unwrap().annotations
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_start_does_not_prepare_authentication_before_admission() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-canceled-auth", "canceled-auth", SandboxPhase::Stopped);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let gate = runtime.lifecycle_gates.lock_for(sandbox.object_id()).await;
+        let authority = Arc::new(test_session_authority());
+        let start_runtime = runtime.clone();
+        let mut start = tokio::spawn(async move {
+            start_runtime
+                .start_sandbox_authenticated("default", "canceled-auth", Some(authority.as_ref()))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut start)
+                .await
+                .is_err()
+        );
+        start.abort();
+        assert!(start.await.unwrap_err().is_cancelled());
+        drop(gate);
+        assert_eq!(driver.start_calls(), 0);
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
+        assert_eq!(
+            stored.metadata.unwrap().annotations,
+            sandbox.metadata.unwrap().annotations
+        );
+    }
+
+    #[tokio::test]
+    async fn start_authentication_epoch_is_not_rolled_back_after_driver_failure() {
+        let driver = ControlledDriver::new();
+        driver.set_start_outcome(ControlledLifecycleOutcome::Error("start refused"));
+        let sandbox = sandbox_record("sb-failed-auth", "failed-auth", SandboxPhase::Stopped);
+        let mut stopped = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        stopped.status = Some(make_driver_status(DriverCondition {
+            r#type: "Suspended".to_string(),
+            status: "True".to_string(),
+            reason: "PodTerminated".to_string(),
+            ..Default::default()
+        }));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(stopped)));
+        let runtime = test_runtime(driver).await;
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let authority = test_session_authority();
+        let error = runtime
+            .start_sandbox_authenticated("default", "failed-auth", Some(&authority))
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("start refused"));
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &stored.metadata.unwrap().annotations,
+        )
+        .unwrap();
+        assert_eq!(identity.auth_epoch.get(), 2);
+    }
+
+    #[tokio::test]
     async fn stale_container_exit_queued_before_start_cannot_regress_restart() {
         for reason in [
             "ContainerExited",
@@ -11186,6 +11635,101 @@ mod tests {
         assert!(
             matches!(phase, SandboxPhase::Starting | SandboxPhase::Provisioning),
             "the queued Ready event must not promote the sandbox; got {phase:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_container_exit_after_restart_reaches_ready_is_revalidated() {
+        for phase in [SandboxPhase::Provisioning, SandboxPhase::Ready] {
+            for reason in [
+                "ContainerExited",
+                "ContainerStopped",
+                "ContainerRuntimeRestart",
+            ] {
+                let driver = ControlledDriver::new();
+                let sandbox = sandbox_record("sb-ready-race", "sandbox-ready-race", phase);
+                driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+                    ready_driver_sandbox(sandbox.object_id(), sandbox.object_name()),
+                )));
+                let mut runtime = test_runtime(driver).await;
+                runtime.driver_info.driver_reports_runtime_readiness = true;
+                runtime.store.put_message(&sandbox).await.unwrap();
+                let mut stale_exit =
+                    ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+                stale_exit.status = Some(make_driver_status(make_driver_condition(
+                    reason,
+                    "old runtime stopped before the replacement became ready",
+                )));
+
+                runtime.apply_sandbox_update(stale_exit).await.unwrap();
+
+                let stored = runtime
+                    .store
+                    .get_message::<Sandbox>(sandbox.object_id())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    stored.phase(),
+                    SandboxPhase::Ready as i32,
+                    "queued {reason} must not regress a live replacement from {phase:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn current_container_exit_after_ready_still_fails_closed() {
+        for outcome in [
+            ControlledGetOutcome::Missing,
+            ControlledGetOutcome::Error("engine unavailable"),
+        ] {
+            let driver = ControlledDriver::new();
+            let sandbox =
+                sandbox_record("sb-ready-exit", "sandbox-ready-exit", SandboxPhase::Ready);
+            driver.set_get_outcome(outcome);
+            let runtime = test_runtime(driver).await;
+            runtime.store.put_message(&sandbox).await.unwrap();
+            let mut exited = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            exited.status = Some(make_driver_status(make_driver_condition(
+                "ContainerExited",
+                "runtime exited",
+            )));
+
+            runtime.apply_sandbox_update(exited).await.unwrap();
+
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.phase(),
+                SandboxPhase::Error as i32,
+                "an unverified terminal event must not keep a stable sandbox Ready"
+            );
+        }
+        let driver = ControlledDriver::new();
+        let sandbox = sandbox_record("sb-live-exit", "sandbox-live-exit", SandboxPhase::Ready);
+        let mut exited = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        exited.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "runtime exited",
+        )));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(exited.clone())));
+        let runtime = test_runtime(driver).await;
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime.apply_sandbox_update(exited).await.unwrap();
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .phase(),
+            SandboxPhase::Error as i32
         );
     }
 
@@ -14165,6 +14709,151 @@ mod tests {
                 "{driver_name} should retain operator-owned lifecycle"
             );
         }
+    }
+
+    #[derive(Debug)]
+    struct RecoveryTestGuard {
+        release: AtomicBool,
+        verified_stopped: bool,
+    }
+    #[async_trait::async_trait]
+    impl start_guard::SandboxStartGuard for RecoveryTestGuard {
+        async fn check(
+            &self,
+            context: start_guard::StartContext,
+        ) -> Result<start_guard::StartDecision, String> {
+            if context.sandbox_id != "held"
+                || (!context.automatic && self.release.load(Ordering::SeqCst))
+            {
+                return Ok(start_guard::StartDecision::Allow);
+            }
+            Ok(start_guard::StartDecision::Hold {
+                reason: "owner review and explicit resume required".into(),
+                stopped: self.verified_stopped,
+            })
+        }
+    }
+    #[tokio::test]
+    async fn embedder_restart_hold_precedes_interrupted_start_and_survives_sweeps() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime_with_gateway_managed_lifecycle(driver.clone(), "docker").await;
+        let guard = Arc::new(RecoveryTestGuard {
+            release: AtomicBool::new(false),
+            verified_stopped: true,
+        });
+        runtime.install_start_guard(guard.clone());
+        runtime
+            .store
+            .put_message(&sandbox_record("held", "held-name", SandboxPhase::Starting))
+            .await
+            .unwrap();
+        runtime
+            .store
+            .put_message(&sandbox_record(
+                "independent",
+                "other-name",
+                SandboxPhase::Ready,
+            ))
+            .await
+            .unwrap();
+        runtime.start_persisted_sandboxes().await.unwrap();
+        assert_eq!(driver.start_calls(), 1);
+        assert_eq!(driver.stop_calls(), 0);
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>("held")
+                .await
+                .unwrap()
+                .unwrap()
+                .phase(),
+            SandboxPhase::Stopped as i32
+        );
+        runtime.start_persisted_sandboxes().await.unwrap();
+        assert_eq!(driver.start_calls(), 2); // Only the independent guest.
+        assert_eq!(
+            runtime
+                .start_sandbox("default", "held-name")
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(driver.start_calls(), 2);
+        guard.release.store(true, Ordering::SeqCst);
+        runtime.start_sandbox("default", "held-name").await.unwrap();
+        assert_eq!(driver.start_calls(), 3);
+    }
+    #[tokio::test]
+    async fn embedder_restart_hold_also_reviews_already_stopped_guests() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime_with_gateway_managed_lifecycle(driver.clone(), "docker").await;
+        runtime.install_start_guard(Arc::new(RecoveryTestGuard {
+            release: AtomicBool::new(false),
+            verified_stopped: true,
+        }));
+        runtime
+            .store
+            .put_message(&sandbox_record("held", "held-name", SandboxPhase::Stopped))
+            .await
+            .unwrap();
+        runtime.start_persisted_sandboxes().await.unwrap();
+        let held = runtime
+            .store
+            .get_message::<Sandbox>("held")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            held.status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == "RecoveryHold")
+        );
+        runtime.start_persisted_sandboxes().await.unwrap();
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>("held")
+                .await
+                .unwrap()
+                .unwrap(),
+            held
+        );
+        assert_eq!(driver.start_calls(), 0);
+        assert_eq!(driver.stop_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn embedder_unknown_restart_hold_never_stops_or_rewrites_running_intent() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime_with_gateway_managed_lifecycle(driver.clone(), "docker").await;
+        runtime.install_start_guard(Arc::new(RecoveryTestGuard {
+            release: AtomicBool::new(false),
+            verified_stopped: false,
+        }));
+        let original = sandbox_record("held", "held-name", SandboxPhase::Ready);
+        runtime.store.put_message(&original).await.unwrap();
+        let before = runtime
+            .store
+            .get_message::<Sandbox>("held")
+            .await
+            .unwrap()
+            .unwrap();
+        runtime.start_persisted_sandboxes().await.unwrap();
+        assert_eq!(driver.start_calls(), 0);
+        assert_eq!(driver.stop_calls(), 0);
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>("held")
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
     }
 
     #[tokio::test]

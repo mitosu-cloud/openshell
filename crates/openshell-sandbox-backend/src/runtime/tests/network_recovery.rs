@@ -390,7 +390,7 @@ async fn verify_connection(mut pending: PendingTcpOpen) {
 #[tokio::test]
 async fn tcp_accept_recovers_a_lost_tls_connection() {
     let fixture = Fixture::new(Reply::Disconnect { pending_accepts: 1 }).await;
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(CONNECTION_PROBE_TIMEOUT + Duration::from_secs(3), async {
         verify_connection(fixture.source.accept_tcp().await.unwrap()).await;
     })
     .await
@@ -565,7 +565,7 @@ async fn requests_during_delayed_retirement_wait_for_the_confirmed_replacement()
         client: fixture.source.client.clone(),
     };
     let first = tokio::spawn(async move { first.accept_tcp().await });
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(CONNECTION_PROBE_TIMEOUT + Duration::from_secs(3), async {
         while fixture.state.rejected_attaches.load(Ordering::Acquire) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

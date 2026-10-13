@@ -12,12 +12,13 @@ use crate::lifecycle::{
     RestoreContext, extension_state_dir,
 };
 use crate::rootfs::{
-    clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    ext4_image_has_directory, extract_host_supervisor, extract_rootfs_archive_to,
-    prepare_sandbox_rootfs_from_image_root, recover_rootfs_image, remove_rootfs_image_file,
-    sandbox_guest_init_path, sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
-    sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode,
-    validate_host_supervisor, write_rootfs_image_file,
+    RootfsOwnership, clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size,
+    create_rootfs_image_with_ownership, ext4_image_has_directory, extract_host_supervisor,
+    extract_rootfs_archive_to, merge_layer_ownership, prepare_sandbox_rootfs_from_image_root,
+    read_archive_ownership, read_rootfs_archive_ownership, recover_rootfs_image,
+    remove_rootfs_image_file, sandbox_guest_init_path, sandbox_guest_runtime_identity,
+    sandbox_guest_user_ids_from_image, sandbox_guest_user_ids_from_overlay_image,
+    set_rootfs_image_file_mode, validate_host_supervisor, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use bollard::Docker;
@@ -50,7 +51,8 @@ use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
     DriverSandboxTemplate as SandboxTemplate, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     GpuResourceCapabilities, ListSandboxesRequest, ListSandboxesResponse,
     MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
@@ -1890,37 +1892,54 @@ impl VmDriver {
             )
         };
         if already_running {
-            let active_generation =
-                tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE))
-                    .await
-                    .map_err(|error| {
-                        Status::failed_precondition(format!(
-                            "read active VM sandbox generation: {error}"
-                        ))
-                    })?;
-            if active_generation.trim() != generation.as_str() {
-                return Err(Status::failed_precondition(format!(
-                    "VM sandbox is already running generation {}",
-                    active_generation.trim()
-                )));
-            }
             if launch_authentication.is_empty() {
+                // An unauthenticated duplicate start is only idempotent for
+                // the generation already running; it cannot replace a guest.
+                let active_generation =
+                    tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE))
+                        .await
+                        .map_err(|error| {
+                            Status::failed_precondition(format!(
+                                "read active VM sandbox generation: {error}"
+                            ))
+                        })?;
+                if active_generation.trim() != generation.as_str() {
+                    return Err(Status::failed_precondition(format!(
+                        "VM sandbox is already running generation {}",
+                        active_generation.trim()
+                    )));
+                }
                 return Ok(());
             }
-        }
-        let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
-            .await
+            // A restarted gateway issues a fresh generation and authenticated
+            // launch bundle. Validate the bundle before stopping the old VM;
+            // then restart it with the new supervisor session.
+            let authentication = serde_json::from_slice::<
+                openshell_core::jwt::SandboxLaunchAuthentication,
+            >(&launch_authentication)
             .map_err(|error| {
-                Status::failed_precondition(format!("read VM admission provenance: {error}"))
+                Status::failed_precondition(format!(
+                    "decode VM sandbox launch authentication: {error}"
+                ))
             })?;
-        self.validate_sandbox(&sandbox)?;
-        if already_running {
+            authentication.validate().map_err(|error| {
+                Status::failed_precondition(format!(
+                    "validate VM sandbox launch authentication: {error}"
+                ))
+            })?;
             // The gateway keeps launch sessions in memory. A non-empty bundle
             // during startup recovery represents a new gateway session, so
             // restart the VM before installing it rather than leaving the old
             // supervisor connected with invalid credentials.
             self.stop_sandbox(&record_id, sandbox_name).await?;
         }
+
+        let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .map_err(|error| {
+                Status::failed_precondition(format!("read VM admission provenance: {error}"))
+            })?;
+        self.validate_sandbox(&sandbox)?;
 
         remove_runtime_generation_material(&state_dir)
             .await
@@ -3862,6 +3881,8 @@ impl VmDriver {
 
         let image_ref_owned = image_ref.to_string();
         let image_identity_owned = image_identity.to_string();
+        let owners =
+            read_rootfs_archive_ownership(&exported_rootfs).map_err(Status::failed_precondition)?;
         let exported_rootfs_for_build = exported_rootfs.clone();
         let prepared_rootfs_for_build = prepared_rootfs.clone();
         let (sandbox_uid, sandbox_gid) = configured_sandbox_identity(&self.config)
@@ -3913,7 +3934,11 @@ impl VmDriver {
         let prepared_rootfs_for_build = prepared_rootfs.clone();
         let prepared_image_for_build = prepared_image.clone();
         let build_result = tokio::task::spawn_blocking(move || {
-            create_rootfs_image_from_dir(&prepared_rootfs_for_build, &prepared_image_for_build)
+            create_rootfs_image_with_ownership(
+                &prepared_rootfs_for_build,
+                &prepared_image_for_build,
+                &owners,
+            )
         })
         .await
         .map_err(|err| Status::internal(format!("rootfs image build panicked: {err}")))?;
@@ -3978,7 +4003,7 @@ impl VmDriver {
             staging_dir = %staging_dir.display(),
             "vm driver: pulling registry image layers"
         );
-        if let Err(err) = self
+        let owners = match self
             .pull_registry_image_rootfs(
                 sandbox_id,
                 client,
@@ -3990,14 +4015,17 @@ impl VmDriver {
             )
             .await
         {
-            warn!(
-                image_ref = %image_ref,
-                error = %err.message(),
-                "vm driver: pull_registry_image_rootfs failed"
-            );
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(err);
-        }
+            Ok(owners) => owners,
+            Err(err) => {
+                warn!(
+                    image_ref = %image_ref,
+                    error = %err.message(),
+                    "vm driver: pull_registry_image_rootfs failed"
+                );
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                return Err(err);
+            }
+        };
         info!(
             image_ref = %image_ref,
             "vm driver: image layers pulled, preparing rootfs image"
@@ -4059,7 +4087,11 @@ impl VmDriver {
         let prepared_rootfs_for_build = prepared_rootfs.clone();
         let prepared_image_for_build = prepared_image.clone();
         let build_result = tokio::task::spawn_blocking(move || {
-            create_rootfs_image_from_dir(&prepared_rootfs_for_build, &prepared_image_for_build)
+            create_rootfs_image_with_ownership(
+                &prepared_rootfs_for_build,
+                &prepared_image_for_build,
+                &owners,
+            )
         })
         .await
         .map_err(|err| Status::internal(format!("image rootfs build panicked: {err}")))?;
@@ -4366,6 +4398,15 @@ impl ComputeDriver for VmDriver {
         )
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
         Ok(Response::new(capabilities))
+    }
+
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        Ok(Response::new(
+            GetGatewayListenerRequirementsResponse::default(),
+        ))
     }
 
     async fn validate_sandbox_create(
@@ -5028,7 +5069,7 @@ impl VmDriver {
         image_ref: &str,
         staging_dir: &Path,
         rootfs: &Path,
-    ) -> Result<(), Status> {
+    ) -> Result<RootfsOwnership, Status> {
         retry_registry_request("authenticate with registry", || {
             client.auth(reference, auth, RegistryOperation::Pull)
         })
@@ -5082,13 +5123,15 @@ impl VmDriver {
             .await?;
         layers.sort_by_key(|layer| layer.index);
 
+        let mut owners = RootfsOwnership::new();
         for layer in &layers {
             apply_registry_layer_blob(image_ref, rootfs, layer).await?;
+            merge_layer_ownership(&mut owners, layer.ownership.clone());
         }
 
         remove_registry_layer_staging(staging_dir).await?;
 
-        Ok(())
+        Ok(owners)
     }
 
     fn publish_registry_layer_progress(
@@ -5145,6 +5188,7 @@ impl VmDriver {
 }
 
 struct DownloadedRegistryLayer {
+    ownership: RootfsOwnership,
     index: usize,
     digest: String,
     layer_root: PathBuf,
@@ -5204,8 +5248,16 @@ async fn download_registry_layer_blob(
     let blob_path_for_unpack = blob_path.clone();
     let layer_root_for_unpack = layer_root.clone();
     let media_type = layer.media_type.clone();
-    tokio::task::spawn_blocking(move || {
-        extract_layer_blob_to_dir(&blob_path_for_unpack, &media_type, &layer_root_for_unpack)
+    let ownership = tokio::task::spawn_blocking(move || {
+        extract_layer_blob_to_dir(&blob_path_for_unpack, &media_type, &layer_root_for_unpack)?;
+        let file = fs::File::open(&blob_path_for_unpack).map_err(|e| e.to_string())?;
+        match layer_compression_from_media_type(&media_type)? {
+            LayerCompression::None => read_archive_ownership(file),
+            LayerCompression::Gzip => read_archive_ownership(GzDecoder::new(file)),
+            LayerCompression::Zstd => read_archive_ownership(
+                zstd::stream::read::Decoder::new(file).map_err(|e| e.to_string())?,
+            ),
+        }
     })
     .await
     .map_err(|err| Status::internal(format!("layer extraction panicked: {err}")))?
@@ -5217,6 +5269,7 @@ async fn download_registry_layer_blob(
     })?;
 
     Ok(DownloadedRegistryLayer {
+        ownership,
         index,
         digest: layer.digest,
         layer_root,

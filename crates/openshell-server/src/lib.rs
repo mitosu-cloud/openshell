@@ -21,6 +21,7 @@ pub mod config_file;
 mod config_update_operation;
 mod credentials;
 mod defaults;
+pub mod embed;
 mod gateway_listener;
 mod gateway_ocsf;
 mod grpc;
@@ -49,11 +50,11 @@ mod tls;
 #[cfg(test)]
 pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
-mod tracing_setup;
+pub mod tracing_setup;
 mod watch_cursor;
 mod ws_tunnel;
 
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{BuildError, PrometheusBuilder, PrometheusHandle};
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{Config, Error, ObjectLabels, Result};
@@ -73,7 +74,8 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 #[cfg(test)]
@@ -87,8 +89,25 @@ pub(crate) fn install_jsonwebtoken_crypto_provider() {
     let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
 }
 
+#[cfg(test)]
+mod crypto_provider_tolerance_tests {
+    #[test]
+    fn jsonwebtoken_provider_tolerates_already_installed() {
+        super::install_jsonwebtoken_crypto_provider();
+        super::install_jsonwebtoken_crypto_provider();
+    }
+
+    #[test]
+    fn rustls_provider_tolerates_already_installed() {
+        let first = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let second = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        assert!(first.is_ok() || second.is_err());
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 use compute::ComputeRuntime;
-use gateway_listener::{BoundGatewayListener, bind_gateway_listener};
+use gateway_listener::{BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 
@@ -182,11 +201,12 @@ fn mint_gateway_extension_credential(
 fn spawn_gateway_extension_token_refresh(
     issuer: Arc<auth::sandbox_jwt::ExtensionJwtIssuer>,
     credentials: Vec<GatewayExtensionCredential>,
-) {
+    mut shutdown: watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
     if credentials.is_empty() {
-        return;
+        return None;
     }
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         loop {
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -210,7 +230,9 @@ fn spawn_gateway_extension_token_refresh(
                         .max(100),
                 )
             };
-            tokio::time::sleep(refresh_delay).await;
+            if !wait_for_shutdown_or_sleep(&mut shutdown, refresh_delay).await {
+                break;
+            }
             for credential in &credentials {
                 match issuer.mint_extension_token(
                     &credential.audience,
@@ -237,7 +259,40 @@ fn spawn_gateway_extension_token_refresh(
                 }
             }
         }
-    });
+    }))
+}
+
+/// Wait until `shutdown` becomes true or the sender is dropped, or `duration`
+/// elapses. Returns `false` when background work should stop.
+pub(crate) async fn wait_for_shutdown_or_sleep(
+    shutdown: &mut watch::Receiver<bool>,
+    duration: Duration,
+) -> bool {
+    if *shutdown.borrow() {
+        return false;
+    }
+    tokio::select! {
+        result = shutdown.changed() => result.is_ok() && !*shutdown.borrow(),
+        () = tokio::time::sleep(duration) => true,
+    }
+}
+
+/// Install the Prometheus recorder only when the caller still owns the global
+/// slot. An already-installed recorder is not an error for an embedded host.
+fn try_install_prometheus_recorder() -> Result<Option<PrometheusHandle>> {
+    match PrometheusBuilder::new().install_recorder() {
+        Ok(handle) => Ok(Some(handle)),
+        Err(BuildError::FailedToSetGlobalRecorder(err)) => {
+            warn!(
+                error = %err,
+                "Prometheus recorder already installed; continuing without replacing it"
+            );
+            Ok(None)
+        }
+        Err(err) => Err(Error::config(format!(
+            "failed to install metrics recorder: {err}"
+        ))),
+    }
 }
 pub use multiplex::{MultiplexService, MultiplexedService};
 pub use persistence::Store;
@@ -246,12 +301,40 @@ use sandbox_watch::SandboxWatchBus;
 pub use tls::TlsAcceptor;
 use tracing_bus::TracingLogBus;
 
-pub(crate) struct ServerStartupConfig {
+/// Inputs required to construct server state before sockets are bound.
+pub struct ServerStartupConfig {
     pub config: Config,
     pub config_file: Option<config_file::ConfigFile>,
     pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
     pub compute_driver: ComputeDriverSelection,
     pub legacy_compute_driver_env_seen: bool,
+}
+
+/// Addresses the gateway is actually listening on after bind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListenerInfo {
+    /// Operator-facing multiplexed gRPC/HTTP bind address.
+    pub primary: SocketAddr,
+    /// Extra callback-only listeners requested by the compute driver.
+    pub callback_addresses: Vec<SocketAddr>,
+}
+
+/// Fully constructed server state, before sockets are bound.
+pub struct BootstrappedServer {
+    state: Arc<ServerState>,
+    background_tasks: Vec<JoinHandle<()>>,
+}
+
+/// Running listeners and the task that waits for shutdown.
+pub struct ServingServer {
+    /// Completes once listeners are bound and persisted sandboxes have been
+    /// asked to start.
+    pub ready: oneshot::Receiver<ListenerInfo>,
+    /// Resolves when the shutdown watch becomes true.
+    pub task: JoinHandle<Result<()>>,
+    state: Arc<ServerState>,
+    listener_tasks: Vec<JoinHandle<()>>,
+    background_tasks: Vec<JoinHandle<()>>,
 }
 
 /// Server state shared across handlers.
@@ -515,6 +598,32 @@ pub(crate) async fn run_server(
     tracing_log_bus: TracingLogBus,
     compute_drivers: ComputeDriverRegistry,
 ) -> Result<()> {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bootstrapped = bootstrap_state(
+        startup,
+        compute_drivers,
+        tracing_log_bus,
+        shutdown_rx.clone(),
+    )
+    .await?;
+    let serving = serve(bootstrapped, shutdown_rx).await?;
+    shutdown_signal().await;
+    info!("Shutdown signal received; stopping gateway");
+    serving
+        .state
+        .gateway_shutting_down
+        .store(true, Ordering::Release);
+    let _ = shutdown_tx.send(true);
+    shutdown_and_cleanup(serving).await
+}
+
+/// Construct authenticated server state without binding sockets.
+pub async fn bootstrap_state(
+    startup: ServerStartupConfig,
+    compute_drivers: ComputeDriverRegistry,
+    tracing_log_bus: TracingLogBus,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<BootstrappedServer> {
     let ServerStartupConfig {
         config,
         config_file,
@@ -522,7 +631,6 @@ pub(crate) async fn run_server(
         compute_driver,
         legacy_compute_driver_env_seen: _,
     } = startup;
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     auth::descriptor_authz::init()
         .map_err(|error| Error::config(format!("invalid gRPC authorization metadata: {error}")))?;
@@ -742,8 +850,15 @@ pub(crate) async fn run_server(
     state.provider_profile_sources = provider_profile_sources;
     state.extension_jwt_issuer = extension_jwt_issuer.clone();
     state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
-    if let Some(issuer) = extension_jwt_issuer {
-        spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
+    let mut background_tasks = Vec::new();
+    if let Some(issuer) = extension_jwt_issuer.clone()
+        && let Some(task) = spawn_gateway_extension_token_refresh(
+            issuer,
+            gateway_extension_credentials,
+            shutdown_rx.clone(),
+        )
+    {
+        background_tasks.push(task);
     }
 
     if state.sandbox_session_jwt_authority.is_some()
@@ -866,7 +981,29 @@ pub(crate) async fn run_server(
             ))
         })?;
 
-    let gateway_listener = bind_gateway_listener(config.bind_address).await?;
+    Ok(BootstrappedServer {
+        state,
+        background_tasks,
+    })
+}
+
+/// Bind listeners and start serving until `shutdown` becomes true.
+pub async fn serve(
+    bootstrapped: BootstrappedServer,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<ServingServer> {
+    let BootstrappedServer {
+        state,
+        mut background_tasks,
+    } = bootstrapped;
+    let store = state.store.clone();
+    let config = state.config.clone();
+
+    let gateway_listeners = bind_gateway_listeners(
+        config.bind_address,
+        state.compute.gateway_listener_requirements(),
+    )
+    .await?;
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
@@ -883,36 +1020,66 @@ pub(crate) async fn run_server(
         // `Initializing → 503` until the background monitor publishes the
         // first real probe outcome, so the endpoint is always responsive.
         let router = health_router(store.clone());
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(health_listener, router.into_make_service()).await {
+        let mut health_shutdown = shutdown_rx.clone();
+        background_tasks.push(tokio::spawn(async move {
+            let shutdown = async move {
+                while !*health_shutdown.borrow() {
+                    if health_shutdown.changed().await.is_err() {
+                        break;
+                    }
+                }
+            };
+            if let Err(e) = axum::serve(health_listener, router.into_make_service())
+                .with_graceful_shutdown(shutdown)
+                .await
+            {
                 error!("Health server error: {e}");
             }
-        });
+        }));
     } else {
         info!("Health server disabled");
     }
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
+    // The global recorder is installed only for that listener; an already-installed
+    // recorder (typical when the gateway is embedded) is left in place.
     if let Some(metrics_bind_address) = config.metrics_bind_address {
-        let prometheus_handle = PrometheusBuilder::new()
-            .install_recorder()
-            .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
-        let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
-            Error::transport(format!(
-                "failed to bind metrics port {metrics_bind_address}: {e}",
-            ))
-        })?;
-        info!(address = %metrics_bind_address, "Metrics server listening");
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(
-                metrics_listener,
-                metrics_router(prometheus_handle).into_make_service(),
-            )
-            .await
-            {
-                error!("Metrics server error: {e}");
+        match try_install_prometheus_recorder()? {
+            Some(prometheus_handle) => {
+                let metrics_listener =
+                    TcpListener::bind(metrics_bind_address).await.map_err(|e| {
+                        Error::transport(format!(
+                            "failed to bind metrics port {metrics_bind_address}: {e}",
+                        ))
+                    })?;
+                info!(address = %metrics_bind_address, "Metrics server listening");
+                let mut metrics_shutdown = shutdown_rx.clone();
+                background_tasks.push(tokio::spawn(async move {
+                    let shutdown = async move {
+                        while !*metrics_shutdown.borrow() {
+                            if metrics_shutdown.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    };
+                    if let Err(e) = axum::serve(
+                        metrics_listener,
+                        metrics_router(prometheus_handle).into_make_service(),
+                    )
+                    .with_graceful_shutdown(shutdown)
+                    .await
+                    {
+                        error!("Metrics server error: {e}");
+                    }
+                }));
             }
-        });
+            None => {
+                warn!(
+                    address = %metrics_bind_address,
+                    "skipping dedicated metrics listener because a Prometheus recorder is already installed"
+                );
+            }
+        }
     } else {
         info!("Metrics server disabled");
     }
@@ -932,7 +1099,7 @@ pub(crate) async fn run_server(
         // Spawn file-watcher-based TLS certificate reload worker.
         // Watches parent directories of cert/key/CA files and atomically
         // reloads when changes are detected.
-        acceptor.spawn_reload_worker(shutdown_rx.clone());
+        background_tasks.push(acceptor.spawn_reload_worker(shutdown_rx.clone()));
 
         Some(acceptor)
     } else {
@@ -940,14 +1107,32 @@ pub(crate) async fn run_server(
         None
     };
 
+    let primary = gateway_listeners
+        .iter()
+        .find(|listener| listener.spec.scope == GatewayListenerScope::Primary)
+        .map(|listener| listener.spec.address)
+        .ok_or_else(|| Error::config("primary gateway listener was not bound"))?;
+    let callback_addresses = gateway_listeners
+        .iter()
+        .filter(|listener| listener.spec.scope == GatewayListenerScope::ComputeDriverCallback)
+        .map(|listener| listener.spec.address)
+        .collect();
+    let listener_info = ListenerInfo {
+        primary,
+        callback_addresses,
+    };
+
+    let mut listener_tasks = Vec::with_capacity(gateway_listeners.len());
     let enable_loopback_service_http = config.service_routing.enable_loopback_service_http;
-    let listener_task = tokio::spawn(serve_gateway_listener(
-        gateway_listener,
-        service.clone(),
-        tls_acceptor.clone(),
-        enable_loopback_service_http,
-        shutdown_rx.clone(),
-    ));
+    for listener in gateway_listeners {
+        listener_tasks.push(tokio::spawn(serve_gateway_listener(
+            listener,
+            service.clone(),
+            tls_acceptor.clone(),
+            enable_loopback_service_http,
+            shutdown_rx.clone(),
+        )));
+    }
 
     // Deadlines must run while restored supervisors wait for policy repair.
     let (startup_tx, startup_rx) = watch::channel(false);
@@ -984,30 +1169,76 @@ pub(crate) async fn run_server(
     }
 
     startup_tx.send_replace(true);
+    background_tasks.push(ssh_sessions::spawn_session_reaper(
+        store.clone(),
+        Duration::from_hours(1),
+        shutdown_rx.clone(),
+    ));
+    background_tasks.push(supervisor_session::spawn_relay_reaper(
+        state.clone(),
+        Duration::from_secs(30),
+        shutdown_rx.clone(),
+    ));
+    background_tasks.push(provider_refresh::spawn_refresh_worker(
+        state.clone(),
+        Duration::from_mins(1),
+        shutdown_rx.clone(),
+    ));
     // The poller exists to observe writes made by other replicas. Single-
     // replica backends have none, so it would only add load.
     if !store.is_single_replica() {
-        sandbox_watch::spawn_store_poller(
+        background_tasks.push(sandbox_watch::spawn_store_poller(
             store.clone(),
             state.sandbox_watch_bus.clone(),
             sandbox_watch::DEFAULT_STORE_POLL_INTERVAL,
             shutdown_rx.clone(),
-        );
+        ));
     }
-    ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
-    supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
-    provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
-    shutdown_signal().await;
-    info!("Shutdown signal received; stopping gateway");
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let _ = ready_tx.send(listener_info);
+
+    let mut shutdown_wait = shutdown_rx.clone();
+    let task = tokio::spawn(async move {
+        while !*shutdown_wait.borrow() {
+            if shutdown_wait.changed().await.is_err() {
+                break;
+            }
+        }
+        Ok(())
+    });
+
+    Ok(ServingServer {
+        ready: ready_rx,
+        task,
+        state,
+        listener_tasks,
+        background_tasks,
+    })
+}
+
+/// Stop listeners and run compute-driver shutdown cleanup.
+pub async fn shutdown_and_cleanup(serving: ServingServer) -> Result<()> {
+    let ServingServer {
+        ready: _,
+        task,
+        state,
+        listener_tasks,
+        background_tasks,
+    } = serving;
     state.gateway_shutting_down.store(true, Ordering::Release);
     state.supervisor_sessions.close_admission();
-    let _ = shutdown_tx.send(true);
-
-    if let Err(err) = listener_task.await {
-        warn!(error = %err, "Gateway listener task failed during shutdown");
+    let _ = task.await;
+    for listener_task in listener_tasks {
+        if let Err(err) = listener_task.await {
+            warn!(error = %err, "Gateway listener task failed during shutdown");
+        }
     }
-
+    for background_task in background_tasks {
+        if let Err(err) = background_task.await {
+            warn!(error = %err, "Background task failed during shutdown");
+        }
+    }
     let compute_cleanup = state.compute.cleanup_on_shutdown().await;
     // A stopped supervisor may still have a detached task deleting its owner
     // record. Drain it even when compute cleanup failed before exiting Tokio.
@@ -1021,7 +1252,7 @@ pub(crate) async fn run_server(
     compute_cleanup
         .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
     session_cleanup.map_err(Error::execution)?;
-
+    state.store.close().await;
     Ok(())
 }
 
@@ -1032,10 +1263,8 @@ async fn serve_gateway_listener(
     enable_loopback_service_http: bool,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let BoundGatewayListener {
-        listener,
-        address: listen_addr,
-    } = bound_listener;
+    let BoundGatewayListener { listener, spec } = bound_listener;
+    let listen_addr = spec.address;
 
     loop {
         let accepted = tokio::select! {
@@ -1055,12 +1284,20 @@ async fn serve_gateway_listener(
                 continue;
             }
         };
+        let listener_scope = match stream.local_addr() {
+            Ok(local_addr) => spec.scope_for_local_addr(local_addr),
+            Err(e) => {
+                debug!(error = %e, client = %addr, listen = %listen_addr, "Failed to inspect accepted local address");
+                spec.scope
+            }
+        };
         set_tcp_nodelay_best_effort(&stream);
 
         spawn_gateway_connection(
             stream,
             addr,
             listen_addr,
+            listener_scope,
             service.clone(),
             tls_acceptor.clone(),
             enable_loopback_service_http,
@@ -1121,14 +1358,19 @@ fn allow_plaintext_service_http(
     enabled: bool,
     listen_addr: SocketAddr,
     peer_addr: SocketAddr,
+    listener_scope: GatewayListenerScope,
 ) -> bool {
-    enabled && listen_addr.ip().is_loopback() && peer_addr.ip().is_loopback()
+    enabled
+        && matches!(listener_scope, GatewayListenerScope::Primary)
+        && listen_addr.ip().is_loopback()
+        && peer_addr.ip().is_loopback()
 }
 
 fn spawn_gateway_connection(
     stream: TcpStream,
     addr: SocketAddr,
     listen_addr: SocketAddr,
+    listener_scope: GatewayListenerScope,
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
     enable_loopback_service_http: bool,
@@ -1141,9 +1383,13 @@ fn spawn_gateway_connection(
                         enable_loopback_service_http,
                         listen_addr,
                         addr,
+                        listener_scope,
                     ) =>
                 {
-                    if let Err(e) = service.serve_service_http(stream).await {
+                    if let Err(e) = service
+                        .serve_service_http_on_listener(stream, listener_scope)
+                        .await
+                    {
                         if is_benign_connection_close(e.as_ref()) {
                             debug!(error = %e, client = %addr, listen = %listen_addr, "Plaintext service HTTP connection closed");
                         } else {
@@ -1155,6 +1401,7 @@ fn spawn_gateway_connection(
                     warn!(
                         client = %addr,
                         listen = %listen_addr,
+                        scope = ?listener_scope,
                         "Rejected plaintext HTTP on gateway listener"
                     );
                 }
@@ -1166,7 +1413,11 @@ fn spawn_gateway_connection(
                         Ok(tls_stream) => {
                             let peer_identity = multiplex::extract_peer_identity(&tls_stream);
                             if let Err(e) = service
-                                .serve_with_peer_identity(tls_stream, peer_identity)
+                                .serve_with_peer_identity_on_listener(
+                                    tls_stream,
+                                    peer_identity,
+                                    listener_scope,
+                                )
                                 .await
                             {
                                 if is_benign_connection_close(e.as_ref()) {
@@ -1192,7 +1443,7 @@ fn spawn_gateway_connection(
         });
     } else {
         tokio::spawn(async move {
-            if let Err(e) = service.serve(stream).await {
+            if let Err(e) = service.serve_on_listener(stream, listener_scope).await {
                 if is_benign_connection_close(e.as_ref()) {
                     debug!(error = %e, client = %addr, "Connection closed");
                 } else {
@@ -1387,8 +1638,9 @@ pub struct ComputeDriverRegistry {
     drivers: BTreeMap<String, ComputeDriverRegistration>,
 }
 
+/// Names of installed drivers that passed auto-detection, in priority order.
 #[derive(Clone, Debug)]
-struct ComputeDriverDetection {
+pub struct ComputeDriverDetection {
     available: Vec<String>,
 }
 
@@ -1398,9 +1650,12 @@ impl ComputeDriverDetection {
     }
 }
 
+/// How the gateway chose the compute driver for this process.
 #[derive(Clone, Debug)]
-pub(crate) enum ComputeDriverSelection {
+pub enum ComputeDriverSelection {
+    /// Operator or embedder named the driver.
     Configured { name: String },
+    /// First auto-detectable installed driver that reported itself available.
     AutoDetected(ComputeDriverDetection),
 }
 
@@ -1896,7 +2151,7 @@ mod tests {
     use super::{
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
         MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
-        bind_gateway_listener, classify_initial_bytes, configured_compute_driver,
+        bind_gateway_listeners, classify_initial_bytes, configured_compute_driver,
         extension_token_ttl, is_benign_tls_handshake_failure, mint_gateway_extension_credential,
         serve_gateway_listener, validate_peer_endpoint_scheme,
     };
@@ -1993,6 +2248,28 @@ mod tests {
             )
             .expect("issuer"),
         )
+    }
+
+    #[test]
+    fn already_installed_prometheus_recorder_is_tolerated() {
+        assert!(super::try_install_prometheus_recorder().is_ok());
+        assert!(matches!(super::try_install_prometheus_recorder(), Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn wait_for_shutdown_or_sleep_stops_when_signaled() {
+        let (tx, mut rx) = watch::channel(false);
+        let wait = super::wait_for_shutdown_or_sleep(&mut rx, Duration::from_mins(1));
+        tx.send(true).unwrap();
+        assert!(!wait.await);
+    }
+
+    #[tokio::test]
+    async fn wait_for_shutdown_or_sleep_returns_after_duration() {
+        let (_tx, mut rx) = watch::channel(false);
+        let started = std::time::Instant::now();
+        assert!(super::wait_for_shutdown_or_sleep(&mut rx, Duration::from_millis(20)).await);
+        assert!(started.elapsed() >= Duration::from_millis(20));
     }
 
     #[test]
@@ -2222,7 +2499,10 @@ mod tests {
         let handle = tokio::spawn(serve_gateway_listener(
             BoundGatewayListener {
                 listener,
-                address: listen_addr,
+                spec: crate::gateway_listener::GatewayListenerSpec::new(
+                    listen_addr,
+                    crate::GatewayListenerScope::Primary,
+                ),
             },
             service,
             Some(tls_acceptor),
@@ -2320,10 +2600,36 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:54000".parse().unwrap();
         let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let remote_peer: SocketAddr = "192.0.2.10:54000".parse().unwrap();
-        assert!(allow_plaintext_service_http(true, loopback, peer));
-        assert!(!allow_plaintext_service_http(false, loopback, peer));
-        assert!(!allow_plaintext_service_http(true, wildcard, peer));
-        assert!(!allow_plaintext_service_http(true, loopback, remote_peer));
+        assert!(allow_plaintext_service_http(
+            true,
+            loopback,
+            peer,
+            crate::GatewayListenerScope::Primary,
+        ));
+        assert!(!allow_plaintext_service_http(
+            false,
+            loopback,
+            peer,
+            crate::GatewayListenerScope::Primary,
+        ));
+        assert!(!allow_plaintext_service_http(
+            true,
+            wildcard,
+            peer,
+            crate::GatewayListenerScope::Primary,
+        ));
+        assert!(!allow_plaintext_service_http(
+            true,
+            loopback,
+            remote_peer,
+            crate::GatewayListenerScope::Primary,
+        ));
+        assert!(!allow_plaintext_service_http(
+            true,
+            loopback,
+            peer,
+            crate::GatewayListenerScope::ComputeDriverCallback,
+        ));
     }
 
     #[tokio::test]
@@ -2623,7 +2929,7 @@ mod tests {
         let occupied_address = occupied_listener.local_addr().unwrap();
         let start_attempted = AtomicBool::new(false);
         let result: openshell_core::Result<()> = async {
-            let _listener = bind_gateway_listener(occupied_address).await?;
+            let _listeners = bind_gateway_listeners(occupied_address, &[]).await?;
             start_attempted.store(true, Ordering::SeqCst);
             Ok(())
         }

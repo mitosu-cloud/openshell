@@ -106,3 +106,4 @@ jobs:
           triple: ${{ matrix.triple }}
           cargo-version: ${{ inputs['cargo-version'] }}
           supervisor-image-tag: ${{ inputs['supervisor-image-tag'] }}
+          entitlements: ${{ endsWith(matrix.triple, '-apple-darwin') && 'crates/openshell-driver-vm/entitlements.plist' || '' }}

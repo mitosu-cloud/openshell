@@ -32,6 +32,11 @@ service ComputeDriver {
   rpc AuthenticateSandbox(AuthenticateSandboxRequest)
       returns (AuthenticateSandboxResponse);
 
+  // Report additional gateway listeners required by this driver instance.
+  // The gateway validates, authorizes, and performs every bind.
+  rpc GetGatewayListenerRequirements(GetGatewayListenerRequirementsRequest)
+      returns (GetGatewayListenerRequirementsResponse);
+
   // Validate a sandbox before create-time provisioning.
   rpc ValidateSandboxCreate(ValidateSandboxCreateRequest)
       returns (ValidateSandboxCreateResponse);
@@ -145,6 +150,30 @@ message GpuResourceCapabilities {
   bool default_selection_supported = 1;
   // The driver accepts an explicit `gpu.count` request.
   bool count_selection_supported = 2;
+}
+
+message GetGatewayListenerRequirementsRequest {}
+
+message GatewayListenerRequirement {
+  // Untrusted human-readable driver rationale for diagnostics.
+  string reason = 1;
+
+  oneof selector {
+    // Concrete IP:port address requested by the driver. The port must match
+    // the gateway's configured primary listener port.
+    string exact_bind_address = 2;
+    // Ask the gateway to bind the IPv4 address selected by its default route.
+    GatewayDefaultRouteInterfaceRequirement default_route_interface = 3;
+    // Ask the gateway to ensure an IPv4 loopback listener is present.
+    GatewayLoopbackInterfaceRequirement loopback_interface = 4;
+  }
+}
+
+message GatewayDefaultRouteInterfaceRequirement {}
+message GatewayLoopbackInterfaceRequirement {}
+
+message GetGatewayListenerRequirementsResponse {
+  repeated GatewayListenerRequirement requirements = 1;
 }
 
 // Driver-owned sandbox model used for create requests and platform observations.

@@ -17,11 +17,14 @@ use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    FinalizeMainProcessExitRequest, GatewayMessage, RelayFrame, RelayInit, RelayOpen,
-    RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
-    SupervisorMessage, TcpRelayTarget, gateway_message, relay_open, supervisor_message,
+    FinalizeMainProcessExitRequest, GatewayMessage, ProvisionSandboxFileCommand,
+    ProvisionSandboxFileResult, RelayFrame, RelayInit, RelayOpen, RelayOpenResult,
+    ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello, SupervisorMessage,
+    TcpRelayTarget, gateway_message, relay_open, supervisor_message,
 };
-use openshell_isolation_interface::contract::{BoundaryLoopbackConnector, LoopbackTarget};
+use openshell_isolation_interface::contract::{
+    BoundaryExec, BoundaryLoopbackConnector, FileProvisionRequest, LoopbackTarget,
+};
 use openshell_ocsf::{
     ActivityId, BaseEventBuilder, ConnectionInfo, Endpoint, EventContext, NetworkActivityBuilder,
     OcsfEvent, SeverityId, StatusId, ocsf_emit,
@@ -294,11 +297,16 @@ fn map_session_stream_message<T>(
 ///
 /// The task runs for the lifetime of the sandbox process, reconnecting with
 /// exponential backoff on failures.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit boundary handles preserve the existing session API"
+)]
 pub fn spawn(
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    boundary_exec: Arc<dyn BoundaryExec>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     runtime: SessionRuntimeContext,
@@ -308,6 +316,7 @@ pub fn spawn(
         sandbox_id,
         ssh_socket_path,
         port_forward,
+        boundary_exec,
         expected_ssh_peer_pid,
         terminating,
         runtime,
@@ -316,11 +325,16 @@ pub fn spawn(
 }
 
 /// Spawn the supervisor session and expose when the gateway has accepted it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "same boundary handles as spawn plus a readiness receiver"
+)]
 pub fn spawn_with_readiness(
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    boundary_exec: Arc<dyn BoundaryExec>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     runtime: SessionRuntimeContext,
@@ -331,6 +345,7 @@ pub fn spawn_with_readiness(
         sandbox_id,
         ssh_socket_path,
         port_forward,
+        boundary_exec,
         expected_ssh_peer_pid,
         terminating,
         instance_id: runtime.instance_id,
@@ -345,6 +360,7 @@ struct SessionConfig {
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    boundary_exec: Arc<dyn BoundaryExec>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
@@ -477,6 +493,7 @@ async fn run_single_session(
                     sandbox_id: &config.sandbox_id,
                     ssh_socket_path: &config.ssh_socket_path,
                     port_forward: &config.port_forward,
+                    boundary_exec: &config.boundary_exec,
                     expected_ssh_peer_pid: config.expected_ssh_peer_pid,
                     channel: &channel,
                     tx: &tx,
@@ -561,6 +578,7 @@ struct GatewayMessageContext<'a> {
     sandbox_id: &'a str,
     ssh_socket_path: &'a std::path::Path,
     port_forward: &'a Arc<dyn BoundaryLoopbackConnector>,
+    boundary_exec: &'a Arc<dyn BoundaryExec>,
     expected_ssh_peer_pid: Option<u32>,
     channel: &'a grpc_client::AuthedChannel,
     tx: &'a mpsc::Sender<SupervisorMessage>,
@@ -625,6 +643,14 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                 }
             });
         }
+        Some(gateway_message::Payload::ProvisionSandboxFile(request)) => {
+            let request = request.clone();
+            let boundary_exec = Arc::clone(context.boundary_exec);
+            let tx = context.tx.clone();
+            tokio::spawn(async move {
+                provision_sandbox_file(boundary_exec, tx, request).await;
+            });
+        }
         Some(gateway_message::Payload::RelayClose(close)) => {
             let event = relay_close_from_gateway_event(
                 openshell_ocsf::ctx::ctx(),
@@ -636,6 +662,48 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
         _ => {
             warn!(sandbox_id = %context.sandbox_id, "supervisor session: unexpected gateway message");
         }
+    }
+}
+
+async fn provision_sandbox_file(
+    boundary_exec: Arc<dyn BoundaryExec>,
+    tx: mpsc::Sender<SupervisorMessage>,
+    request: ProvisionSandboxFileCommand,
+) {
+    let request_id = request.request_id.clone();
+    let outcome = boundary_exec
+        .provision_file(FileProvisionRequest {
+            path: request.path,
+            mode: request.mode,
+            contents: request.contents,
+            overwrite: request.overwrite,
+        })
+        .await;
+    let result = match outcome {
+        Ok(report) => ProvisionSandboxFileResult {
+            request_id,
+            success: true,
+            error: String::new(),
+            written: report.written,
+            length: report.length,
+            mode: report.mode,
+        },
+        Err(error) => ProvisionSandboxFileResult {
+            request_id,
+            success: false,
+            error: error.to_string(),
+            written: false,
+            length: 0,
+            mode: 0,
+        },
+    };
+    let message = SupervisorMessage {
+        payload: Some(supervisor_message::Payload::ProvisionSandboxFileResult(
+            result,
+        )),
+    };
+    if tx.send(message).await.is_err() {
+        warn!("supervisor session: private file result could not be delivered");
     }
 }
 
@@ -716,21 +784,54 @@ async fn handle_relay_open(
 /// Forward the relay's data frames without interpreting the target protocol.
 async fn bridge_relay(
     target: Box<dyn TargetStream>,
-    mut inbound: impl tokio_stream::Stream<Item = Result<RelayFrame, tonic::Status>> + Unpin,
+    inbound: impl tokio_stream::Stream<Item = Result<RelayFrame, tonic::Status>> + Unpin,
     out_tx: mpsc::Sender<RelayFrame>,
     channel_id: String,
     terminating: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the local SSH daemon on its Unix socket.
-    let (mut target_r, mut target_w) = tokio::io::split(target);
+    let (target_r, target_w) = tokio::io::split(target);
 
     debug!(
         channel_id = %channel_id,
         "relay bridge: connected to local target"
     );
 
+    bridge_relay_bytes(
+        &channel_id,
+        target_r,
+        target_w,
+        out_tx,
+        inbound,
+        &terminating,
+    )
+    .await
+}
+
+/// Bridge bytes between a local target socket and an inbound `RelayFrame`
+/// stream, sending target bytes out through `out_tx`.
+///
+/// `out_tx` is moved into the target-reading task rather than cloned. A
+/// clone would let the sender-side task's copy be dropped on target EOF
+/// while this function's own copy stayed alive until `inbound` also ended,
+/// which keeps the outbound gRPC stream open indefinitely after the target
+/// closes. Moving it in means the outbound stream (and therefore the
+/// client's view of the connection) closes as soon as the target does,
+/// regardless of whether the client side has sent anything else.
+async fn bridge_relay_bytes<S>(
+    channel_id: &str,
+    mut target_r: impl AsyncRead + Unpin + Send + 'static,
+    mut target_w: impl AsyncWrite + Unpin,
+    out_tx: mpsc::Sender<RelayFrame>,
+    mut inbound: S,
+    terminating: &AtomicBool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio_stream::Stream<Item = Result<RelayFrame, tonic::Status>> + Unpin,
+{
     // Target → gRPC (out_tx): read local target, forward as `RelayFrame::data`.
-    let out_tx_writer = out_tx.clone();
+    // `out_tx` is owned by this task, so dropping it on target EOF ends the
+    // outbound stream immediately, without waiting on the inbound side.
     let target_to_grpc = tokio::spawn(async move {
         let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
         loop {
@@ -742,7 +843,7 @@ async fn bridge_relay(
                             buf[..n].to_vec(),
                         )),
                     };
-                    if out_tx_writer.send(chunk).await.is_err() {
+                    if out_tx.send(chunk).await.is_err() {
                         break;
                     }
                 }
@@ -769,7 +870,7 @@ async fn bridge_relay(
                 }
             }
             Err(e) => {
-                if expected_transport_close_during_shutdown(&e, &terminating) {
+                if expected_transport_close_during_shutdown(&e, terminating) {
                     debug!(
                         channel_id = %channel_id,
                         error = %e,
@@ -785,10 +886,6 @@ async fn bridge_relay(
 
     // Half-close the target socket's write side so the service sees EOF.
     let _ = target_w.shutdown().await;
-
-    // Dropping out_tx closes the outbound gRPC stream, letting the gateway
-    // observe EOF on its side too.
-    drop(out_tx);
     let _ = target_to_grpc.await;
 
     if let Some(e) = inbound_err {
@@ -1232,5 +1329,101 @@ mod ocsf_event_tests {
         };
         assert!(err.to_string().contains("peer PID mismatch"));
         accept_task.await.unwrap();
+    }
+
+    /// Regression test for #3724: when the target closes after sending
+    /// data, the outbound relay stream must close too, even though the
+    /// inbound (client) side is still open. Before the fix, `out_tx` was
+    /// cloned into the target-reading task, so the function's own copy kept
+    /// the outbound stream alive until `inbound` also ended.
+    #[tokio::test]
+    async fn bridge_closes_outbound_when_target_closes_first() {
+        let (target, mut remote) = tokio::io::duplex(4096);
+        let (target_r, target_w) = tokio::io::split(target);
+
+        let (out_tx, mut out_rx) = mpsc::channel::<RelayFrame>(16);
+
+        // Inbound stream the client never closes during this test.
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Result<RelayFrame, tonic::Status>>(16);
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+
+        let terminating = AtomicBool::new(false);
+        let bridge = tokio::spawn(async move {
+            bridge_relay_bytes("chan-1", target_r, target_w, out_tx, inbound, &terminating).await
+        });
+
+        remote.write_all(b"hello").await.unwrap();
+        remote.shutdown().await.unwrap();
+
+        let frame = out_rx.recv().await.expect("data frame expected");
+        assert_eq!(
+            frame.payload,
+            Some(openshell_core::proto::relay_frame::Payload::Data(
+                b"hello".to_vec()
+            ))
+        );
+
+        // The outbound stream must end here, without the inbound side (still
+        // held open by `inbound_tx`) ending first.
+        assert!(
+            out_rx.recv().await.is_none(),
+            "outbound stream should close once the target closes"
+        );
+
+        drop(inbound_tx);
+        bridge
+            .await
+            .unwrap()
+            .expect("bridge should finish cleanly when target closes first");
+    }
+
+    /// A well-behaved round trip: bytes flow both directions and the bridge
+    /// ends cleanly when the client closes its side.
+    #[tokio::test]
+    async fn bridge_round_trips_bytes_until_client_closes() {
+        let (target, mut remote) = tokio::io::duplex(4096);
+        let (target_r, target_w) = tokio::io::split(target);
+
+        let (out_tx, mut out_rx) = mpsc::channel::<RelayFrame>(16);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Result<RelayFrame, tonic::Status>>(16);
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+
+        let terminating = AtomicBool::new(false);
+        let bridge = tokio::spawn(async move {
+            bridge_relay_bytes("chan-2", target_r, target_w, out_tx, inbound, &terminating).await
+        });
+
+        // Client -> target.
+        inbound_tx
+            .send(Ok(RelayFrame {
+                payload: Some(openshell_core::proto::relay_frame::Payload::Data(
+                    b"ping".to_vec(),
+                )),
+            }))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 4];
+        remote.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        // Target -> client.
+        remote.write_all(b"pong").await.unwrap();
+        let frame = out_rx.recv().await.expect("data frame expected");
+        assert_eq!(
+            frame.payload,
+            Some(openshell_core::proto::relay_frame::Payload::Data(
+                b"pong".to_vec()
+            ))
+        );
+
+        // Client closes its side first; the bridge should still complete
+        // once the target also closes.
+        drop(inbound_tx);
+        remote.shutdown().await.unwrap();
+
+        bridge
+            .await
+            .unwrap()
+            .expect("bridge should finish cleanly on an ordinary round trip");
     }
 }

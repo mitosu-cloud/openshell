@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedRwLockReadGuard, RwLock, mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -17,11 +18,12 @@ use uuid::Uuid;
 
 use openshell_core::proto::{
     GatewayMessage, GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse,
-    PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen,
-    ReportEndpointStatusRequest, ReportEndpointStatusResponse, ReportMainProcessExitRequest,
-    ReportMainProcessExitResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
-    Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget, SupervisorHello, SupervisorMessage,
-    gateway_message, open_shell_client, peer_relay_frame, relay_open, supervisor_message,
+    PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation, ProvisionSandboxFileCommand,
+    ProvisionSandboxFileResult, RelayFrame, RelayInit, RelayOpen, ReportEndpointStatusRequest,
+    ReportEndpointStatusResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
+    ReportProviderReadinessRequest, ReportProviderReadinessResponse, Sandbox, SandboxPhase,
+    SessionAccepted, SshRelayTarget, SupervisorHello, SupervisorMessage, gateway_message,
+    open_shell_client, peer_relay_frame, relay_open, supervisor_message,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
@@ -324,6 +326,8 @@ pub struct SupervisorSessionRegistry {
     sessions: Mutex<HashMap<String, LiveSession>>,
     /// `channel_id` -> oneshot sender for the reverse CONNECT stream.
     pending_relays: Mutex<HashMap<String, PendingRelay>>,
+    /// `request_id` -> private-file result. The map does not retain file bytes.
+    pending_provisions: Mutex<HashMap<String, oneshot::Sender<ProvisionSandboxFileResult>>>,
     /// Read guards cover owner publication through final cleanup, even after
     /// a session has left `sessions`. Shutdown waits for the write guard.
     session_lifetimes: Arc<RwLock<()>>,
@@ -348,9 +352,11 @@ impl std::fmt::Debug for SupervisorSessionRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let session_count = self.sessions.lock().unwrap().len();
         let pending_count = self.pending_relays.lock().unwrap().len();
+        let provision_count = self.pending_provisions.lock().unwrap().len();
         f.debug_struct("SupervisorSessionRegistry")
             .field("sessions", &session_count)
             .field("pending_relays", &pending_count)
+            .field("pending_provisions", &provision_count)
             .finish()
     }
 }
@@ -842,6 +848,60 @@ impl SupervisorSessionRegistry {
         Ok((channel_id, relay_rx))
     }
 
+    /// Ask the supervisor to write one private file through the boundary.
+    ///
+    /// The contents are sent once on the supervisor session and are not logged.
+    pub async fn provision_private_file(
+        &self,
+        sandbox_id: &str,
+        path: String,
+        mode: u32,
+        contents: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<ProvisionSandboxFileResult, Status> {
+        let tx = self
+            .wait_for_session(sandbox_id, Duration::from_secs(15))
+            .await?;
+        let request_id = Uuid::new_v4().to_string();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.pending_provisions
+            .lock()
+            .unwrap()
+            .insert(request_id.clone(), reply_tx);
+        let message = GatewayMessage {
+            payload: Some(gateway_message::Payload::ProvisionSandboxFile(
+                ProvisionSandboxFileCommand {
+                    request_id: request_id.clone(),
+                    path,
+                    mode,
+                    contents,
+                    overwrite,
+                },
+            )),
+        };
+        if tx.send(message).await.is_err() {
+            self.pending_provisions.lock().unwrap().remove(&request_id);
+            return Err(Status::unavailable("supervisor session disconnected"));
+        }
+        match tokio::time::timeout(Duration::from_secs(15), reply_rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err(Status::unavailable("supervisor session disconnected")),
+            Err(_) => {
+                self.pending_provisions.lock().unwrap().remove(&request_id);
+                Err(Status::deadline_exceeded(
+                    "private file provisioning timed out",
+                ))
+            }
+        }
+    }
+
+    pub fn take_provision(
+        &self,
+        request_id: &str,
+    ) -> Option<oneshot::Sender<ProvisionSandboxFileResult>> {
+        self.pending_provisions.lock().unwrap().remove(request_id)
+    }
+
     pub fn fail_pending_relay(&self, channel_id: &str, error: String) -> bool {
         let pending = self.pending_relays.lock().unwrap().remove(channel_id);
         if let Some(pending) = pending {
@@ -948,13 +1008,19 @@ impl SupervisorSessionRegistry {
 /// out. If neither happens — e.g., the supervisor crashed after acknowledging
 /// `RelayOpen` but before initiating `RelayStream` — the entry would otherwise
 /// sit in the map indefinitely. This sweeper bounds that leak.
-pub fn spawn_relay_reaper(state: Arc<ServerState>, interval: Duration) {
+pub fn spawn_relay_reaper(
+    state: Arc<ServerState>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
+            if !crate::wait_for_shutdown_or_sleep(&mut shutdown, interval).await {
+                break;
+            }
             state.supervisor_sessions.reap_expired_relays();
         }
-    });
+    })
 }
 
 fn owner_error_to_status(err: OwnerError) -> Status {
@@ -2238,6 +2304,24 @@ async fn handle_supervisor_message(
                     pending_relay_failed = failed,
                     "supervisor session: relay open failed"
                 );
+            }
+        }
+        Some(supervisor_message::Payload::ProvisionSandboxFileResult(result)) => {
+            let request_id = result.request_id.clone();
+            let success = result.success;
+            match state.supervisor_sessions.take_provision(&request_id) {
+                Some(sender) => {
+                    let _ = sender.send(result);
+                }
+                None => {
+                    info!(
+                        sandbox_id = %sandbox_id,
+                        session_id = %session_id,
+                        request_id = %request_id,
+                        success,
+                        "supervisor session: private file result had no waiter"
+                    );
+                }
             }
         }
         Some(supervisor_message::Payload::RelayClose(close)) => {

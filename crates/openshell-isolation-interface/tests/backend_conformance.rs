@@ -709,6 +709,7 @@ async fn exec_session_owns_its_process_and_streams() {
             env: vec![],
             workdir: None,
             pty: false,
+            exact_environment: false,
         })
         .await
         .expect("exec");
@@ -732,6 +733,7 @@ async fn pty_exec_merges_output_and_supports_resize() {
             env: vec![],
             workdir: None,
             pty: true,
+            exact_environment: false,
         })
         .await
         .expect("pty exec");

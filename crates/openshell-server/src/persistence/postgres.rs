@@ -134,10 +134,7 @@ impl PostgresStore {
         })
     }
 
-    /// Test support only: close the underlying connection pool.
-    ///
-    /// Do not call from runtime code; this tears down the active pool.
-    #[cfg(any(test, feature = "test-support"))]
+    /// Close the underlying connection pool during gateway shutdown.
     pub async fn close(&self) {
         self.pool.close().await;
     }

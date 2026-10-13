@@ -50,6 +50,7 @@ const (
 	OpenShell_ExecSandbox_FullMethodName                   = "/openshell.v1.OpenShell/ExecSandbox"
 	OpenShell_ForwardTcp_FullMethodName                    = "/openshell.v1.OpenShell/ForwardTcp"
 	OpenShell_ExecSandboxInteractive_FullMethodName        = "/openshell.v1.OpenShell/ExecSandboxInteractive"
+	OpenShell_ProvisionSandboxFile_FullMethodName          = "/openshell.v1.OpenShell/ProvisionSandboxFile"
 	OpenShell_CreateProvider_FullMethodName                = "/openshell.v1.OpenShell/CreateProvider"
 	OpenShell_GetProvider_FullMethodName                   = "/openshell.v1.OpenShell/GetProvider"
 	OpenShell_ListProviders_FullMethodName                 = "/openshell.v1.OpenShell/ListProviders"
@@ -183,6 +184,11 @@ type OpenShellClient interface {
 	// The first client message MUST carry an ExecSandboxInput with the start
 	// variant. Subsequent messages carry stdin bytes or window resize events.
 	ExecSandboxInteractive(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecSandboxInput, ExecSandboxEvent], error)
+	// Write one private file as the workload identity.
+	//
+	// The bytes stay on this RPC and the supervisor-to-boundary control frame.
+	// They are not placed in argv, the environment, or a shell command.
+	ProvisionSandboxFile(ctx context.Context, in *ProvisionSandboxFileRequest, opts ...grpc.CallOption) (*ProvisionSandboxFileResponse, error)
 	// Create a provider.
 	CreateProvider(ctx context.Context, in *CreateProviderRequest, opts ...grpc.CallOption) (*ProviderResponse, error)
 	// Fetch a provider by name.
@@ -629,6 +635,16 @@ func (c *openShellClient) ExecSandboxInteractive(ctx context.Context, opts ...gr
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type OpenShell_ExecSandboxInteractiveClient = grpc.BidiStreamingClient[ExecSandboxInput, ExecSandboxEvent]
+
+func (c *openShellClient) ProvisionSandboxFile(ctx context.Context, in *ProvisionSandboxFileRequest, opts ...grpc.CallOption) (*ProvisionSandboxFileResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ProvisionSandboxFileResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ProvisionSandboxFile_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 func (c *openShellClient) CreateProvider(ctx context.Context, in *CreateProviderRequest, opts ...grpc.CallOption) (*ProviderResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -1277,6 +1293,11 @@ type OpenShellServer interface {
 	// The first client message MUST carry an ExecSandboxInput with the start
 	// variant. Subsequent messages carry stdin bytes or window resize events.
 	ExecSandboxInteractive(grpc.BidiStreamingServer[ExecSandboxInput, ExecSandboxEvent]) error
+	// Write one private file as the workload identity.
+	//
+	// The bytes stay on this RPC and the supervisor-to-boundary control frame.
+	// They are not placed in argv, the environment, or a shell command.
+	ProvisionSandboxFile(context.Context, *ProvisionSandboxFileRequest) (*ProvisionSandboxFileResponse, error)
 	// Create a provider.
 	CreateProvider(context.Context, *CreateProviderRequest) (*ProviderResponse, error)
 	// Fetch a provider by name.
@@ -1519,6 +1540,9 @@ func (UnimplementedOpenShellServer) ForwardTcp(grpc.BidiStreamingServer[TcpForwa
 }
 func (UnimplementedOpenShellServer) ExecSandboxInteractive(grpc.BidiStreamingServer[ExecSandboxInput, ExecSandboxEvent]) error {
 	return status.Error(codes.Unimplemented, "method ExecSandboxInteractive not implemented")
+}
+func (UnimplementedOpenShellServer) ProvisionSandboxFile(context.Context, *ProvisionSandboxFileRequest) (*ProvisionSandboxFileResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ProvisionSandboxFile not implemented")
 }
 func (UnimplementedOpenShellServer) CreateProvider(context.Context, *CreateProviderRequest) (*ProviderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateProvider not implemented")
@@ -2162,6 +2186,24 @@ func _OpenShell_ExecSandboxInteractive_Handler(srv interface{}, stream grpc.Serv
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type OpenShell_ExecSandboxInteractiveServer = grpc.BidiStreamingServer[ExecSandboxInput, ExecSandboxEvent]
+
+func _OpenShell_ProvisionSandboxFile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProvisionSandboxFileRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ProvisionSandboxFile(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ProvisionSandboxFile_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ProvisionSandboxFile(ctx, req.(*ProvisionSandboxFileRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
 
 func _OpenShell_CreateProvider_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CreateProviderRequest)
@@ -3204,6 +3246,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RevokeSshSession",
 			Handler:    _OpenShell_RevokeSshSession_Handler,
+		},
+		{
+			MethodName: "ProvisionSandboxFile",
+			Handler:    _OpenShell_ProvisionSandboxFile_Handler,
 		},
 		{
 			MethodName: "CreateProvider",

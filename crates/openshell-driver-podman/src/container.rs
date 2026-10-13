@@ -1298,7 +1298,7 @@ fn build_base_spec(
         // not depend on a libc-specific option or alter short-name searches.
         dns_search: Vec::new(),
         dns_option: Vec::new(),
-        use_image_resolve_conf: None,
+        use_image_resolve_conf: Some(false),
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
@@ -1556,6 +1556,10 @@ pub fn build_isolation_specs(
         .sysctl
         .insert("net.ipv4.ip_unprivileged_port_start".into(), "0".into());
     workload.netns.nsmode = "none".into();
+    // Podman generates an empty resolver for network=none and rejects custom
+    // DNS servers in that mode. Keep our provisioned resolver in the rootfs;
+    // its exact sandbox-local relay is mediated by the sandbox boundary.
+    workload.use_image_resolve_conf = Some(true);
     workload.networks.clear();
     workload.portmappings.clear();
     workload.hostadd.clear();
@@ -1870,6 +1874,8 @@ mod tests {
         assert_eq!(specs.supervisor.groups, vec!["2000"]);
         assert!(specs.supervisor.cap_add.is_empty());
         assert_eq!(specs.workload.netns.nsmode, "none");
+        assert_eq!(specs.workload.use_image_resolve_conf, Some(true));
+        assert_eq!(specs.supervisor.use_image_resolve_conf, Some(false));
         assert_eq!(
             specs
                 .workload
@@ -1946,7 +1952,7 @@ mod tests {
         assert_eq!(specs.workload.secrets[0].gid, 0);
         assert_eq!(specs.workload.secrets[0].mode, 0o444);
         assert_eq!(specs.workload.use_image_resolve_conf, Some(true));
-        assert_eq!(specs.supervisor.use_image_resolve_conf, None);
+        assert_eq!(specs.supervisor.use_image_resolve_conf, Some(false));
         assert!(
             specs
                 .workload

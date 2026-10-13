@@ -14,6 +14,7 @@ pub mod auth;
 pub mod config;
 pub mod container_paths;
 pub mod denial;
+pub mod direct_exec;
 pub mod driver_mounts;
 pub mod driver_utils;
 pub mod dynamic_string_allowlist;

@@ -1631,6 +1631,76 @@ mod linux {
             }
         }
 
+        fn provision_private_file(
+            &self,
+            path: String,
+            mode: u32,
+            contents: Vec<u8>,
+            overwrite: bool,
+        ) -> Response {
+            if mode != 0o600 {
+                return guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "credential files must be mode 0600",
+                );
+            }
+            let uid = match self.workload_uid() {
+                Ok(uid) => uid,
+                Err(message) => return guest_error(BoundaryErrorKind::Denied, message),
+            };
+            #[cfg(not(unix))]
+            {
+                let _ = (path, contents, overwrite, uid);
+                return guest_error(
+                    BoundaryErrorKind::Unavailable,
+                    "private file provisioning requires unix",
+                );
+            }
+            #[cfg(unix)]
+            match crate::provision_file::provision_private_file(&path, &contents, overwrite, uid) {
+                Ok(report) => Response::FileProvisioned {
+                    written: report.written,
+                    length: report.length,
+                    mode: report.mode,
+                },
+                Err(message) => guest_error(BoundaryErrorKind::Invalid, message),
+            }
+        }
+
+        fn workload_uid(&self) -> Result<u32, String> {
+            let policy = lock(&self.attached_policy);
+            let Some(policy) = policy.as_ref() else {
+                return Err("workload identity is not bound".into());
+            };
+            let raw = policy
+                .run_as_user
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "workload identity is not bound".to_string())?;
+            if let Ok(uid) = raw.parse::<u32>() {
+                if uid == 0 {
+                    return Err("workload identity must not be root".into());
+                }
+                return Ok(uid);
+            }
+            #[cfg(unix)]
+            {
+                let user = nix::unistd::User::from_name(raw)
+                    .map_err(|error| format!("resolving workload identity: {error}"))?
+                    .ok_or_else(|| format!("workload identity '{raw}' does not exist"))?;
+                let uid = user.uid.as_raw();
+                if uid == 0 {
+                    return Err("workload identity must not be root".into());
+                }
+                Ok(uid)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = raw;
+                Err("private file provisioning requires a unix workload identity".into())
+            }
+        }
+
         fn authorize_request(
             &self,
             principal: &SandboxProtocolPrincipal,
@@ -1983,6 +2053,12 @@ mod linux {
                 Request::Wait { process_id } => self.wait(&process_id),
                 Request::Signal { process_id, signal } => self.signal(&process_id, signal),
                 Request::Terminate { process_id } => self.terminate(&process_id),
+                Request::ProvisionFile {
+                    path,
+                    mode,
+                    contents,
+                    overwrite,
+                } => self.provision_private_file(path, mode, contents, overwrite),
                 Request::ExecSignal { process_id, signal } => self.signal_exec(&process_id, signal),
                 Request::Resize {
                     process_id,
@@ -3056,6 +3132,8 @@ mod linux {
         attachment: MainAttachment,
     ) -> Result<(), String> {
         let session = attachment.session.clone();
+        let preserve_exec_output_after_stdin_close =
+            matches!(&attachment.status, AttachmentStatus::Exec(_));
         let (mut reader, writer) = tokio::io::split(stream);
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
         let input = session.acquire_input_if_open().map_err(str::to_string)?;
@@ -3064,6 +3142,7 @@ mod linux {
         let input_session = session.clone();
         let mut input_task = tokio::spawn(async move {
             let mut input = input.map(|(_, input)| input);
+            let mut stdin_closed = false;
             while let Some((channel, payload)) = read_stream_frame(&mut reader).await? {
                 match channel {
                     STREAM_STDIN => {
@@ -3076,10 +3155,11 @@ mod linux {
                             input.take();
                         }
                     }
-                    // Keep reading after stdin closes so transport EOF still
-                    // releases this control process's attachment lease.
+                    // Keep reading after stdin closes so the transport can
+                    // release its request side independently from output.
                     STREAM_STDIN_CLOSED => {
                         input.take();
+                        stdin_closed = true;
                         if let Some(owner) = owner {
                             input_session.close_input(owner).await;
                         }
@@ -3092,18 +3172,34 @@ mod linux {
                     }
                 }
             }
-            Ok::<(), io::Error>(())
+            Ok::<bool, io::Error>(stdin_closed)
         });
+        let mut input_finished = false;
         let result = loop {
-            let output_message = tokio::select! {
-                input_result = &mut input_task => {
-                    break match input_result {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(error)) => Err(format!("read main process attachment: {error}")),
-                        Err(error) => Err(format!("join main process input stream: {error}")),
-                    };
+            let output_message = if input_finished {
+                output.recv().await
+            } else {
+                tokio::select! {
+                    input_result = &mut input_task => {
+                        match input_result {
+                            Ok(Ok(true)) if preserve_exec_output_after_stdin_close => {
+                                // STREAM_STDIN_CLOSED is the protocol-level EOF.
+                                // A following transport half-close must not discard
+                                // retained exec output or its final status.
+                                input_finished = true;
+                                continue;
+                            }
+                            Ok(Ok(_)) => break Ok(()),
+                            Ok(Err(error)) => {
+                                break Err(format!("read main process attachment: {error}"));
+                            }
+                            Err(error) => {
+                                break Err(format!("join main process input stream: {error}"));
+                            }
+                        }
+                    }
+                    output_message = output.recv() => output_message,
                 }
-                output_message = output.recv() => output_message,
             };
             let (channel, payload) = match output_message {
                 Ok(MainOutput::Stdout(payload)) => (STREAM_STDOUT, payload.to_vec()),
@@ -3682,6 +3778,42 @@ mod linux {
             generate_sandbox_tls_material,
         };
         use rcgen::{KeyPair, PKCS_ED25519};
+
+        #[tokio::test]
+        async fn exec_stream_preserves_final_status_after_explicit_stdin_half_close() {
+            let session = MainSession::inert();
+            let attached = Arc::new(AtomicBool::new(true));
+            let attachment = MainAttachment {
+                session: session.clone(),
+                attached: attached.clone(),
+                status: AttachmentStatus::Exec(Arc::new(Mutex::new(Some(ExitStatusWire::Exited(
+                    0,
+                ))))),
+            };
+            let (boundary, mut control) = tokio::io::duplex(4096);
+            let bridge = tokio::spawn(bridge_main_stream(Box::new(boundary), attachment));
+
+            write_stream_frame(&mut control, STREAM_STDIN_CLOSED, &[])
+                .await
+                .expect("write stdin-close frame");
+            control.shutdown().await.expect("half-close request stream");
+            assert!(!session.finish(0, false).await);
+
+            let exit = read_stream_frame(&mut control)
+                .await
+                .expect("read exit frame")
+                .expect("exit frame");
+            assert_eq!(exit.0, STREAM_EXIT);
+            assert_eq!(
+                serde_json::from_slice::<ExitStatusWire>(&exit.1).expect("decode exit status"),
+                ExitStatusWire::Exited(0)
+            );
+            bridge
+                .await
+                .expect("join main stream bridge")
+                .expect("bridge exec stream");
+            assert!(!attached.load(Ordering::Acquire));
+        }
 
         #[test]
         fn exec_tombstones_outlive_retained_handles_and_fail_closed_at_capacity() {
@@ -5088,6 +5220,7 @@ mod linux {
                 shell: None,
                 runtime_helper: None,
                 env: Vec::new(),
+                exact_environment: false,
                 workdir: None,
                 pty: false,
             };
@@ -5386,6 +5519,7 @@ mod linux {
                 shell: None,
                 runtime_helper: None,
                 env: Vec::new(),
+                exact_environment: false,
                 workdir: None,
                 pty: false,
             };
@@ -5455,6 +5589,7 @@ mod linux {
                     shell: None,
                     runtime_helper: None,
                     env: Vec::new(),
+                    exact_environment: false,
                     workdir: None,
                     pty: false,
                 };
@@ -5494,6 +5629,7 @@ mod linux {
                             shell: None,
                             runtime_helper: None,
                             env: Vec::new(),
+                            exact_environment: false,
                             workdir: None,
                             pty: false,
                         }

@@ -48,11 +48,11 @@ use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
     ClearDraftChunksRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
     CreateSshSessionRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
-    DeleteServiceRequest, DeletionOutcome, EndpointResult, EndpointStatus, ExecSandboxRequest,
-    ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
-    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
-    GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
+    DeleteServiceRequest, DeletionOutcome, EndpointResult, EndpointStatus, ExecMode,
+    ExecSandboxRequest, ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest,
+    GetDraftPolicyRequest, GetGatewayConfigRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
+    GetSandboxRequest, GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
     ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
     RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
@@ -1942,6 +1942,7 @@ pub async fn sandbox_exec_grpc(
         cols,
         rows,
         no_login_shell,
+        exec_mode: ExecMode::LoginShell.into(),
     };
 
     let stdin_for_size_check = std::mem::take(&mut request.stdin);
@@ -2382,6 +2383,7 @@ async fn sandbox_exec_streaming_grpc(
                 tty,
                 cols,
                 rows,
+                exec_mode: ExecMode::LoginShell.into(),
             })),
         })
         .await

@@ -734,8 +734,12 @@ pub struct ExecSpec {
     /// Trusted helper implemented by the sandbox runtime. This intent is set
     /// only by supervisor-owned protocol adapters, never by public exec APIs.
     pub runtime_helper: Option<RuntimeHelper>,
-    /// Extra environment over the boundary's base.
+    /// Extra environment over the boundary's base, or the complete child
+    /// environment when `exact_environment` is set.
     pub env: Vec<(String, String)>,
+    /// DIRECT exec receives only `env`; shell and SFTP sessions retain the
+    /// boundary's normal identity, provider, and TLS environment.
+    pub exact_environment: bool,
     /// Working directory, if any.
     pub workdir: Option<String>,
     /// Whether to allocate a PTY.
@@ -779,6 +783,48 @@ pub trait BoundaryExec: Send + Sync {
             "provider environment installation acknowledgment is unavailable".to_string(),
         ))
     }
+
+    /// Write one private file inside the boundary as the workload identity.
+    ///
+    /// The default refuses. Callers must not fall back to argv or environment.
+    async fn provision_file(
+        &self,
+        _request: FileProvisionRequest,
+    ) -> Result<FileProvisionResult, BackendError> {
+        Err(BackendError::Unsupported(
+            "private file provisioning is unavailable".to_string(),
+        ))
+    }
+}
+
+/// One private file for [`BoundaryExec::provision_file`].
+///
+/// `Debug` reports the length only. The bytes are a credential.
+pub struct FileProvisionRequest {
+    pub path: String,
+    pub mode: u32,
+    pub contents: Vec<u8>,
+    pub overwrite: bool,
+}
+
+impl fmt::Debug for FileProvisionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileProvisionRequest")
+            .field("path", &self.path)
+            .field("mode", &self.mode)
+            .field("contents_len", &self.contents.len())
+            .field("overwrite", &self.overwrite)
+            .finish()
+    }
+}
+
+/// Result of a private-file write. `mode` is the mode actually applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileProvisionResult {
+    pub written: bool,
+    pub length: u64,
+    pub mode: u32,
 }
 
 /// Evidence that the running workload boundary installed one provider snapshot.

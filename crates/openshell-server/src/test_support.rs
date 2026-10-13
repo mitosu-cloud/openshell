@@ -306,6 +306,20 @@ impl ComputeDriver for FakeComputeDriver {
         Ok(Response::new(response))
     }
 
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<
+            openshell_core::proto::compute::v1::GetGatewayListenerRequirementsRequest,
+        >,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::GetGatewayListenerRequirementsResponse>,
+        Status,
+    > {
+        Ok(Response::new(
+            openshell_core::proto::compute::v1::GetGatewayListenerRequirementsResponse::default(),
+        ))
+    }
+
     async fn validate_sandbox_create(
         &self,
         request: Request<ValidateSandboxCreateRequest>,

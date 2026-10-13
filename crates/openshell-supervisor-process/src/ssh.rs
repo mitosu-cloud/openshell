@@ -23,6 +23,15 @@ use tokio::net::UnixListener;
 use tracing::warn;
 
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
+const EXEC_MODE_ENV: &str = "OPENSHELL_EXEC_MODE";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SshExecMode {
+    #[default]
+    LoginShell,
+    Shell,
+    Direct,
+}
 const MAIN_DETACH_PREFIX: u8 = 0x10;
 const MAIN_DETACH_KEY: u8 = 0x11;
 const MAIN_DETACH_EOF: u8 = 0x04;
@@ -76,7 +85,9 @@ fn ssh_server_init(
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
 
     let mut config = russh::server::Config {
-        server_id: russh::SshId::Standard(Cow::Owned(format!("SSH-2.0-OpenShell_{VERSION}"))),
+        server_id: russh::SshId::Standard(Cow::Owned(format!(
+            "SSH-2.0-OpenShell_{VERSION} exec_direct"
+        ))),
         auth_rejection_time: Duration::from_secs(1),
         // Peer replies keep idle attachments alive without relying on shell I/O.
         keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
@@ -357,6 +368,7 @@ struct ChannelState {
     terminal: Option<Arc<dyn openshell_isolation_interface::contract::BoundaryTerminal>>,
     pty_request: Option<PtyRequest>,
     no_login_shell: bool,
+    exec_mode: SshExecMode,
     main_input_owner: Option<u64>,
     main_attached: bool,
     main_read_only: bool,
@@ -651,8 +663,23 @@ impl russh::server::Handler for SshHandler {
         if command.is_empty() {
             return Ok(());
         }
-        self.start_shell(channel, session.handle(), Some(command))
-            .await?;
+        if let Err(error) = self
+            .start_shell(channel, session.handle(), Some(command))
+            .await
+        {
+            warn!(%error, ?channel, "failed to start boundary exec process");
+            let handle = session.handle();
+            let _ = handle
+                .extended_data(
+                    channel,
+                    1,
+                    b"openshell: command could not be started\n".to_vec(),
+                )
+                .await;
+            let _ = handle.exit_status_request(channel, 126).await;
+            let _ = handle.eof(channel).await;
+            let _ = handle.close(channel).await;
+        }
         Ok(())
     }
 
@@ -794,6 +821,7 @@ impl russh::server::Handler for SshHandler {
                     env: vec![],
                     workdir: None,
                     pty: false,
+                    exact_environment: false,
                 },
             )
             .await?;
@@ -828,6 +856,19 @@ impl russh::server::Handler for SshHandler {
             && let Some(state) = self.channels.get_mut(&channel)
         {
             state.no_login_shell = variable_value == NO_LOGIN_SHELL_ENV.1;
+            if state.no_login_shell && state.exec_mode == SshExecMode::LoginShell {
+                state.exec_mode = SshExecMode::Shell;
+            }
+        }
+        if variable_name == EXEC_MODE_ENV
+            && let Some(state) = self.channels.get_mut(&channel)
+        {
+            state.exec_mode = match variable_value {
+                "direct" => SshExecMode::Direct,
+                "shell" => SshExecMode::Shell,
+                "login_shell" => SshExecMode::LoginShell,
+                _ => state.exec_mode,
+            };
         }
         if variable_name == "OPENSHELL_MAIN_READ_ONLY"
             && variable_value == "1"
@@ -984,15 +1025,31 @@ impl SshHandler {
             .get_mut(&channel)
             .ok_or_else(|| anyhow::anyhow!("start_shell on unknown channel {channel:?}"))?;
         let no_login_shell = state.no_login_shell;
+        let exec_mode = state.exec_mode;
         let pty = state.pty_request.take();
         let pty_requested = pty.is_some();
-        let env = pty
+        let term_env = pty
             .as_ref()
             .map(|request| vec![("TERM".to_string(), request.term.clone())])
             .unwrap_or_default();
-        self.start_exec_spec(
-            channel,
-            handle,
+        let spec = if exec_mode == SshExecMode::Direct {
+            let command =
+                command.ok_or_else(|| anyhow::anyhow!("DIRECT exec requires a command"))?;
+            let decoded = openshell_core::direct_exec::decode(&command)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let mut env = decoded.env;
+            env.extend(term_env);
+            openshell_isolation_interface::contract::ExecSpec {
+                program: decoded.program,
+                args: decoded.args,
+                shell: None,
+                runtime_helper: None,
+                env,
+                workdir: decoded.workdir,
+                pty: pty_requested,
+                exact_environment: true,
+            }
+        } else {
             openshell_isolation_interface::contract::ExecSpec {
                 program: String::new(),
                 args: Vec::new(),
@@ -1001,12 +1058,13 @@ impl SshHandler {
                     login: !no_login_shell,
                 }),
                 runtime_helper: None,
-                env,
+                env: term_env,
                 workdir: None,
                 pty: pty_requested,
-            },
-        )
-        .await?;
+                exact_environment: false,
+            }
+        };
+        self.start_exec_spec(channel, handle, spec).await?;
         if let (Some(pty), Some(terminal)) = (
             pty,
             self.channels
@@ -1326,11 +1384,89 @@ mod tests {
         }
     }
 
+    struct CompletingExec;
+
+    struct CompletingProcess;
+
+    #[async_trait::async_trait]
+    impl openshell_isolation_interface::contract::BoundaryProcess for CompletingProcess {
+        async fn wait(
+            &self,
+        ) -> std::result::Result<
+            openshell_isolation_interface::contract::BoundaryExitStatus,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            Ok(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(23))
+        }
+
+        async fn signal(
+            &self,
+            _signal: openshell_isolation_interface::contract::BoundarySignal,
+        ) -> std::result::Result<(), openshell_isolation_interface::contract::BackendError>
+        {
+            Ok(())
+        }
+
+        async fn terminate(
+            &self,
+        ) -> std::result::Result<(), openshell_isolation_interface::contract::BackendError>
+        {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl openshell_isolation_interface::contract::BoundaryExec for CompletingExec {
+        async fn exec(
+            &self,
+            _spec: openshell_isolation_interface::contract::ExecSpec,
+        ) -> std::result::Result<
+            openshell_isolation_interface::contract::ExecSession,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            use tokio::io::AsyncReadExt as _;
+
+            let (stdin, mut stdin_peer) = tokio::io::duplex(64);
+            let (stdout, stdout_peer) = tokio::io::duplex(64);
+            let (stderr, stderr_peer) = tokio::io::duplex(64);
+            let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let mut input = Vec::new();
+                let _ = stdin_peer.read_to_end(&mut input).await;
+                drop(stdout_peer);
+                drop(stderr_peer);
+                let _ = status_tx
+                    .send(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(23));
+            });
+            Ok(openshell_isolation_interface::contract::ExecSession {
+                process: Arc::new(CompletingProcess),
+                stdin: Some(Box::new(stdin)),
+                stdout: Box::new(stdout),
+                stderr: Some(Box::new(stderr)),
+                terminal: None,
+                output_status: Some(status_rx),
+            })
+        }
+    }
+
+    async fn authenticated_test_client_with_exec(
+        boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
+    ) -> russh::client::Handle<AcceptAnyServerKey> {
+        test_client(boundary_exec, Some(MainSession::inert())).await
+    }
+
     async fn authenticated_test_client() -> russh::client::Handle<AcceptAnyServerKey> {
         main_test_client(Some(MainSession::inert())).await
     }
 
     async fn main_test_client(
+        main_session: Option<Arc<MainSession>>,
+    ) -> russh::client::Handle<AcceptAnyServerKey> {
+        test_client(Arc::new(RejectingExec), main_session).await
+    }
+
+    async fn test_client(
+        boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
         main_session: Option<Arc<MainSession>>,
     ) -> russh::client::Handle<AcceptAnyServerKey> {
         let host_key = {
@@ -1343,11 +1479,7 @@ mod tests {
         };
         server_config.keys.push(host_key);
 
-        let handler = SshHandler::new(
-            Arc::new(TestLoopbackConnector),
-            Arc::new(RejectingExec),
-            main_session,
-        );
+        let handler = SshHandler::new(Arc::new(TestLoopbackConnector), boundary_exec, main_session);
         let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             if let Ok(session) =
@@ -1734,6 +1866,78 @@ mod tests {
             assert_eq!(forwarded, data);
         }
         channel.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_reports_status_after_client_closes_stdin() {
+        let client = authenticated_test_client_with_exec(Arc::new(CompletingExec)).await;
+        let mut channel = client
+            .channel_open_session()
+            .await
+            .expect("open exec channel");
+        channel.exec(true, b"true").await.expect("start exec");
+        channel.eof().await.expect("close exec stdin");
+
+        let mut exit_status = None;
+        let mut close_seen = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = channel.wait().await {
+                match message {
+                    russh::ChannelMsg::ExitStatus {
+                        exit_status: status,
+                    } => {
+                        exit_status = Some(status);
+                    }
+                    russh::ChannelMsg::Close => {
+                        close_seen = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("exec channel completion timeout");
+
+        assert_eq!(exit_status, Some(23));
+        assert!(close_seen);
+    }
+
+    #[tokio::test]
+    async fn exec_start_failure_reports_stderr_and_status() {
+        let client = authenticated_test_client().await;
+        let mut channel = client
+            .channel_open_session()
+            .await
+            .expect("open exec channel");
+        channel.exec(true, b"missing").await.expect("submit exec");
+
+        let mut stderr = Vec::new();
+        let mut exit_status = None;
+        let mut close_seen = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = channel.wait().await {
+                match message {
+                    russh::ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
+                    russh::ChannelMsg::ExitStatus {
+                        exit_status: status,
+                    } => {
+                        exit_status = Some(status);
+                    }
+                    russh::ChannelMsg::Close => {
+                        close_seen = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("exec failure response timeout");
+
+        assert_eq!(stderr, b"openshell: command could not be started\n");
+        assert_eq!(exit_status, Some(126));
+        assert!(close_seen);
     }
 
     #[tokio::test]
