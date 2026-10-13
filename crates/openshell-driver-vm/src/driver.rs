@@ -15,10 +15,11 @@ use crate::rootfs::{
     RootfsOwnership, clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size,
     create_rootfs_image_with_ownership, ext4_image_has_directory, extract_host_supervisor,
     extract_rootfs_archive_to, merge_layer_ownership, prepare_sandbox_rootfs_from_image_root,
-    read_archive_ownership, read_rootfs_archive_ownership, recover_rootfs_image,
-    remove_rootfs_image_file, sandbox_guest_init_path, sandbox_guest_runtime_identity,
-    sandbox_guest_user_ids_from_image, sandbox_guest_user_ids_from_overlay_image,
-    set_rootfs_image_file_mode, validate_host_supervisor, write_rootfs_image_file,
+    read_archive_ownership, read_rootfs_archive_ownership, read_rootfs_image_file,
+    recover_rootfs_image, remove_rootfs_image_file, sandbox_guest_init_path,
+    sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
+    sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode, sync_rootfs_image,
+    validate_host_supervisor, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use bollard::Docker;
@@ -1608,6 +1609,8 @@ impl VmDriver {
             &channel_tls,
         )
         .map_err(|error| Status::internal(format!("inject VM boundary configuration: {error}")))?;
+        sync_rootfs_image(&overlay_disk)
+            .map_err(|error| Status::internal(format!("sync VM overlay disk: {error}")))?;
         write_private_file(
             &state_dir.join(HOST_BOUNDARY_GENERATION_FILE),
             boundary_generation.as_bytes().to_vec(),
@@ -2241,8 +2244,28 @@ impl VmDriver {
                 continue;
             }
 
-            self.restore_persisted_sandbox(sandbox, state_dir, false, &tracing::Span::current())
-                .await;
+            // The gateway owns the per-launch authentication bundle and will
+            // issue StartSandbox during its startup sweep. Register the
+            // durable record, but never begin restoring compute here. If the
+            // driver and gateway both provision concurrently, aborting the
+            // first async task cannot cancel in-flight spawn_blocking ext4
+            // work, and both tasks can mutate the same overlay.
+            let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
+            let mut registry = self.registry.lock().await;
+            registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
+                snapshot: snapshot.clone(),
+                state_dir,
+                process: None,
+                provisioning_task: None,
+                gpu_bdf: None,
+                deleting: false,
+            });
+            drop(registry);
+            self.publish_snapshot(snapshot);
+            info!(
+                sandbox_id = %sandbox.id,
+                "vm driver: restored persisted sandbox without launching compute; awaiting authenticated start"
+            );
         }
     }
 
@@ -6231,6 +6254,11 @@ async fn remove_runtime_generation_material(state_dir: &Path) -> Result<(), Stri
         let overlay = sandbox_runtime_disk_paths(state_dir).overlay_disk;
         let generation_for_cleanup = generation.clone();
         tokio::task::spawn_blocking(move || {
+            // An abruptly stopped guest can leave its journal dirty. Never
+            // run debugfs against that state: replay and repair it only after
+            // the former VM has released exclusive ownership, then remove the
+            // obsolete authentication material offline.
+            recover_rootfs_image(&overlay)?;
             let tls = guest_boundary_tls_paths(&generation_for_cleanup);
             for guest_path in [
                 PathBuf::from(guest_boundary_config_path(&generation_for_cleanup)),
@@ -6242,6 +6270,7 @@ async fn remove_runtime_generation_material(state_dir: &Path) -> Result<(), Stri
                     &overlay_upper_path(&guest_path.to_string_lossy()),
                 )?;
             }
+            sync_rootfs_image(&overlay)?;
             Ok::<(), String>(())
         })
         .await
@@ -6450,6 +6479,7 @@ fn inject_guest_boundary_bundle(
     let config_path = overlay_upper_path(guest_path);
     write_rootfs_image_file(overlay_disk, &config_path, &encoded_config)?;
     set_rootfs_image_file_mode(overlay_disk, &config_path, 0o600)?;
+    verify_rootfs_image_file(overlay_disk, &config_path, &encoded_config)?;
     for (guest_path, contents) in [
         (
             tls.certificate_chain_path,
@@ -6460,8 +6490,26 @@ fn inject_guest_boundary_bundle(
         let path = overlay_upper_path(guest_path.to_string_lossy().as_ref());
         write_rootfs_image_file(overlay_disk, &path, contents)?;
         set_rootfs_image_file_mode(overlay_disk, &path, 0o600)?;
+        verify_rootfs_image_file(overlay_disk, &path, contents)?;
     }
     Ok(())
+}
+
+fn verify_rootfs_image_file(
+    overlay_disk: &Path,
+    guest_path: &str,
+    expected: &[u8],
+) -> Result<(), String> {
+    let actual = read_rootfs_image_file(overlay_disk, guest_path)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "verify injected VM guest file {guest_path}: expected {} bytes, read {} bytes",
+            expected.len(),
+            actual.len()
+        ))
+    }
 }
 
 fn guest_boundary_config_path(generation: &str) -> String {
@@ -7480,7 +7528,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_reconciliation_is_root_and_restore_operations_have_parents() {
+    async fn startup_reconciliation_registers_records_without_launching_compute() {
         let traced = TestTracing::new();
         let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
         let temp = tempfile::tempdir().unwrap();
@@ -7505,10 +7553,22 @@ mod tests {
         }
 
         driver.restore_persisted_sandboxes().await;
-        for suffix in ["a", "b"] {
-            driver
-                .wait_for_provisioning_for_test(&format!("sb-restored-trace-{suffix}"))
-                .await;
+        {
+            let registry = driver.registry.lock().await;
+            assert_eq!(registry.len(), 2);
+            for suffix in ["a", "b"] {
+                let record = registry
+                    .get(&format!("sb-restored-trace-{suffix}"))
+                    .expect("restored record");
+                assert!(record.process.is_none());
+                assert!(record.provisioning_task.is_none());
+                let status = record.snapshot.status.as_ref().expect("restored status");
+                assert!(status.conditions.iter().any(|condition| {
+                    condition.r#type == "Stopped"
+                        && condition.status == "True"
+                        && condition.reason == "ComputeStopped"
+                }));
+            }
         }
 
         let spans = traced.exporter.get_finished_spans().unwrap();
@@ -7524,30 +7584,9 @@ mod tests {
         );
         let reconciliation = reconciliations[0];
         assert_is_root(reconciliation);
-        let restorations = spans
-            .iter()
-            .filter(|span| span.name == "vm.restore")
-            .collect::<Vec<_>>();
-        assert_eq!(restorations.len(), 2);
-        for restoration in restorations {
-            assert_has_parent(restoration);
-        }
-        let provisioning = spans
-            .iter()
-            .filter(|span| span.name == "vm.provision")
-            .collect::<Vec<_>>();
-        assert_eq!(provisioning.len(), 2);
-        for span in provisioning {
-            assert_has_parent(span);
-        }
-        let prepare_images = spans
-            .iter()
-            .filter(|span| span.name == "vm.prepare_images")
-            .collect::<Vec<_>>();
-        assert_eq!(prepare_images.len(), 2);
-        for span in prepare_images {
-            assert_has_parent(span);
-        }
+        assert!(!spans.iter().any(|span| span.name == "vm.restore"));
+        assert!(!spans.iter().any(|span| span.name == "vm.provision"));
+        assert!(!spans.iter().any(|span| span.name == "vm.prepare_images"));
     }
 
     #[tokio::test]

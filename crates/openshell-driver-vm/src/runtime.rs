@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
+#[cfg(not(target_os = "linux"))]
 use std::time::Duration;
 
 use crate::{embedded_runtime, ffi, procguard, rootfs};
@@ -52,10 +53,25 @@ pub struct VmLaunchConfig {
 }
 
 pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
-    match config.backend {
+    // Arm parent-death cleanup before waiting for a prior VM incarnation to
+    // release the writable-overlay lock. Keep the lock descriptor inheritable
+    // so the actual VM process, not only this launcher, owns it until exit.
+    #[cfg(target_os = "linux")]
+    if let Err(err) = procguard::die_with_parent_term() {
+        return Err(format!("procguard arm failed: {err}"));
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Err(err) = procguard::die_with_parent_cleanup(procguard_kill_children) {
+        return Err(format!("procguard arm failed: {err}"));
+    }
+    let overlay_lock = rootfs::lock_rootfs_image(&config.overlay_disk)?;
+    rootfs::make_rootfs_image_lock_inheritable(&overlay_lock, &config.overlay_disk)?;
+    let result = match config.backend {
         VmBackend::Qemu => run_qemu_vm(config),
         VmBackend::Libkrun => run_libkrun_vm(config),
-    }
+    };
+    drop(overlay_lock);
+    result
 }
 
 fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
@@ -83,10 +99,6 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         && !image_disk.is_file()
     {
         return Err(format!("image disk not found: {}", image_disk.display()));
-    }
-
-    if let Err(err) = procguard::die_with_parent_cleanup(procguard_kill_children) {
-        return Err(format!("procguard arm failed: {err}"));
     }
 
     #[cfg(target_os = "linux")]
@@ -263,8 +275,10 @@ fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
     parts.join(" ")
 }
 
-/// Shared procguard cleanup callback for both libkrun and QEMU paths.
-/// Only async-signal-safe calls: atomic loads and `kill(2)`.
+/// Shared BSD procguard cleanup callback for both libkrun and QEMU paths.
+/// The procguard invokes it on a normal watcher thread, so it can wait until
+/// the VM child has been reaped before the launcher's overlay lock is released.
+#[cfg(not(target_os = "linux"))]
 fn procguard_kill_children() {
     let child_pid = CHILD_PID.load(Ordering::Relaxed);
     if child_pid > 0 {
@@ -276,6 +290,15 @@ fn procguard_kill_children() {
     if child_pid > 0 {
         unsafe {
             libc::kill(child_pid, libc::SIGKILL);
+            // The BSD procguard callback runs on a normal watcher thread, so
+            // it can reap the worker before process exit releases the overlay
+            // lock. Ignore errors: the worker may already have been reaped by
+            // the launcher's main thread.
+            let mut status = 0;
+            while libc::waitpid(child_pid, &raw mut status, 0) < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+            }
         }
     }
 }
@@ -303,13 +326,6 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
         && !image_disk.is_file()
     {
         return Err(format!("image disk not found: {}", image_disk.display()));
-    }
-
-    // Arm procguard before forking libkrun so the VM worker cannot outlive
-    // the launcher. No network helper is started: the only host/guest data
-    // path is the protected vsock mapping below.
-    if let Err(err) = procguard::die_with_parent_cleanup(procguard_kill_children) {
-        return Err(format!("procguard arm failed: {err}"));
     }
 
     #[cfg(target_os = "linux")]
