@@ -14,6 +14,11 @@
 # HTTPS endpoint-only mode is intentionally unsupported here. Use a named
 # gateway config when mTLS materials are needed.
 #
+# Supervisor image overrides:
+#   SUPERVISOR_IMAGE=... (common test-wrapper override)
+#   OPENSHELL_SUPERVISOR_IMAGE=... (existing compatibility override)
+#   SANDBOX_IMAGE=... (trusted sandbox runtime override)
+#
 # Set OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS to override the managed gateway's
 # Podman sandbox stop timeout. The harness default is intentionally shorter
 # than the production driver default to keep CI teardown bounded.
@@ -113,7 +118,9 @@ if [ "${OPENSHELL_E2E_SPIFFE_FIXTURE:-0}" = "1" ]; then
   if [ -z "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" ]; then
     OPENSHELL_E2E_PROVIDER_SPIFFE_PORT="$(e2e_pick_port)"
     export OPENSHELL_E2E_PROVIDER_SPIFFE_LISTEN="0.0.0.0:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
-    export OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET="tcp:169.254.1.2:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
+    # Podman supervisors run with host networking, so reach the host-side
+    # Workload API fixture over loopback rather than the workload bridge.
+    export OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET="tcp:127.0.0.1:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
   fi
 fi
 GATEWAY_BIN=""
@@ -196,14 +203,14 @@ cleanup() {
         local workload_ids workload_id
         workload_ids="$(podman_cmd ps -aq --filter "label=openshell.managed=true" \
           --filter "label=openshell.ai/sandbox-id=${sandbox_id}" \
-          --filter "label=openshell.io/isolation-role=sandbox" 2>/dev/null || true)"
+          --filter "label=openshell.ai/isolation-role=sandbox" 2>/dev/null || true)"
         for workload_id in ${workload_ids}; do
           podman_cmd rm -f "${workload_id}" >/dev/null 2>&1 || true
         done
         podman_cmd volume rm "openshell-channel-${sandbox_id}" >/dev/null 2>&1 || true
         podman_cmd volume rm -f "openshell-sandbox-${sandbox_id}-workspace" >/dev/null 2>&1 || true
         local secret_prefix
-        for secret_prefix in openshell-token openshell-proxy-auth openshell-tls-ca openshell-tls-cert openshell-tls-key; do
+        for secret_prefix in openshell-token openshell-proxy-auth openshell-resolver openshell-tls-ca openshell-tls-cert openshell-tls-key; do
           podman_cmd secret rm "${secret_prefix}-${sandbox_id}" >/dev/null 2>&1 || true
         done
       fi
@@ -346,6 +353,16 @@ resolve_podman_supervisor_image() {
     return 0
   fi
 
+  if [ -n "${SUPERVISOR_IMAGE:-}" ]; then
+    if [ -n "${CI:-}" ] && [ -z "${IMAGE_TAG:-}" ] \
+       && ! e2e_image_reference_is_complete "${SUPERVISOR_IMAGE}"; then
+      echo "ERROR: IMAGE_TAG must be set in CI when SUPERVISOR_IMAGE is repository-only." >&2
+      exit 2
+    fi
+    printf '%s\n' "$(e2e_resolve_image_reference "${SUPERVISOR_IMAGE}" "${IMAGE_TAG:-dev}")"
+    return 0
+  fi
+
   if [ -n "${CI:-}" ]; then
     if [ -z "${IMAGE_TAG:-}" ]; then
       echo "ERROR: IMAGE_TAG must be set in CI when no Podman supervisor image override is provided." >&2
@@ -363,6 +380,10 @@ resolve_podman_supervisor_image() {
 resolve_podman_sandbox_runtime_image() {
   if [ -n "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" ]; then
     printf '%s\n' "${OPENSHELL_SANDBOX_RUNTIME_IMAGE}"
+    return 0
+  fi
+  if [ -n "${SANDBOX_IMAGE:-}" ]; then
+    printf '%s\n' "$(e2e_resolve_image_reference "${SANDBOX_IMAGE}" "${IMAGE_TAG:-dev}")"
     return 0
   fi
 
@@ -387,6 +408,11 @@ ensure_podman_supervisor_image() {
     local dockerfile=${OPENSHELL_E2E_SUPERVISOR_DOCKERFILE:-${ROOT}/deploy/docker/Dockerfile.supervisor}
     local context="${WORKDIR}/supervisor-image" arch
     case "${image}" in
+      *@*)
+        echo "ERROR: supplied supervisor binaries cannot be built to a digest-pinned image reference: ${image}" >&2
+        echo "       Use a tagged image reference when building from OPENSHELL_E2E_SUPERVISOR_BIN." >&2
+        exit 2
+        ;;
       *:dev|*:latest)
         echo "ERROR: supplied supervisor binaries require a unique versioned image tag, not ${image}." >&2
         exit 2
@@ -470,7 +496,7 @@ ensure_podman_supervisor_image() {
   fi
 
   echo "ERROR: supervisor image '${image}' is not available." >&2
-  echo "       Build it, push it, or set OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
+  echo "       Build it, push it, or set SUPERVISOR_IMAGE/OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
   exit 2
 }
 
@@ -577,7 +603,11 @@ fi
 # isolated XDG store where this image was built. Address the local image by its
 # immutable manifest digest so policy=missing cannot resolve a mutable tag or
 # contact a registry for a different artifact.
-SUPERVISOR_IMAGE_REPOSITORY="${SUPERVISOR_IMAGE%:*}"
+SUPERVISOR_IMAGE_REPOSITORY="${SUPERVISOR_IMAGE%%@*}"
+last_component="${SUPERVISOR_IMAGE_REPOSITORY##*/}"
+if [[ "${last_component}" == *:* ]]; then
+  SUPERVISOR_IMAGE_REPOSITORY="${SUPERVISOR_IMAGE_REPOSITORY%:*}"
+fi
 SUPERVISOR_RUNTIME_IMAGE="${SUPERVISOR_IMAGE_REPOSITORY}@${SUPERVISOR_IMAGE_DIGEST}"
 if ! [[ "${SUPERVISOR_RUNTIME_IMAGE}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
   echo "ERROR: supervisor runtime image is not digest-pinned: ${SUPERVISOR_RUNTIME_IMAGE}" >&2
@@ -613,7 +643,7 @@ SANDBOX_BOUNDARY_IMAGE="$(resolve_podman_sandbox_runtime_image)"
 ensure_podman_sandbox_runtime_image "${SANDBOX_BOUNDARY_IMAGE}"
 echo "Using Podman sandbox runtime image: ${SANDBOX_BOUNDARY_IMAGE}"
 
-DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+DEFAULT_SANDBOX_IMAGE="nvcr.io/nvidia/base/ubuntu:24.04"
 SANDBOX_IMAGE_REQUEST="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
 if [ "${OPENSHELL_E2E_REQUIRE_DIGEST_PINNED_SANDBOX_IMAGE:-0}" = "1" ] \
    && ! [[ "${SANDBOX_IMAGE_REQUEST}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
@@ -667,16 +697,9 @@ export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
-if [ "$(uname -s)" = "Darwin" ]; then
-  # Podman Machine reserves IPv4 loopback for its callback-only listener.
-  PRIMARY_BIND_IP="::1"
-  CLI_ENDPOINT_HOST="localhost"
-  HEALTH_ENDPOINT_HOST="[::1]"
-else
-  PRIMARY_BIND_IP="127.0.0.1"
-  CLI_ENDPOINT_HOST="127.0.0.1"
-  HEALTH_ENDPOINT_HOST="127.0.0.1"
-fi
+PRIMARY_BIND_IP="127.0.0.1"
+CLI_ENDPOINT_HOST="127.0.0.1"
+HEALTH_ENDPOINT_HOST="127.0.0.1"
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
 export XDG_STATE_HOME="${STATE_DIR}"
@@ -708,6 +731,7 @@ e2e_write_podman_gateway_config \
   "${SANDBOX_RUNTIME_IMAGE}" \
   "${PODMAN_STOP_TIMEOUT_SECS}" \
   "${SUPERVISOR_RUNTIME_IMAGE}" \
+  "${SANDBOX_BOUNDARY_IMAGE}" \
   "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" \
   "${OPENSHELL_PODMAN_SOCKET:-}" \
   "${OIDC_MODE}" \
@@ -715,7 +739,7 @@ e2e_write_podman_gateway_config \
 if [ -n "${OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE:-}" ]; then
   cp "${GATEWAY_CONFIG}" "${OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE}"
 fi
-EXTERNAL_DRIVER_CALLBACK_ENDPOINT="https://host.containers.internal:${HOST_PORT}"
+EXTERNAL_DRIVER_GRPC_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
 EXTERNAL_DRIVER_HEALTH_CHECK_INTERVAL_SECS=10
 EXTERNAL_DRIVER_ENABLE_BIND_MOUNTS=true
 EXTERNAL_DRIVER_TLS_CA="${PKI_DIR}/ca.crt"
@@ -732,7 +756,7 @@ if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
   external_driver_environment=null
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     driver_transport=remote_uds
-    external_driver_grpc_endpoint="\"${EXTERNAL_DRIVER_CALLBACK_ENDPOINT}\""
+    external_driver_grpc_endpoint="\"${EXTERNAL_DRIVER_GRPC_ENDPOINT}\""
     external_driver_host_gateway_ip='"host-gateway"'
     driver_tls_ca_sha256="$(sha256sum "${EXTERNAL_DRIVER_TLS_CA}" | cut -d' ' -f1)"
     driver_tls_cert_sha256="$(sha256sum "${EXTERNAL_DRIVER_TLS_CERT}" | cut -d' ' -f1)"
@@ -744,7 +768,7 @@ if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
       "${SANDBOX_IMAGE_REQUEST}" \
       "${EXTERNAL_DRIVER_PULL_POLICY}" \
       "${EXTERNAL_DRIVER_HEALTH_CHECK_INTERVAL_SECS}" \
-      "${EXTERNAL_DRIVER_CALLBACK_ENDPOINT}" \
+      "${EXTERNAL_DRIVER_GRPC_ENDPOINT}" \
       "${HOST_PORT}" \
       "${PODMAN_NETWORK_NAME}" \
       "${PODMAN_STOP_TIMEOUT_SECS}" \
@@ -807,7 +831,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   OPENSHELL_SANDBOX_IMAGE="${SANDBOX_IMAGE_REQUEST}" \
   OPENSHELL_SANDBOX_IMAGE_PULL_POLICY="${EXTERNAL_DRIVER_PULL_POLICY}" \
   OPENSHELL_HEALTH_CHECK_INTERVAL_SECS="${EXTERNAL_DRIVER_HEALTH_CHECK_INTERVAL_SECS}" \
-  OPENSHELL_GRPC_ENDPOINT="${EXTERNAL_DRIVER_CALLBACK_ENDPOINT}" \
+  OPENSHELL_GRPC_ENDPOINT="${EXTERNAL_DRIVER_GRPC_ENDPOINT}" \
   OPENSHELL_GATEWAY_PORT="${HOST_PORT}" \
   OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
   OPENSHELL_STOP_TIMEOUT="${PODMAN_STOP_TIMEOUT_SECS}" \
@@ -825,13 +849,15 @@ fi
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
-  # compute_driver comes from the RPM template. Override the loopback address
-  # and port so Podman Machine can keep its IPv4 callback listener distinct.
+  # compute_driver comes from the RPM template. Override the loopback port for
+  # this isolated test gateway.
   --bind-address "${PRIMARY_BIND_IP}"
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
   --tls-cert "${PKI_DIR}/server/tls.crt"
   --tls-key "${PKI_DIR}/server/tls.key"
+  # edge_tunnel_e2e exercises the opt-in WebSocket tunnel.
+  --enable-websocket-tunnel true
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
   --log-level info
 )

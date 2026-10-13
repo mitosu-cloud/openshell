@@ -31,7 +31,7 @@ use crate::proto::{
     PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
     ReportEndpointStatusRequest, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
     SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
-    open_shell_client::OpenShellClient, workspace_selector,
+    open_shell_client::OpenShellClient,
 };
 use crate::sandbox_env;
 use crate::time::{duration_to_std, timestamp_to_millis};
@@ -133,13 +133,19 @@ fn validate_sandbox_refresh(
 ) -> std::result::Result<ValidatedSandboxRefresh, crate::jwt::SessionJwtError> {
     let token = crate::jwt::SecretJwt::parse(response.sandbox_token.clone())?;
     let credential_epoch = crate::jwt::CredentialEpoch::new(response.credential_epoch)?;
-    let expiration_time = response
+    let expires_at = response
         .sandbox_expiration_time
         .as_ref()
-        .ok_or(crate::jwt::SessionJwtError::InvalidLifetime)?;
-    crate::time::validate_timestamp(expiration_time)
-        .map_err(|_| crate::jwt::SessionJwtError::InvalidLifetime)?;
-    let expires_at = expiration_time.seconds;
+        .map(|expiration_time| {
+            crate::time::validate_timestamp(expiration_time)
+                .map_err(|_| crate::jwt::SessionJwtError::InvalidLifetime)?;
+            if expiration_time.seconds == 0 {
+                return Err(crate::jwt::SessionJwtError::InvalidLifetime);
+            }
+            Ok(expiration_time.seconds)
+        })
+        .transpose()?
+        .unwrap_or(0);
     crate::jwt::SessionBearerTokenSlot::new(token.clone(), expires_at, credential_epoch)?;
     Ok(ValidatedSandboxRefresh {
         token,
@@ -441,7 +447,10 @@ async fn refresh_token_loop(
 ) {
     let mut client = OpenShellClient::new(channel);
     loop {
-        let sleep = compute_refresh_delay(&slot);
+        let Some(sleep) = compute_refresh_delay(&slot) else {
+            debug!("gateway sandbox JWT does not expire; stopping periodic renewal");
+            return;
+        };
         tokio::time::sleep(sleep).await;
         match client
             .refresh_sandbox_token(RefreshSandboxTokenRequest {
@@ -647,10 +656,10 @@ async fn refresh_extension_credentials_with_client(
 
 /// Compute the next refresh delay: 80 % of the time remaining until the
 /// current token's `exp`, plus up to 10 % jitter, with a small lower bound
-/// for already-expired tokens and capped at 12 h. If the token can't be parsed
-/// (legacy/non-JWT bearer) or carries the `exp = 0` non-expiring sentinel,
-/// default to 6 h.
-fn compute_refresh_delay(slot: &TokenSlot) -> Duration {
+/// for already-expired tokens and capped at 12 h. An `exp` of zero denotes a
+/// non-expiring session credential and needs no periodic refresh. If the token
+/// can't be parsed (for example, an opaque bootstrap bearer), default to 6 h.
+fn compute_refresh_delay(slot: &TokenSlot) -> Option<Duration> {
     let token = slot
         .read()
         .ok()
@@ -663,23 +672,24 @@ fn compute_refresh_delay(slot: &TokenSlot) -> Duration {
             .map_or(0, |d| d.as_millis()),
     )
     .unwrap_or(i64::MAX);
-    let mut delay_ms = match parse_jwt_exp_ms(bearer) {
-        Some(0) | None => 21_600_000,
-        Some(exp) => {
-            let remaining_ms = exp - now_ms;
-            if remaining_ms <= 0 {
-                1_000
-            } else {
-                (remaining_ms * 8 / 10).clamp(1_000, 43_200_000)
-            }
+    let expires_at = parse_jwt_exp_ms(bearer);
+    if expires_at == Some(0) {
+        return None;
+    }
+    let mut delay_ms = expires_at.map_or(21_600_000, |exp| {
+        let remaining_ms = exp - now_ms;
+        if remaining_ms <= 0 {
+            1_000
+        } else {
+            (remaining_ms * 8 / 10).clamp(1_000, 43_200_000)
         }
-    };
+    });
     // Up to 10 % jitter, derived deterministically from token bytes so
     // unit tests are reproducible without injecting an RNG.
     let jitter_pct = (token.len() % 10) as u64;
     let jitter_ms = (u64::try_from(delay_ms).unwrap_or(0) * jitter_pct) / 100;
     delay_ms = delay_ms.saturating_add(i64::try_from(jitter_ms).unwrap_or(0));
-    Duration::from_millis(u64::try_from(delay_ms).unwrap_or(0))
+    Some(Duration::from_millis(u64::try_from(delay_ms).unwrap_or(0)))
 }
 
 /// Decode the `exp` claim from a JWT without verifying its signature.
@@ -714,17 +724,15 @@ mod auth_tests {
 
     #[cfg(feature = "jwt")]
     #[test]
-    fn sandbox_refresh_validation_rejects_missing_expiration() {
+    fn sandbox_refresh_validation_accepts_missing_expiration_as_non_expiring() {
         let response = crate::proto::RefreshSandboxTokenResponse {
             sandbox_token: "sandbox-token".to_string(),
             credential_epoch: 2,
             ..Default::default()
         };
 
-        assert_eq!(
-            validate_sandbox_refresh(&response).err(),
-            Some(crate::jwt::SessionJwtError::InvalidLifetime)
-        );
+        let refresh = validate_sandbox_refresh(&response).expect("non-expiring refresh");
+        assert_eq!(refresh.expires_at, 0);
     }
 
     #[cfg(feature = "jwt")]
@@ -794,7 +802,7 @@ mod auth_tests {
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
         let slot: TokenSlot = Arc::new(RwLock::new(bearer));
-        let delay = compute_refresh_delay(&slot);
+        let delay = compute_refresh_delay(&slot).expect("expiring token needs refresh");
         // 800 s baseline + up to 10 % jitter → 800..=880 s, with some slack
         // for the 1-second resolution of the exp claim.
         let secs = delay.as_secs();
@@ -815,22 +823,18 @@ mod auth_tests {
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
         let slot: TokenSlot = Arc::new(RwLock::new(bearer));
-        let delay = compute_refresh_delay(&slot);
+        let delay = compute_refresh_delay(&slot).expect("expired token needs refresh");
         assert!((1..60).contains(&delay.as_secs()));
     }
 
     #[test]
-    fn compute_refresh_delay_treats_exp_zero_as_non_expiring() {
+    fn compute_refresh_delay_skips_non_expiring_token() {
         use base64::Engine as _;
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"exp":0}"#);
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
         let slot: TokenSlot = Arc::new(RwLock::new(bearer));
-        let delay = compute_refresh_delay(&slot);
-        assert!(
-            (6 * 60 * 60..=7 * 60 * 60).contains(&delay.as_secs()),
-            "non-expiring tokens should use the fallback refresh delay, got {delay:?}"
-        );
+        assert_eq!(compute_refresh_delay(&slot), None);
     }
 
     #[test]
@@ -846,7 +850,7 @@ mod auth_tests {
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
         let slot: TokenSlot = Arc::new(RwLock::new(bearer));
-        let delay = compute_refresh_delay(&slot);
+        let delay = compute_refresh_delay(&slot).expect("expiring token needs refresh");
         assert!(
             delay.as_secs() < 30,
             "expected refresh before 30s expiry, got {delay:?}",
@@ -895,14 +899,17 @@ async fn connect(endpoint: &str) -> Result<OpenShellClient<AuthedChannel>> {
 /// Returns `Ok(Some(policy))` when the server has a policy configured,
 /// or `Ok(None)` when the sandbox was created without a policy (the sandbox
 /// should discover one from disk or use the restrictive default).
-pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<ProtoSandboxPolicy>> {
-    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to OpenShell server");
+pub async fn fetch_policy(
+    endpoint: &str,
+    sandbox_name: &str,
+) -> Result<Option<ProtoSandboxPolicy>> {
+    debug!(endpoint = %endpoint, sandbox_name = %sandbox_name, "Connecting to OpenShell server");
 
     let mut client = connect(endpoint).await?;
 
     debug!("Connected, fetching sandbox policy");
 
-    fetch_policy_with_client(&mut client, sandbox_id).await
+    fetch_policy_with_client(&mut client, sandbox_name).await
 }
 
 /// Fetch the authoritative policy and revision metadata in one response.
@@ -913,20 +920,22 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<Pro
 /// by the policy.
 pub async fn fetch_settings_snapshot(
     endpoint: &str,
-    sandbox_id: &str,
+    sandbox_name: &str,
 ) -> Result<SettingsPollResult> {
-    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to fetch OpenShell settings snapshot");
+    debug!(endpoint = %endpoint, sandbox_name = %sandbox_name, "Connecting to fetch OpenShell settings snapshot");
     let mut client = connect(endpoint).await?;
-    fetch_settings_snapshot_with_client(&mut client, sandbox_id).await
+    fetch_settings_snapshot_with_client(&mut client, sandbox_name, None).await
 }
 
 async fn fetch_settings_snapshot_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
-    sandbox_id: &str,
+    sandbox_name: &str,
+    workspace: Option<&str>,
 ) -> Result<SettingsPollResult> {
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox_id.to_string(),
+            workspace_scope: workspace.map(crate::proto::workspace_selector),
+            name: sandbox_name.to_string(),
         })
         .await
         .map_err(grpc_status_error)?;
@@ -934,12 +943,16 @@ async fn fetch_settings_snapshot_with_client(
     Ok(settings_poll_result(response.into_inner()))
 }
 
+fn learned_workspace_selector(workspace: Option<&str>) -> Option<crate::proto::WorkspaceSelector> {
+    workspace.map(crate::proto::workspace_selector)
+}
+
 /// Fetch sandbox policy using an existing client connection.
 async fn fetch_policy_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
-    sandbox_id: &str,
+    sandbox_name: &str,
 ) -> Result<Option<ProtoSandboxPolicy>> {
-    let snapshot = fetch_settings_snapshot_with_client(client, sandbox_id).await?;
+    let snapshot = fetch_settings_snapshot_with_client(client, sandbox_name, None).await?;
 
     // version 0 with no policy means the sandbox was created without one.
     if snapshot.version == 0 && snapshot.policy.is_none() {
@@ -960,9 +973,9 @@ async fn sync_policy_with_client(
 ) -> Result<()> {
     client
         .update_config(UpdateConfigRequest {
-            name: sandbox.to_string(),
+            sandbox: sandbox.to_string(),
+            workspace_scope: Some(crate::proto::workspace_selector(workspace)),
             policy: Some(policy.clone()),
-            workspace_scope: Some(workspace_selector(workspace)),
             ..Default::default()
         })
         .await
@@ -978,14 +991,12 @@ async fn sync_policy_with_client(
 /// channel instead of establishing three separate connections.
 pub async fn discover_and_sync_policy(
     endpoint: &str,
-    sandbox_id: &str,
     sandbox: &str,
     discovered_policy: &ProtoSandboxPolicy,
     workspace: &str,
 ) -> Result<ProtoSandboxPolicy> {
     debug!(
         endpoint = %endpoint,
-        sandbox_id = %sandbox_id,
         sandbox = %sandbox,
         "Syncing discovered policy and re-fetching canonical version"
     );
@@ -996,8 +1007,9 @@ pub async fn discover_and_sync_policy(
     sync_policy_with_client(&mut client, sandbox, discovered_policy, workspace).await?;
 
     // Re-fetch from the gateway to get the canonical version/hash.
-    fetch_policy_with_client(&mut client, sandbox_id)
+    fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace))
         .await?
+        .policy
         .ok_or_else(|| {
             miette::miette!("Server still returned no policy after sync — this is a bug")
         })
@@ -1021,14 +1033,13 @@ pub async fn sync_policy(
 /// Sync an enriched policy and return the authoritative revision snapshot.
 pub async fn sync_policy_and_fetch_snapshot(
     endpoint: &str,
-    sandbox_id: &str,
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
     workspace: &str,
 ) -> Result<SettingsPollResult> {
     let mut client = connect(endpoint).await?;
     sync_policy_with_client(&mut client, sandbox, policy, workspace).await?;
-    fetch_settings_snapshot_with_client(&mut client, sandbox_id).await
+    fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace)).await
 }
 
 /// Report an exact runtime configuration generation. Pending registration uses
@@ -1105,6 +1116,7 @@ fn provider_environment_result(
         .collect::<Result<HashMap<_, _>>>()?;
     Ok(ProviderEnvironmentResult {
         environment: inner.environment,
+        files: inner.files,
         provider_env_revision: inner.provider_env_revision,
         provider_attachment_epoch: inner.provider_attachment_epoch,
         policy_hash: inner.policy_hash,
@@ -1312,7 +1324,7 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
 
 #[cfg(test)]
 mod settings_poll_tests {
-    use super::settings_poll_result;
+    use super::{learned_workspace_selector, settings_poll_result};
     use crate::PolicyValidationFailureMode;
     use crate::proto::GetSandboxConfigResponse;
 
@@ -1351,11 +1363,25 @@ mod settings_poll_tests {
         let legacy = settings_poll_result(GetSandboxConfigResponse::default());
         assert!(!legacy.extension_authentication_enabled);
     }
+
+    #[test]
+    fn workspace_selector_is_omitted_until_bootstrap_learns_the_workspace() {
+        assert!(learned_workspace_selector(None).is_none());
+
+        let selector = learned_workspace_selector(Some("team-a")).expect("workspace selector");
+        assert_eq!(
+            selector.selection,
+            Some(crate::proto::workspace_selector::Selection::Workspace(
+                "team-a".to_string()
+            ))
+        );
+    }
 }
 
 /// Credential material and the authority snapshot that produced its bindings.
 pub struct ProviderEnvironmentResult {
     pub environment: HashMap<String, String>,
+    pub files: HashMap<String, String>,
     pub provider_env_revision: u64,
     /// Attachment identity captured with the delivered credential records.
     pub provider_attachment_epoch: String,
@@ -1405,12 +1431,17 @@ impl CachedOpenShellClient {
     }
 
     /// Poll for current effective sandbox settings and policy metadata.
-    pub async fn poll_settings(&self, sandbox_id: &str) -> Result<SettingsPollResult> {
+    pub async fn poll_settings(&self, sandbox_name: &str) -> Result<SettingsPollResult> {
+        // Sandbox-authenticated callers may omit the selector during bootstrap.
+        // Once the first response identifies the workspace, scope every later
+        // poll explicitly instead of constructing an invalid empty selector.
+        let workspace_scope = learned_workspace_selector(self.workspace.get().map(String::as_str));
         let response = self
             .client
             .clone()
             .get_sandbox_config(GetSandboxConfigRequest {
-                sandbox_id: sandbox_id.to_string(),
+                workspace_scope,
+                name: sandbox_name.to_string(),
             })
             .await
             .into_diagnostic()?;
@@ -1515,7 +1546,7 @@ impl CachedOpenShellClient {
                 proposed_chunks,
                 network_activity_summaries,
                 analysis_mode: analysis_mode.to_string(),
-                workspace: self.workspace(),
+                workspace_scope: Some(crate::proto::workspace_selector(self.workspace())),
             })
             .await
             .into_diagnostic()?;
@@ -1536,9 +1567,9 @@ impl CachedOpenShellClient {
             .client
             .clone()
             .get_draft_policy(GetDraftPolicyRequest {
-                name: sandbox_name.to_string(),
                 status_filter: status_filter.to_string(),
-                workspace_scope: Some(workspace_selector(self.workspace())),
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(crate::proto::workspace_selector(self.workspace())),
             })
             .await
             .into_diagnostic()?;

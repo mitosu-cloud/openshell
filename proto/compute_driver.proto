@@ -7,6 +7,7 @@ package openshell.compute.v1;
 
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
+import "extension.proto";
 import "options.proto";
 import "sandbox.proto";
 
@@ -32,9 +33,7 @@ service ComputeDriver {
       returns (AuthenticateSandboxResponse);
 
   // Report additional gateway listeners required by this driver instance.
-  //
-  // A requirement is not authorization to expose the gateway. The gateway
-  // owns validation, authorization, and the authoritative bind.
+  // The gateway validates, authorizes, and performs every bind.
   rpc GetGatewayListenerRequirements(GetGatewayListenerRequirementsRequest)
       returns (GetGatewayListenerRequirementsResponse);
 
@@ -71,7 +70,10 @@ service ComputeDriver {
   rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
 }
 
-message GetCapabilitiesRequest {}
+message GetCapabilitiesRequest {
+  // Gateway protocol metadata. Drivers must reject unmet requirements.
+  openshell.extension.v1.PeerMetadata gateway = 1;
+}
 
 message GetCapabilitiesResponse {
   reserved 4, 5;
@@ -79,14 +81,16 @@ message GetCapabilitiesResponse {
 
   // Human-readable driver name.
   string driver_name = 1;
-  // Driver implementation version string.
+  // Deprecated diagnostic compatibility field. Use extension.implementation_version.
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
   // Whether the gateway should stop running sandbox compute during graceful
   // shutdown and restart the retained running intent on startup.
   bool gateway_manages_lifecycle = 6;
-  // Whether AuthenticateSandbox is implemented by this driver.
+  // Whether AuthenticateSandbox is implemented by this driver. Drivers that
+  // enable this capability must return a stable runtime identity from create,
+  // start, and authentication responses for gateway-side binding checks.
   bool supports_sandbox_authentication = 7;
   // Whether the driver reports runtime readiness itself. When false, the
   // gateway waits for the standard OpenShell supervisor session in addition
@@ -101,6 +105,12 @@ message GetCapabilitiesResponse {
   // Maximum rootfs tar file size in bytes accepted by the driver. Zero means
   // the driver does not support rootfs tar sources.
   uint64 rootfs_tar_max_bytes = 11;
+  // Compute extension protocol metadata. Required for protocol negotiation.
+  openshell.extension.v1.PeerMetadata extension = 12;
+  // Versioned effective operator admission policy (v1: followed by JSON).
+  // Gateways require an exact policy match before activating the driver.
+  // Empty denotes a legacy driver and requires explicit admission opt-out.
+  string resource_admission_policy = 13;
 }
 
 message AuthenticateSandboxRequest {
@@ -111,6 +121,10 @@ message AuthenticateSandboxRequest {
 message AuthenticateSandboxResponse {
   // Stable gateway-assigned sandbox ID authenticated by the driver.
   string sandbox_id = 1;
+  // Opaque, stable identity of the compute resource presenting the credential.
+  // The gateway compares this with the identity recorded when the sandbox was
+  // created to authorize the bootstrap exchange.
+  string runtime_identity = 2;
 }
 
 // Static portable resource request forms supported by a compute driver.
@@ -149,10 +163,8 @@ message GatewayListenerRequirement {
     // the gateway's configured primary listener port.
     string exact_bind_address = 2;
     // Ask the gateway to bind the IPv4 address selected by its default route.
-    // This matches rootless pasta's default upstream-interface selection.
     GatewayDefaultRouteInterfaceRequirement default_route_interface = 3;
-    // Ask the gateway to ensure an IPv4 loopback listener is present. This
-    // covers runtimes whose host forwarder terminates on gateway loopback.
+    // Ask the gateway to ensure an IPv4 loopback listener is present.
     GatewayLoopbackInterfaceRequirement loopback_interface = 4;
   }
 }
@@ -324,7 +336,7 @@ message DriverResourceRequirements {
 // conditions plus `deleting`.
 message DriverSandboxStatus {
   // Compute-platform sandbox object name.
-  string sandbox_name = 1;
+  string name = 1;
   // Platform-assigned instance identifier for the compute unit running the
   // sandbox agent (e.g. Kubernetes pod name, VM instance ID, hostname).
   // The gateway uses this to correlate incoming connections back to a sandbox.
@@ -390,7 +402,7 @@ message GetSandboxRequest {
   // Stable sandbox ID stored by the gateway.
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
-  string sandbox_name = 2;
+  string name = 2;
 }
 
 message GetSandboxResponse {
@@ -410,13 +422,17 @@ message CreateSandboxRequest {
   DriverSandbox sandbox = 1;
 }
 
-message CreateSandboxResponse {}
+message CreateSandboxResponse {
+  // Opaque, stable identity of the compute resource created for the sandbox.
+  // Required when the driver advertises sandbox authentication support.
+  string runtime_identity = 1;
+}
 
 message StopSandboxRequest {
   // Stable sandbox ID stored by the gateway.
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
-  string sandbox_name = 2;
+  string name = 2;
 }
 
 message StopSandboxResponse {}
@@ -425,22 +441,31 @@ message StartSandboxRequest {
   // Stable sandbox ID stored by the gateway.
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
-  string sandbox_name = 2;
+  string name = 2;
   // Fresh launch credentials for start-from-stopped. Empty only for drivers
   // that do not implement the OpenShell Sandbox Protocol.
   bytes launch_authentication = 3 [(openshell.options.v1.secret) = true];
   // Stable identity of this gateway start transition. Retries of the same
   // transition carry the same generation ID; a later start uses a new ID.
   string generation_id = 4;
+  // Opaque runtime identity persisted from the prior successful create or
+  // start. Drivers that advertise runtime identity binding must preserve the
+  // stable resource represented by this identity while replacing only the
+  // generation-specific runtime component.
+  string expected_runtime_identity = 5;
 }
 
-message StartSandboxResponse {}
+message StartSandboxResponse {
+  // Updated opaque runtime identity after a successful start. Required when
+  // the driver advertises sandbox authentication support.
+  string runtime_identity = 1;
+}
 
 message DeleteSandboxRequest {
   // Stable sandbox ID stored by the gateway.
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
-  string sandbox_name = 2;
+  string name = 2;
 }
 
 message DeleteSandboxResponse {

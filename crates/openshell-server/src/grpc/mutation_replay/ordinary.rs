@@ -39,7 +39,7 @@ use super::{
 };
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
-    MinWorkspaceRole, authorize_workspace, authorize_workspace_selector,
+    MinWorkspaceRole, authorize_workspace, selected_workspace_name,
 };
 use crate::grpc::{policy, provider, sandbox, service};
 use crate::persistence::{ObjectType, SetResourceVersion, Store};
@@ -154,6 +154,8 @@ pub(in crate::grpc) enum Outcome {
     Sandbox {
         id: String,
         changed: bool,
+        #[serde(default)]
+        service_urls: HashMap<String, String>,
     },
     SandboxDeletion {
         id: String,
@@ -286,23 +288,41 @@ async fn live<T: Message + Default + ObjectType + SetResourceVersion>(
 async fn selected_scope(
     state: &ServerState,
     principal: &Principal,
-    selector: Option<&WorkspaceSelector>,
+    workspace_scope: Option<&WorkspaceSelector>,
     role: MinWorkspaceRole,
 ) -> Result<Scope, Status> {
+    let workspace = selected_workspace_name(workspace_scope)?;
     let authz =
-        authorize_workspace_selector(&state.store, &state.admin_role, principal, selector, role)
-            .await?;
+        authorize_workspace(&state.store, &state.admin_role, principal, workspace, role).await?;
     named_scope(state, &authz.workspace).await
+}
+
+async fn sandbox_scope(
+    state: &ServerState,
+    principal: &Principal,
+    workspace_scope: Option<&WorkspaceSelector>,
+    role: MinWorkspaceRole,
+) -> Result<Scope, Status> {
+    selected_scope(state, principal, workspace_scope, role)
+        .await
+        .map_err(|status| {
+            if status.code() == tonic::Code::PermissionDenied {
+                Status::not_found("sandbox not found")
+            } else {
+                status
+            }
+        })
 }
 
 async fn profile_scope(
     state: &ServerState,
     principal: &Principal,
-    workspace: &str,
+    workspace_scope: Option<&WorkspaceSelector>,
 ) -> Result<Scope, Status> {
-    if workspace.is_empty() {
+    let Some(workspace_scope) = workspace_scope else {
         return global_scope(state, principal);
-    }
+    };
+    let workspace = selected_workspace_name(Some(workspace_scope))?;
     let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
@@ -369,16 +389,43 @@ macro_rules! scoped_mutation {
     };
 }
 
-fn sandbox_receipt(sandbox: Option<&Sandbox>, changed: bool) -> Result<Outcome, Status> {
+macro_rules! sandbox_scoped_mutation {
+    ($req:ty, $resp:ty, $method:literal, $handler:path, $role:ident, $capture:expr, $restore:expr) => {
+        mutation!(
+            $req,
+            $resp,
+            $method,
+            $handler,
+            async |req: &$req, state: &ServerState, principal: &Principal| {
+                sandbox_scope(
+                    state,
+                    principal,
+                    req.workspace_scope.as_ref(),
+                    MinWorkspaceRole::$role,
+                )
+                .await
+            },
+            $capture,
+            $restore
+        );
+    };
+}
+
+fn sandbox_receipt(
+    sandbox: Option<&Sandbox>,
+    changed: bool,
+    service_urls: HashMap<String, String>,
+) -> Result<Outcome, Status> {
     Ok(Outcome::Sandbox {
         id: sandbox.ok_or_else(uncertain)?.object_id().into(),
         changed,
+        service_urls,
     })
 }
 
 macro_rules! sandbox_mutation {
     ($req:ty, $method:literal, $handler:path) => {
-        scoped_mutation!(
+        sandbox_scoped_mutation!(
             $req,
             SandboxResponse,
             $method,
@@ -386,7 +433,8 @@ macro_rules! sandbox_mutation {
             User,
             |response: &Response<SandboxResponse>| sandbox_receipt(
                 response.get_ref().sandbox.as_ref(),
-                false
+                false,
+                HashMap::new(),
             ),
             async |store: &Store, outcome: Outcome| {
                 let Outcome::Sandbox { id, .. } = outcome else {
@@ -394,15 +442,35 @@ macro_rules! sandbox_mutation {
                 };
                 Ok(SandboxResponse {
                     sandbox: Some(live(store, &id).await?),
+                    service_urls: HashMap::new(),
                 })
             }
         );
     };
 }
-sandbox_mutation!(
+scoped_mutation!(
     CreateSandboxRequest,
+    SandboxResponse,
     "CreateSandbox",
-    sandbox::handle_create_sandbox
+    sandbox::handle_create_sandbox,
+    User,
+    |response: &Response<SandboxResponse>| sandbox_receipt(
+        response.get_ref().sandbox.as_ref(),
+        false,
+        response.get_ref().service_urls.clone(),
+    ),
+    async |store: &Store, outcome: Outcome| {
+        let Outcome::Sandbox {
+            id, service_urls, ..
+        } = outcome
+        else {
+            return Err(replay_unavailable());
+        };
+        Ok(SandboxResponse {
+            sandbox: Some(live(store, &id).await?),
+            service_urls,
+        })
+    }
 );
 sandbox_mutation!(
     StartSandboxRequest,
@@ -417,7 +485,7 @@ sandbox_mutation!(
 
 macro_rules! attachment_mutation {
     ($req:ty, $resp:ident, $method:literal, $handler:path, $field:ident) => {
-        scoped_mutation!(
+        sandbox_scoped_mutation!(
             $req,
             $resp,
             $method,
@@ -471,7 +539,7 @@ attachment_mutation!(
     detached
 );
 
-scoped_mutation!(
+sandbox_scoped_mutation!(
     DeleteSandboxRequest,
     DeleteSandboxResponse,
     "DeleteSandbox",
@@ -492,7 +560,7 @@ scoped_mutation!(
     }
 );
 
-scoped_mutation!(
+sandbox_scoped_mutation!(
     ExposeServiceRequest,
     ServiceEndpointResponse,
     "ExposeService",
@@ -623,7 +691,7 @@ ordinary_deletion!(
     "DeleteService",
     service::handle_delete_service,
     async |req: &DeleteServiceRequest, state: &ServerState, principal: &Principal| {
-        selected_scope(
+        sandbox_scope(
             state,
             principal,
             req.workspace_scope.as_ref(),
@@ -668,7 +736,7 @@ ordinary_deletion!(
     "DeleteProviderProfile",
     provider::handle_delete_provider_profile,
     async |req: &DeleteProviderProfileRequest, state: &ServerState, principal: &Principal| {
-        profile_scope(state, principal, &req.workspace).await
+        profile_scope(state, principal, req.workspace_scope.as_ref()).await
     }
 );
 
@@ -693,7 +761,7 @@ mutation!(
     "ImportProviderProfiles",
     provider::handle_import_provider_profiles,
     async |req: &ImportProviderProfilesRequest, state: &ServerState, principal: &Principal| {
-        profile_scope(state, principal, &req.workspace).await
+        profile_scope(state, principal, req.workspace_scope.as_ref()).await
     },
     |response: &Response<ImportProviderProfilesResponse>| {
         let value = response.get_ref();
@@ -730,7 +798,7 @@ mutation!(
     "UpdateProviderProfiles",
     provider::handle_update_provider_profiles,
     async |req: &UpdateProviderProfilesRequest, state: &ServerState, principal: &Principal| {
-        profile_scope(state, principal, &req.workspace).await
+        profile_scope(state, principal, req.workspace_scope.as_ref()).await
     },
     |response: &Response<UpdateProviderProfilesResponse>| {
         let value = response.get_ref();
@@ -819,12 +887,12 @@ mutation!(
         if req.global {
             if req.workspace_scope.is_some() {
                 return Err(Status::invalid_argument(
-                    "workspace_scope must be omitted when global is true",
+                    "workspace must be omitted when global is true",
                 ));
             }
             global_scope(state, principal)
         } else {
-            selected_scope(
+            sandbox_scope(
                 state,
                 principal,
                 req.workspace_scope.as_ref(),
@@ -876,7 +944,7 @@ mutation!(
 
 macro_rules! policy_mutation {
     ($req:ty, $resp:ty, $method:literal, $handler:path, $values:expr, $restore:expr) => {
-        scoped_mutation!(
+        sandbox_scoped_mutation!(
             $req,
             $resp,
             $method,

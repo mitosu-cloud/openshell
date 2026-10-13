@@ -19,13 +19,18 @@ func newServiceClient(conn grpc.ClientConnInterface) *serviceClient {
 	return &serviceClient{client: pb.NewOpenShellClient(conn)}
 }
 
-func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serviceName string, targetPort uint32, domain bool) (*ServiceEndpoint, error) {
+func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serviceName string, targetPort uint32, domain bool, opts ...ExposeServiceOptions) (*ServiceEndpoint, error) {
+	authorizationMode := ServiceAuthorizationModeStrip
+	if len(opts) > 0 && opts[0].AuthorizationMode != 0 {
+		authorizationMode = opts[0].AuthorizationMode
+	}
 	resp, err := s.client.ExposeService(ctx, &pb.ExposeServiceRequest{
-		Sandbox:        sandboxName,
-		Service:        serviceName,
-		TargetPort:     targetPort,
-		Domain:         domain,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		Sandbox:           sandboxName,
+		WorkspaceScope:    namedWorkspaceScope(workspace),
+		Name:              serviceName,
+		TargetPort:        targetPort,
+		Domain:            domain,
+		AuthorizationMode: pb.ServiceAuthorizationMode(authorizationMode),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -36,8 +41,8 @@ func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serv
 func (s *serviceClient) Get(ctx context.Context, workspace, sandboxName, serviceName string) (*ServiceEndpoint, error) {
 	resp, err := s.client.GetService(ctx, &pb.GetServiceRequest{
 		Sandbox:        sandboxName,
-		Service:        serviceName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
+		Name:           serviceName,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -89,8 +94,8 @@ func (s *serviceClient) Delete(ctx context.Context, workspace, sandboxName, serv
 	resp, err := s.client.DeleteService(ctx, &pb.DeleteServiceRequest{
 		AllowMissing:   allowMissing(opts),
 		Sandbox:        sandboxName,
-		Service:        serviceName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
+		Name:           serviceName,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)

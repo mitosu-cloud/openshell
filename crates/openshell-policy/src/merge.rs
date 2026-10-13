@@ -4,11 +4,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use openshell_core::proto::{
-    L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
+    L7Allow, L7DenyRule, L7Rule, NetworkAccessPreset, NetworkBinary, NetworkEndpoint,
+    NetworkEnforcementMode, NetworkPolicyRule, NetworkTlsMode, SandboxPolicy,
 };
 
 use crate::{
-    PolicyViolation, canonicalize_mcp_options, is_provider_rule_name, restrictive_default_policy,
+    PolicyViolation, canonicalize_mcp_options, is_provider_rule_name, network_access_preset_to_str,
+    network_enforcement_mode_to_str, network_tls_mode_to_str, restrictive_default_policy,
     validate_and_canonicalize_sandbox_policy,
 };
 
@@ -110,10 +112,9 @@ pub fn canonicalize_advisor_add_rule(
     if !incoming_endpoint.rules.is_empty() {
         if !incoming_endpoint.protocol.eq_ignore_ascii_case("rest")
             || !contract.protocol.eq_ignore_ascii_case("rest")
-            || !incoming_endpoint
-                .enforcement
-                .eq_ignore_ascii_case("enforce")
-            || !contract.enforcement.eq_ignore_ascii_case("enforce")
+            || effective_enforcement(incoming_endpoint.enforcement)
+                != NetworkEnforcementMode::Enforce as i32
+            || effective_enforcement(contract.enforcement) != NetworkEnforcementMode::Enforce as i32
         {
             return Err(format!(
                 "cannot append observed L7 paths to the existing {}:{} contract",
@@ -850,16 +851,17 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
     if !proposed.protocol.is_empty() && !protocols_match(&loaded.protocol, &proposed.protocol) {
         return false;
     }
-    if !proposed.tls.is_empty() && effective_tls(&loaded.tls) != effective_tls(&proposed.tls) {
+    if proposed.tls != NetworkTlsMode::Unspecified as i32 && loaded.tls != proposed.tls {
         return false;
     }
-    if !proposed.enforcement.is_empty()
-        && effective_enforcement(&loaded.enforcement)
-            != effective_enforcement(&proposed.enforcement)
+    if proposed.enforcement != NetworkEnforcementMode::Unspecified as i32
+        && effective_enforcement(loaded.enforcement) != effective_enforcement(proposed.enforcement)
     {
         return false;
     }
-    if !proposed.access.is_empty() && loaded.access != proposed.access {
+    if proposed.access != NetworkAccessPreset::Unspecified as i32
+        && loaded.access != proposed.access
+    {
         return false;
     }
 
@@ -954,15 +956,12 @@ fn protocols_match(left: &str, right: &str) -> bool {
     }
 }
 
-fn effective_tls(value: &str) -> &str {
-    match value {
-        "" | "terminate" | "passthrough" => "auto",
-        value => value,
+fn effective_enforcement(value: i32) -> i32 {
+    if value == NetworkEnforcementMode::Unspecified as i32 {
+        NetworkEnforcementMode::Audit as i32
+    } else {
+        value
     }
-}
-
-fn effective_enforcement(value: &str) -> &str {
-    if value.is_empty() { "audit" } else { value }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1258,7 +1257,9 @@ fn apply_operation(
             // port for the existing single-port protocol and preset messages.
             let port = target.ports.first().copied().unwrap_or_default();
             ensure_method_path_endpoint(endpoint, &target.host, port)?;
-            if endpoint.access.is_empty() && endpoint.rules.is_empty() {
+            if endpoint.access == NetworkAccessPreset::Unspecified as i32
+                && endpoint.rules.is_empty()
+            {
                 return Err(PolicyMergeError::EndpointHasNoAllowBase {
                     host: target.host.clone(),
                     port,
@@ -1621,27 +1622,27 @@ fn merge_endpoint(
         existing.mcp.clone_from(&incoming.mcp);
         existing.json_rpc_max_body_bytes = incoming.json_rpc_max_body_bytes;
     }
-    let existing_enforcement = existing.enforcement.clone();
-    merge_string_field(
+    let existing_enforcement = existing.enforcement;
+    merge_enum_field(
         &mut existing.enforcement,
-        &incoming.enforcement,
+        incoming.enforcement,
         PolicyMergeWarning::ExistingEnforcementRetained {
             host: host.clone(),
             port,
-            existing: existing_enforcement,
-            incoming: incoming.enforcement.clone(),
+            existing: enforcement_label(existing_enforcement),
+            incoming: enforcement_label(incoming.enforcement),
         },
         warnings,
     );
-    let existing_tls = existing.tls.clone();
-    merge_string_field(
+    let existing_tls = existing.tls;
+    merge_enum_field(
         &mut existing.tls,
-        &incoming.tls,
+        incoming.tls,
         PolicyMergeWarning::ExistingTlsRetained {
             host: host.clone(),
             port,
-            existing: existing_tls,
-            incoming: incoming.tls.clone(),
+            existing: tls_label(existing_tls),
+            incoming: tls_label(incoming.tls),
         },
         warnings,
     );
@@ -1649,28 +1650,28 @@ fn merge_endpoint(
     if !incoming.rules.is_empty() {
         expand_existing_access(existing, &host, port, warnings)?;
         append_unique_l7_rules(&mut existing.rules, &incoming.rules);
-        if !incoming.access.is_empty() {
+        if incoming.access != NetworkAccessPreset::Unspecified as i32 {
             warnings.push(PolicyMergeWarning::IgnoredIncomingAccessBecauseRulesExist {
                 host,
                 port,
-                incoming: incoming.access.clone(),
+                incoming: access_label(incoming.access),
             });
         }
-    } else if !incoming.access.is_empty() {
+    } else if incoming.access != NetworkAccessPreset::Unspecified as i32 {
         if !existing.rules.is_empty() {
             warnings.push(PolicyMergeWarning::IgnoredIncomingAccessBecauseRulesExist {
                 host,
                 port,
-                incoming: incoming.access.clone(),
+                incoming: access_label(incoming.access),
             });
-        } else if existing.access.is_empty() {
-            existing.access.clone_from(&incoming.access);
+        } else if existing.access == NetworkAccessPreset::Unspecified as i32 {
+            existing.access = incoming.access;
         } else if existing.access != incoming.access {
             warnings.push(PolicyMergeWarning::ExistingAccessRetained {
                 host,
                 port,
-                existing: existing.access.clone(),
-                incoming: incoming.access.clone(),
+                existing: access_label(existing.access),
+                incoming: access_label(incoming.access),
             });
         }
     }
@@ -1910,17 +1911,17 @@ fn adopt_unset_retained_fields(
     if adopted.protocol.is_empty() {
         adopted.protocol.clone_from(&merged.protocol);
     }
-    if adopted.tls.is_empty() {
-        adopted.tls.clone_from(&merged.tls);
+    if adopted.tls == NetworkTlsMode::Unspecified as i32 {
+        adopted.tls = merged.tls;
     }
-    if adopted.enforcement.is_empty() {
-        adopted.enforcement.clone_from(&merged.enforcement);
+    if adopted.enforcement == NetworkEnforcementMode::Unspecified as i32 {
+        adopted.enforcement = merged.enforcement;
     }
     // `merge_endpoint` only touches `access` when the incoming endpoint carries
     // an access preset or explicit rules, so an endpoint declaring neither keeps
     // whatever preset is already loaded.
-    if adopted.access.is_empty() && adopted.rules.is_empty() {
-        adopted.access.clone_from(&merged.access);
+    if adopted.access == NetworkAccessPreset::Unspecified as i32 && adopted.rules.is_empty() {
+        adopted.access = merged.access;
     }
     if adopted.persisted_queries.is_empty() {
         adopted
@@ -2016,6 +2017,34 @@ fn merge_string_field(
     } else if *existing != incoming {
         warnings.push(warning);
     }
+}
+
+fn merge_enum_field(
+    existing: &mut i32,
+    incoming: i32,
+    warning: PolicyMergeWarning,
+    warnings: &mut Vec<PolicyMergeWarning>,
+) {
+    if incoming == 0 {
+        return;
+    }
+    if *existing == 0 {
+        *existing = incoming;
+    } else if *existing != incoming {
+        warnings.push(warning);
+    }
+}
+
+fn tls_label(value: i32) -> String {
+    network_tls_mode_to_str(value).map_or_else(|| value.to_string(), str::to_owned)
+}
+
+fn enforcement_label(value: i32) -> String {
+    network_enforcement_mode_to_str(value).map_or_else(|| value.to_string(), str::to_owned)
+}
+
+fn access_label(value: i32) -> String {
+    network_access_preset_to_str(value).map_or_else(|| value.to_string(), str::to_owned)
 }
 
 fn merge_endpoint_ports(existing: &mut NetworkEndpoint, incoming: &NetworkEndpoint) {
@@ -2212,11 +2241,11 @@ fn expand_existing_access(
     port: u32,
     warnings: &mut Vec<PolicyMergeWarning>,
 ) -> Result<(), PolicyMergeError> {
-    if endpoint.access.is_empty() {
+    if endpoint.access == NetworkAccessPreset::Unspecified as i32 {
         return Ok(());
     }
 
-    let access = endpoint.access.clone();
+    let access = access_label(endpoint.access);
     let expanded = expand_access_preset(&endpoint.protocol, &access).ok_or_else(|| {
         PolicyMergeError::UnsupportedAccessPreset {
             host: host.to_string(),
@@ -2224,7 +2253,7 @@ fn expand_existing_access(
             access: access.clone(),
         }
     })?;
-    endpoint.access.clear();
+    endpoint.access = NetworkAccessPreset::Unspecified as i32;
     append_unique_l7_rules(&mut endpoint.rules, &expanded);
     warnings.push(PolicyMergeWarning::ExpandedAccessPreset {
         host: host.to_string(),
@@ -2400,8 +2429,9 @@ mod tests {
     use openshell_core::{
         mcp::DEFAULT_MCP_PROTOCOL_VERSION,
         proto::{
-            L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
-            NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
+            L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkAccessPreset,
+            NetworkBinary, NetworkEndpoint, NetworkEnforcementMode, NetworkPolicyRule,
+            NetworkTlsMode, SandboxPolicy,
         },
     };
 
@@ -2482,7 +2512,7 @@ mod tests {
     fn canonicalize_advisor_retains_denied_rest_path_on_existing_endpoint() {
         let mut existing_endpoint = endpoint("example.com", 443);
         existing_endpoint.protocol = "rest".to_string();
-        existing_endpoint.enforcement = "enforce".to_string();
+        existing_endpoint.enforcement = NetworkEnforcementMode::Enforce as i32;
         existing_endpoint.rules = vec![rest_rule("GET", "/allowed")];
         let mut base = SandboxPolicy::default();
         base.network_policies.insert(
@@ -2495,7 +2525,7 @@ mod tests {
         );
         let mut observed = endpoint("example.com", 443);
         observed.protocol = "rest".to_string();
-        observed.enforcement = "enforce".to_string();
+        observed.enforcement = NetworkEnforcementMode::Enforce as i32;
         observed.rules = vec![rest_rule("GET", "/")];
         observed.advisor_proposed = true;
         let incoming = NetworkPolicyRule {
@@ -2532,8 +2562,8 @@ mod tests {
     fn canonicalize_advisor_keeps_new_binary_separate_from_explicit_rule() {
         let mut existing_endpoint = endpoint("index.crates.io", 443);
         existing_endpoint.protocol = "rest".to_string();
-        existing_endpoint.enforcement = "enforce".to_string();
-        existing_endpoint.access = "read-only".to_string();
+        existing_endpoint.enforcement = NetworkEnforcementMode::Enforce as i32;
+        existing_endpoint.access = NetworkAccessPreset::ReadOnly as i32;
         let existing = NetworkPolicyRule {
             name: "cargo-registry".to_string(),
             endpoints: vec![existing_endpoint.clone()],
@@ -2678,8 +2708,8 @@ mod tests {
         let base = SandboxPolicy::default();
         let mut provider_endpoint = endpoint("api.example.com", 443);
         provider_endpoint.protocol = "rest".to_string();
-        provider_endpoint.enforcement = "enforce".to_string();
-        provider_endpoint.access = "read-only".to_string();
+        provider_endpoint.enforcement = NetworkEnforcementMode::Enforce as i32;
+        provider_endpoint.access = NetworkAccessPreset::ReadOnly as i32;
         provider_endpoint.provider_credentialed = true;
         let mut effective = SandboxPolicy::default();
         effective.network_policies.insert(
@@ -2706,7 +2736,10 @@ mod tests {
 
         assert_eq!(rule_name, "advisor_example");
         assert_eq!(canonical.endpoints[0].protocol, "rest");
-        assert_eq!(canonical.endpoints[0].access, "read-only");
+        assert_eq!(
+            canonical.endpoints[0].access,
+            NetworkAccessPreset::ReadOnly as i32
+        );
         assert!(!canonical.endpoints[0].provider_credentialed);
         assert!(canonical.endpoints[0].advisor_proposed);
         assert_eq!(
@@ -2719,8 +2752,8 @@ mod tests {
     fn canonicalize_advisor_ignores_endpoint_provenance_when_inferring_contract() {
         let mut provider_endpoint = endpoint("api.example.com", 443);
         provider_endpoint.protocol = "rest".to_string();
-        provider_endpoint.enforcement = "enforce".to_string();
-        provider_endpoint.access = "read-only".to_string();
+        provider_endpoint.enforcement = NetworkEnforcementMode::Enforce as i32;
+        provider_endpoint.access = NetworkAccessPreset::ReadOnly as i32;
         provider_endpoint.provider_credentialed = true;
 
         let mut advisor_endpoint = provider_endpoint.clone();
@@ -2764,7 +2797,10 @@ mod tests {
 
         assert_eq!(rule_name, "advisor_example");
         assert_eq!(canonical.endpoints[0].protocol, "rest");
-        assert_eq!(canonical.endpoints[0].access, "read-only");
+        assert_eq!(
+            canonical.endpoints[0].access,
+            NetworkAccessPreset::ReadOnly as i32
+        );
         assert!(canonical.endpoints[0].advisor_proposed);
     }
 
@@ -2774,8 +2810,8 @@ mod tests {
         existing_endpoint.port = 80;
         existing_endpoint.ports = vec![80, 443];
         existing_endpoint.protocol = "rest".to_string();
-        existing_endpoint.enforcement = "enforce".to_string();
-        existing_endpoint.access = "read-only".to_string();
+        existing_endpoint.enforcement = NetworkEnforcementMode::Enforce as i32;
+        existing_endpoint.access = NetworkAccessPreset::ReadOnly as i32;
         let existing = NetworkPolicyRule {
             name: "cargo-registry".to_string(),
             endpoints: vec![existing_endpoint],
@@ -2807,7 +2843,10 @@ mod tests {
         assert_eq!(rule_name, "allow_index_crates_io_443");
         assert_eq!(canonical.endpoints[0].ports, vec![443]);
         assert_eq!(canonical.endpoints[0].protocol, "rest");
-        assert_eq!(canonical.endpoints[0].access, "read-only");
+        assert_eq!(
+            canonical.endpoints[0].access,
+            NetworkAccessPreset::ReadOnly as i32
+        );
 
         let merged = merge_policy(
             base,
@@ -3148,6 +3187,8 @@ mod tests {
         for versions in [
             &["2025-03-26"][..],
             &["2025-03-26", DEFAULT_MCP_VERSION][..],
+            &["2026-07-28"][..],
+            &[DEFAULT_MCP_VERSION, "2026-07-28"][..],
         ] {
             let existing = rule_with_authorizations(
                 "existing",
@@ -3193,6 +3234,7 @@ mod tests {
         let existing = rule_with_authorizations(
             "existing",
             vec![mcp_endpoint_with_versions(&[
+                "2026-07-28",
                 "2025-11-25",
                 "2025-03-26",
                 "2025-06-18",
@@ -3204,6 +3246,7 @@ mod tests {
             vec![mcp_endpoint_with_versions(&[
                 "2025-06-18",
                 "2025-11-25",
+                "2026-07-28",
                 "2025-03-26",
             ])],
             &["/usr/bin/new"],
@@ -3226,7 +3269,7 @@ mod tests {
                 .as_ref()
                 .expect("MCP endpoint must retain options")
                 .versions,
-            ["2025-03-26", "2025-06-18", "2025-11-25"]
+            ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
         );
     }
 
@@ -3237,6 +3280,7 @@ mod tests {
             rule_with_authorizations(
                 "mcp",
                 vec![mcp_endpoint_with_versions(&[
+                    "2026-07-28",
                     "2025-11-25",
                     "2025-03-26",
                     "2025-06-18",
@@ -3254,7 +3298,7 @@ mod tests {
                 .as_ref()
                 .expect("MCP endpoint must retain options")
                 .versions,
-            ["2025-03-26", "2025-06-18", "2025-11-25"]
+            ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
         );
     }
 
@@ -3266,6 +3310,7 @@ mod tests {
                 "2025-03-26",
                 "2025-06-18",
                 "2025-11-25",
+                "2026-07-28",
             ])],
             &["/usr/bin/client"],
         );
@@ -3280,6 +3325,7 @@ mod tests {
         let equivalent = rule_with_authorizations(
             "proposed",
             vec![mcp_endpoint_with_versions(&[
+                "2026-07-28",
                 "2025-11-25",
                 "2025-03-26",
                 "2025-06-18",
@@ -3797,8 +3843,7 @@ mod tests {
         assert!(!policy_covers_rule(&loaded, &different_body));
 
         let mut explicit_defaults = loaded_endpoint;
-        explicit_defaults.tls = "passthrough".to_string();
-        explicit_defaults.enforcement = "audit".to_string();
+        explicit_defaults.enforcement = NetworkEnforcementMode::Audit as i32;
         let runtime_defaults = rule_with_authorizations(
             "proposed",
             vec![explicit_defaults.clone()],
@@ -3806,15 +3851,7 @@ mod tests {
         );
         assert!(policy_covers_rule(&loaded, &runtime_defaults));
 
-        explicit_defaults.tls = "terminate".to_string();
-        let legacy_terminate = rule_with_authorizations(
-            "proposed",
-            vec![explicit_defaults.clone()],
-            &["/usr/bin/client"],
-        );
-        assert!(policy_covers_rule(&loaded, &legacy_terminate));
-
-        explicit_defaults.tls = "skip".to_string();
+        explicit_defaults.tls = NetworkTlsMode::Skip as i32;
         let skip_tls = rule_with_authorizations(
             "proposed",
             vec![explicit_defaults.clone()],
@@ -3822,8 +3859,8 @@ mod tests {
         );
         assert!(!policy_covers_rule(&loaded, &skip_tls));
 
-        explicit_defaults.tls.clear();
-        explicit_defaults.enforcement = "enforce".to_string();
+        explicit_defaults.tls = 0;
+        explicit_defaults.enforcement = NetworkEnforcementMode::Enforce as i32;
         let different_runtime_scalars =
             rule_with_authorizations("proposed", vec![explicit_defaults], &["/usr/bin/client"]);
         assert!(!policy_covers_rule(&loaded, &different_runtime_scalars));
@@ -4030,7 +4067,7 @@ mod tests {
                 port: 443,
                 ports: vec![443],
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
+                enforcement: NetworkEnforcementMode::Enforce as i32,
                 rules: vec![rest_rule("GET", "/repos/**")],
                 ..Default::default()
             }],
@@ -4049,7 +4086,7 @@ mod tests {
         let rule = &result.policy.network_policies["existing"];
         let endpoint = &rule.endpoints[0];
         assert_eq!(endpoint.protocol, "rest");
-        assert_eq!(endpoint.enforcement, "enforce");
+        assert_eq!(endpoint.enforcement, NetworkEnforcementMode::Enforce as i32);
         assert_eq!(endpoint.rules.len(), 1);
         assert_eq!(rule.binaries.len(), 2);
     }
@@ -4176,7 +4213,7 @@ mod tests {
                     port: 443,
                     ports: vec![443],
                     protocol: "websocket".to_string(),
-                    access: "read-write".to_string(),
+                    access: NetworkAccessPreset::ReadWrite as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -4190,7 +4227,7 @@ mod tests {
                 port: 443,
                 ports: vec![443],
                 protocol: "websocket".to_string(),
-                access: "read-write".to_string(),
+                access: NetworkAccessPreset::ReadWrite as i32,
                 websocket_credential_rewrite: true,
                 ..Default::default()
             }],
@@ -4222,7 +4259,7 @@ mod tests {
                     port: 443,
                     ports: vec![443],
                     protocol: "rest".to_string(),
-                    access: "read-write".to_string(),
+                    access: NetworkAccessPreset::ReadWrite as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -4236,7 +4273,7 @@ mod tests {
                 port: 443,
                 ports: vec![443],
                 protocol: "rest".to_string(),
-                access: "read-write".to_string(),
+                access: NetworkAccessPreset::ReadWrite as i32,
                 request_body_credential_rewrite: true,
                 ..Default::default()
             }],
@@ -4310,7 +4347,7 @@ mod tests {
                     port: 443,
                     ports: vec![443],
                     protocol: "rest".to_string(),
-                    access: "read-only".to_string(),
+                    access: NetworkAccessPreset::ReadOnly as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -4327,7 +4364,7 @@ mod tests {
         .expect("merge should succeed");
 
         let endpoint = &result.policy.network_policies["github"].endpoints[0];
-        assert!(endpoint.access.is_empty());
+        assert_eq!(endpoint.access, 0);
         assert_eq!(endpoint.rules.len(), 4);
         assert!(result.warnings.iter().any(|warning| matches!(
             warning,
@@ -4347,7 +4384,7 @@ mod tests {
                     port: 443,
                     ports: vec![443],
                     protocol: "websocket".to_string(),
-                    access: "read-write".to_string(),
+                    access: NetworkAccessPreset::ReadWrite as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -4364,7 +4401,7 @@ mod tests {
         .expect("merge should succeed");
 
         let endpoint = &result.policy.network_policies["realtime"].endpoints[0];
-        assert!(endpoint.access.is_empty());
+        assert_eq!(endpoint.access, 0);
         assert_eq!(endpoint.rules.len(), 3);
         assert!(endpoint.rules.contains(&rest_rule("GET", "**")));
         assert!(endpoint.rules.contains(&rest_rule("WEBSOCKET_TEXT", "**")));
@@ -4392,7 +4429,7 @@ mod tests {
                     port: 443,
                     ports: vec![443],
                     protocol: "websocket".to_string(),
-                    access: "read-write".to_string(),
+                    access: NetworkAccessPreset::ReadWrite as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -4430,7 +4467,7 @@ mod tests {
                     port: 5432,
                     ports: vec![5432],
                     protocol: "sql".to_string(),
-                    access: "full".to_string(),
+                    access: NetworkAccessPreset::Full as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -4840,8 +4877,8 @@ mod tests {
                 host: "api.github.com".to_string(),
                 port: 443,
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
-                access: "read-write".to_string(),
+                enforcement: NetworkEnforcementMode::Enforce as i32,
+                access: NetworkAccessPreset::ReadWrite as i32,
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {
@@ -4870,7 +4907,7 @@ mod tests {
                 host: "api.github.com".to_string(),
                 port: 443,
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
+                enforcement: NetworkEnforcementMode::Enforce as i32,
                 rules: vec![rest_rule("PUT", "/repos/owner/repo/contents/file.md")],
                 ..Default::default()
             }],
@@ -4913,7 +4950,8 @@ mod tests {
         );
         assert_eq!(provider_rule_after.binaries[0].path, "/usr/bin/gh");
         assert_eq!(
-            provider_rule_after.endpoints[0].access, "read-write",
+            provider_rule_after.endpoints[0].access,
+            NetworkAccessPreset::ReadWrite as i32,
             "provider rule's `access` shorthand must remain intact"
         );
         assert!(
@@ -5119,7 +5157,7 @@ mod tests {
             (
                 "enforcement",
                 NetworkEndpoint {
-                    enforcement: "enforce".to_string(),
+                    enforcement: NetworkEnforcementMode::Enforce as i32,
                     ..endpoint("api.example.com", 443)
                 },
             ),
@@ -5127,14 +5165,14 @@ mod tests {
                 "protocol",
                 NetworkEndpoint {
                     protocol: "rest".to_string(),
-                    access: "read-write".to_string(),
+                    access: NetworkAccessPreset::ReadWrite as i32,
                     ..endpoint("api.example.com", 443)
                 },
             ),
             (
                 "tls",
                 NetworkEndpoint {
-                    tls: "skip".to_string(),
+                    tls: NetworkTlsMode::Skip as i32,
                     ..endpoint("api.example.com", 443)
                 },
             ),
@@ -5507,7 +5545,7 @@ mod tests {
                 rule_with_authorizations(
                     "existing",
                     vec![NetworkEndpoint {
-                        enforcement: "enforce".to_string(),
+                        enforcement: NetworkEnforcementMode::Enforce as i32,
                         ..endpoint("api.example.com", 443)
                     }],
                     &["/usr/bin/trusted"],
@@ -5572,7 +5610,7 @@ mod tests {
             (
                 "enforcement",
                 NetworkEndpoint {
-                    enforcement: "enforce".to_string(),
+                    enforcement: NetworkEnforcementMode::Enforce as i32,
                     ..endpoint("api.example.com", 443)
                 },
             ),
@@ -5580,14 +5618,14 @@ mod tests {
                 "protocol",
                 NetworkEndpoint {
                     protocol: "rest".to_string(),
-                    access: "read-write".to_string(),
+                    access: NetworkAccessPreset::ReadWrite as i32,
                     ..endpoint("api.example.com", 443)
                 },
             ),
             (
                 "tls",
                 NetworkEndpoint {
-                    tls: "skip".to_string(),
+                    tls: NetworkTlsMode::Skip as i32,
                     ..endpoint("api.example.com", 443)
                 },
             ),
@@ -5595,7 +5633,7 @@ mod tests {
                 "access",
                 NetworkEndpoint {
                     protocol: "rest".to_string(),
-                    access: "read-only".to_string(),
+                    access: NetworkAccessPreset::ReadOnly as i32,
                     ..endpoint("api.example.com", 443)
                 },
             ),
@@ -5655,7 +5693,7 @@ mod tests {
             "existing",
             vec![NetworkEndpoint {
                 protocol: "rest".to_string(),
-                access: "read-write".to_string(),
+                access: NetworkAccessPreset::ReadWrite as i32,
                 ..endpoint("api.example.com", 443)
             }],
             &["/usr/bin/trusted"],
@@ -5664,7 +5702,7 @@ mod tests {
             "existing",
             vec![NetworkEndpoint {
                 protocol: "websocket".to_string(),
-                access: "read-write".to_string(),
+                access: NetworkAccessPreset::ReadWrite as i32,
                 ..endpoint("api.example.com", 443)
             }],
             &["/usr/bin/trusted", "/usr/bin/second"],
@@ -6847,7 +6885,7 @@ mod tests {
             vec![NetworkEndpoint {
                 path: "/graphql".to_string(),
                 protocol: "graphql".to_string(),
-                access: "read-only".to_string(),
+                access: NetworkAccessPreset::ReadOnly as i32,
                 ..endpoint("api.github.com", 443)
             }],
             &["/usr/bin/only"],
@@ -6875,7 +6913,7 @@ mod tests {
             vec![NetworkEndpoint {
                 path: "/**".to_string(),
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
+                enforcement: NetworkEnforcementMode::Enforce as i32,
                 rules: vec![rest_rule("POST", "/**")],
                 ..endpoint("svc.example.com", 443)
             }],

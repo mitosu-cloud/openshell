@@ -32,6 +32,8 @@ from openshell.sandbox import (
     SandboxRef,
     SandboxStatusRef,
     SandboxTemplateClient,
+    ServiceAuthorizationMode,
+    ServiceExposure,
     TlsConfig,
     _atomic_replace,
     _BearerAuthInterceptor,
@@ -54,6 +56,13 @@ def _request_workspace(request: Any) -> str | None:
 
 def _request_selects_all_workspaces(request: Any) -> bool:
     return request.workspace_scope.WhichOneof("selection") == "all_workspaces"
+
+
+def _request_sandbox(request: Any) -> str:
+    name = getattr(request, "name", "")
+    if name:
+        return cast("str", name)
+    return cast("str", request.sandbox)
 
 
 def _client_credentials_fixture() -> dict[str, Any]:
@@ -434,7 +443,12 @@ def test_exec_sends_stdin_payload() -> None:
     stub = _FakeStub()
     client = _client_with_fake_stub(stub)
 
-    result = client.exec("sandbox-1", ["python", "-c", "print('ok')"], stdin=b"payload")
+    result = client.exec(
+        "sandbox-1",
+        ["python", "-c", "print('ok')"],
+        workspace="default",
+        stdin=b"payload",
+    )
 
     assert result.exit_code == 0
     assert stub.request is not None
@@ -448,7 +462,7 @@ def test_exec_python_serializes_callable_payload() -> None:
     def add(a: int, b: int) -> int:
         return a + b
 
-    result = client.exec_python("sandbox-1", add, args=(2, 3))
+    result = client.exec_python("sandbox-1", add, workspace="default", args=(2, 3))
 
     assert result.exit_code == 0
     assert stub.request is not None
@@ -2002,7 +2016,7 @@ class _FakeSandboxStub:
         return SimpleNamespace(
             sandbox=_make_sandbox_proto(
                 "sandbox-1",
-                request.name,
+                _request_sandbox(request),
                 workspace=_request_workspace(request) or "default",
             )
         )
@@ -2026,7 +2040,7 @@ class _FakeSandboxStub:
         return SimpleNamespace(
             sandbox=_make_sandbox_proto(
                 "sandbox-1",
-                request.name,
+                _request_sandbox(request),
                 phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
                 workspace=_request_workspace(request) or "default",
             )
@@ -2042,7 +2056,7 @@ class _FakeSandboxStub:
         return SimpleNamespace(
             sandbox=_make_sandbox_proto(
                 "sandbox-1",
-                request.name,
+                _request_sandbox(request),
                 phase=openshell_pb2.SANDBOX_PHASE_STARTING,
                 workspace=_request_workspace(request) or "default",
             )
@@ -2061,7 +2075,11 @@ class _FakeSandboxStub:
                 request.name or "generated",
                 dict(request.labels),
                 workspace=_request_workspace(request) or "default",
-            )
+            ),
+            service_urls={
+                exposure.service: f"https://{exposure.service}.example.test/"
+                for exposure in request.service_exposures
+            },
         )
 
     def ListSandboxes(
@@ -2153,14 +2171,14 @@ class _RecordingHighLevelClient:
         self,
         *,
         workspace: str,
-        template_name: str,
+        workload_template: str,
         spec: Any = None,
         name: str | None = None,
         labels: Any = None,
     ) -> Any:
         self.create_template_kwargs = {
             "workspace": workspace,
-            "template_name": template_name,
+            "workload_template": workload_template,
             "spec": spec,
             "name": name,
             "labels": labels,
@@ -2193,7 +2211,42 @@ def test_create_forwards_name_and_labels() -> None:
     assert dict(ref.labels) == {"aiq": "deep-research"}
 
 
-def test_create_from_template_forwards_workload_template_name() -> None:
+def test_create_forwards_service_exposures() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.create(
+        workspace="default",
+        name="app-server",
+        service_exposures=[
+            ServiceExposure(target_port=4500),
+            ServiceExposure(
+                service="metrics",
+                target_port=9090,
+                authorization_mode=ServiceAuthorizationMode.BEARER_PASSTHROUGH,
+            ),
+        ],
+    )
+
+    assert stub.create_request is not None
+    assert [
+        (exposure.service, exposure.target_port, exposure.authorization_mode)
+        for exposure in stub.create_request.service_exposures
+    ] == [
+        ("", 4500, openshell_pb2.SERVICE_AUTHORIZATION_MODE_STRIP),
+        (
+            "metrics",
+            9090,
+            openshell_pb2.SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH,
+        ),
+    ]
+    assert dict(ref.service_urls) == {
+        "": "https://.example.test/",
+        "metrics": "https://metrics.example.test/",
+    }
+
+
+def test_create_from_template_forwards_workload_template() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
     spec = openshell_pb2.SandboxSpec(
@@ -2204,7 +2257,7 @@ def test_create_from_template_forwards_workload_template_name() -> None:
 
     ref = client.create_from_template(
         workspace="default",
-        template_name="gpu-kata",
+        workload_template="gpu-kata",
         spec=spec,
         name="job-1",
         labels={"team": "runtime"},
@@ -2212,7 +2265,7 @@ def test_create_from_template_forwards_workload_template_name() -> None:
 
     assert stub.create_request is not None
     assert stub.create_request.name == "job-1"
-    assert stub.create_request.workload_template_name == "gpu-kata"
+    assert stub.create_request.workload_template == "gpu-kata"
     assert dict(stub.create_request.labels) == {"team": "runtime"}
     assert list(stub.create_request.spec.providers) == ["github"]
     assert list(stub.create_request.spec.command) == ["/opt/worker", "--serve"]
@@ -2220,12 +2273,12 @@ def test_create_from_template_forwards_workload_template_name() -> None:
     assert dict(ref.labels) == {"team": "runtime"}
 
 
-def test_create_from_template_rejects_empty_template_name() -> None:
+def test_create_from_template_rejects_empty_workload_template() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
     with pytest.raises(SandboxError):
-        client.create_from_template(workspace="default", template_name=" ")
+        client.create_from_template(workspace="default", workload_template=" ")
 
     assert stub.create_request is None
 
@@ -2448,13 +2501,13 @@ def test_stop_and_start_forward_workspace_and_return_phase() -> None:
 
     stopped = client.stop("job-1", workspace="team-a")
     assert stub.stop_request is not None
-    assert stub.stop_request.name == "job-1"
+    assert _request_sandbox(stub.stop_request) == "job-1"
     assert _request_workspace(stub.stop_request) == "team-a"
     assert stopped.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
 
     starting = client.start("job-1", workspace="team-a")
     assert stub.start_request is not None
-    assert stub.start_request.name == "job-1"
+    assert _request_sandbox(stub.start_request) == "job-1"
     assert _request_workspace(stub.start_request) == "team-a"
     assert starting.phase == openshell_pb2.SANDBOX_PHASE_STARTING
 
@@ -2479,7 +2532,7 @@ def test_wait_ready_handles_terminal_main_process_results(
             return SimpleNamespace(
                 sandbox=_make_sandbox_proto(
                     "sandbox-1",
-                    request.name,
+                    _request_sandbox(request),
                     phase=phase,
                     workspace=_request_workspace(request) or "default",
                 )
@@ -2611,6 +2664,49 @@ def test_pager_retries_same_token_after_fetch_error() -> None:
     assert tokens == ["resume", "resume"]
 
 
+def test_pager_rejects_a_repeated_continuation_token() -> None:
+    pager = Pager(
+        lambda token: Page(items=[1], next_page_token=token),
+        page_token="resume",
+    )
+
+    with pytest.raises(SandboxError, match="repeated continuation token"):
+        next(pager)
+
+
+def test_pager_bounds_consumed_token_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox_module, "_PAGER_MAX_CONSUMED_TOKENS", 1)
+    requests: list[str] = []
+    pager = Pager(
+        lambda token: (
+            requests.append(token),
+            Page(items=[token], next_page_token="next"),
+        )[1],
+        page_token="first",
+    )
+
+    assert next(pager).items == ["first"]
+    with pytest.raises(SandboxError, match="token history limit exceeded"):
+        next(pager)
+    assert requests == ["first"]
+
+
+def test_pager_bounds_consumed_token_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox_module, "_PAGER_MAX_CONSUMED_TOKEN_BYTES", 1)
+    requests: list[str] = []
+    pager = Pager(
+        lambda token: (
+            requests.append(token),
+            Page(items=[token], next_page_token="next"),
+        )[1],
+        page_token="too-large",
+    )
+
+    with pytest.raises(SandboxError, match="token history limit exceeded"):
+        next(pager)
+    assert requests == []
+
+
 def test_list_ids_forwards_label_selector() -> None:
     stub = _FakeSandboxStub(listed=[_make_sandbox_proto("sandbox-1", "job-1")])
     client = _client_with_fake_stub(stub)
@@ -2635,10 +2731,16 @@ def test_sandbox_ref_retains_gateway_labels() -> None:
 def test_sandbox_ref_includes_main_process_result() -> None:
     proto = _make_sandbox_proto("sandbox-1", "job-1")
     proto.status.exit_code = 0
+    proto.status.restart_count = 2
+    proto.status.next_restart_time.FromMilliseconds(1_700_000_000_000)
+    proto.status.main_process_started_time.FromMilliseconds(1_699_999_000_000)
 
     status = _sandbox_ref(proto).status
 
     assert status.exit_code == 0
+    assert status.restart_count == 2
+    assert status.next_restart_at_ms == 1_700_000_000_000
+    assert status.main_process_started_at_ms == 1_699_999_000_000
 
 
 def test_returned_labels_are_immutable() -> None:
@@ -2736,7 +2838,7 @@ def test_high_level_creation_forwards_name_and_labels(
     }
 
 
-def test_high_level_template_creation_forwards_template_name(
+def test_high_level_template_creation_forwards_workload_template(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     recording = _RecordingHighLevelClient()
@@ -2753,7 +2855,7 @@ def test_high_level_template_creation_forwards_template_name(
     )
     sandbox = Sandbox(
         workspace="staging",
-        template_name="gpu-kata",
+        workload_template="gpu-kata",
         spec=spec,
         name="job-1",
         labels={"team": "runtime"},
@@ -2763,7 +2865,7 @@ def test_high_level_template_creation_forwards_template_name(
 
     assert recording.create_template_kwargs == {
         "workspace": "staging",
-        "template_name": "gpu-kata",
+        "workload_template": "gpu-kata",
         "spec": spec,
         "name": "job-1",
         "labels": {"team": "runtime"},
@@ -2794,9 +2896,9 @@ def test_high_level_attach_rejects_labels() -> None:
         sandbox.__enter__()
 
 
-def test_high_level_attach_rejects_template_name() -> None:
+def test_high_level_attach_rejects_workload_template() -> None:
     sandbox = Sandbox(
-        workspace="default", sandbox="existing-sandbox", template_name="gpu-kata"
+        workspace="default", sandbox="existing-sandbox", workload_template="gpu-kata"
     )
 
     with pytest.raises(SandboxError):

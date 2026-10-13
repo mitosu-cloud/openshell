@@ -90,7 +90,7 @@ impl HttpMiddlewareExchange {
             request_context: openshell_core::proto::RequestContext {
                 request_id: self.request_id.clone(),
                 sandbox_id: sandbox.sandbox_id.clone(),
-                sandbox_name: sandbox.sandbox_name.clone(),
+                sandbox: sandbox.sandbox_name.clone(),
                 workspace: ctx.workspace.clone(),
                 originating_process: None,
             },
@@ -1213,6 +1213,7 @@ mod tests {
             product_version: "0".into(),
             proxy_ip: [127, 0, 0, 1].into(),
             proxy_port: 3128,
+            origin: openshell_ocsf::EventOrigin::Supervisor,
         };
 
         let eval = L7EvalContext {

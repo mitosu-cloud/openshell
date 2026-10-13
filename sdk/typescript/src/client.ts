@@ -22,7 +22,9 @@ import type { Sandbox, SandboxWorkloadTemplate, UpdateConfigResponse } from './g
 import {
   type ExecSandboxInputSchema,
   OpenShell,
+  ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
   SandboxPhase,
+  SandboxRestartPolicy,
   type SandboxSpecSchema,
   type SandboxWorkloadTemplateSchema,
   ServiceStatus,
@@ -84,6 +86,9 @@ export type SandboxPhaseName =
   | 'starting'
   | 'completed';
 
+/** Restart behavior after the canonical main process exits. */
+export type SandboxRestartPolicyName = 'never' | 'on-failure' | 'always';
+
 /** Lowercase mirror of the generated `ServiceStatus` enum. Hand-maintained. */
 export type HealthStatus = 'unspecified' | 'healthy' | 'degraded' | 'unhealthy';
 
@@ -139,6 +144,10 @@ export interface SandboxSpec {
   command?: string[];
   /** Allocate a retained pseudo-terminal for the canonical command. */
   tty?: boolean;
+  /** Loopback HTTP services to expose when the sandbox is created. */
+  serviceExposures?: ServiceExposure[];
+  /** Restart behavior after the canonical main process exits. */
+  restartPolicy?: SandboxRestartPolicyName;
   /**
    * Create-time sandbox policy (the safety boundary). Sandbox-scoped
    * `setPolicy` cannot introduce static fields later, so express filesystem,
@@ -155,17 +164,43 @@ export interface SandboxSpec {
   rawSpec?: MessageInitShape<typeof SandboxSpecSchema>;
 }
 
+export interface ServiceExposure {
+  /** Service name. Empty or omitted selects the unnamed endpoint. */
+  service?: string;
+  /** Loopback TCP port inside the sandbox. */
+  targetPort: number;
+  /** Handling for an incoming application Authorization header. */
+  authorizationMode?: ServiceAuthorizationMode;
+}
+
+export enum ServiceAuthorizationMode {
+  Strip = 'strip',
+  BearerPassthrough = 'bearer_passthrough',
+}
+
+function serviceAuthorizationModeToProto(mode: ServiceAuthorizationMode | undefined): ProtoServiceAuthorizationMode {
+  switch (mode) {
+    case ServiceAuthorizationMode.BearerPassthrough:
+      return ProtoServiceAuthorizationMode.BEARER_PASSTHROUGH;
+    case ServiceAuthorizationMode.Strip:
+    case undefined:
+      return ProtoServiceAuthorizationMode.STRIP;
+  }
+}
+
 export interface SandboxFromTemplateSpec {
   name?: string;
   /** Workspace name. Omit for `default`; empty strings are invalid. */
   workspace?: string;
-  templateName: string;
+  workloadTemplate: string;
   labels?: Record<string, string>;
   providers?: string[];
   /** Exact canonical command. Empty selects the gateway scratch shell. */
   command?: string[];
   /** Allocate a retained pseudo-terminal for the canonical command. */
   tty?: boolean;
+  /** Loopback HTTP services to expose when the sandbox is created. */
+  serviceExposures?: ServiceExposure[];
   /**
    * Create-time sandbox policy (the safety boundary). The named workload
    * template supplies runtime workload fields.
@@ -184,6 +219,11 @@ export interface SandboxRef {
   mainProcessInstanceId?: string;
   exitCode?: number;
   createdFromWorkloadTemplate?: SandboxWorkloadTemplateProvenance;
+  /** Service URLs returned by creation, keyed by service name. */
+  serviceUrls: Record<string, string>;
+  restartCount: number;
+  nextRestartAtMs?: number;
+  mainProcessStartedAtMs?: number;
 }
 
 export interface SandboxWorkloadTemplateProvenance {
@@ -210,6 +250,14 @@ export interface SandboxWorkspaceOptions {
   /** Workspace name. Omit for `default`; empty strings are invalid. */
   workspace?: string;
 }
+
+/** Pagination and workspace scope for providers attached to one sandbox. */
+export type SandboxProviderListOptions = SandboxWorkspaceOptions & {
+  /** Maximum providers requested per page. */
+  pageSize?: number;
+  /** Opaque token from a previous page. Omit to start at the beginning. */
+  pageToken?: string;
+};
 
 export type SandboxCallOptions = CallOptions & SandboxWorkspaceOptions;
 
@@ -451,6 +499,17 @@ export const POLICY_SOURCE_NAMES: Record<PolicySource, PolicySourceName> = {
 function phaseName(p: SandboxPhase): SandboxPhaseName {
   return PHASE_NAMES[p] ?? 'unspecified';
 }
+
+function restartPolicyValue(policy: SandboxRestartPolicyName | undefined): SandboxRestartPolicy {
+  switch (policy) {
+    case 'on-failure':
+      return SandboxRestartPolicy.ON_FAILURE;
+    case 'always':
+      return SandboxRestartPolicy.ALWAYS;
+    default:
+      return SandboxRestartPolicy.NEVER;
+  }
+}
 function statusName(s: ServiceStatus): HealthStatus {
   return STATUS_NAMES[s] ?? 'unspecified';
 }
@@ -461,12 +520,14 @@ function policySourceName(s: PolicySource): PolicySourceName {
   return POLICY_SOURCE_NAMES[s] ?? 'unspecified';
 }
 
-function sandboxRef(sandbox: Sandbox | undefined): SandboxRef {
+function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, string> = {}): SandboxRef {
   if (!sandbox) throw new SdkError('invalid_config', 'sandbox missing from gateway response');
   const meta = sandbox.metadata;
   if (!meta?.id || !meta.name) {
     throw new SdkError('invalid_config', 'sandbox metadata.id and metadata.name are required in gateway responses');
   }
+  const nextRestartAtMs = timestampMillis(sandbox.status?.nextRestartTime);
+  const mainProcessStartedAtMs = timestampMillis(sandbox.status?.mainProcessStartedTime);
   return {
     id: meta.id,
     name: meta.name,
@@ -482,6 +543,10 @@ function sandboxRef(sandbox: Sandbox | undefined): SandboxRef {
           resourceVersion: sandbox.createdFromWorkloadTemplate.resourceVersion,
         }
       : undefined,
+    serviceUrls,
+    restartCount: sandbox.status?.restartCount ?? 0,
+    nextRestartAtMs: nextRestartAtMs ? Number(nextRestartAtMs) : undefined,
+    mainProcessStartedAtMs: mainProcessStartedAtMs ? Number(mainProcessStartedAtMs) : undefined,
   };
 }
 
@@ -567,6 +632,14 @@ function workspaceScope(options?: SandboxWorkspaceOptions | null): MessageInitSh
 
 function listWorkspaceScope(options?: WorkspaceListScope | null): MessageInitShape<typeof WorkspaceSelectorSchema> {
   return options?.allWorkspaces ? { selection: { case: 'allWorkspaces', value: {} } } : workspaceScope(options);
+}
+
+function sandboxTarget(name: string, options?: SandboxWorkspaceOptions | null) {
+  return { sandbox: name, workspaceScope: workspaceScope(options) };
+}
+
+function namedTarget(name: string, options?: SandboxWorkspaceOptions | null) {
+  return { name, workspaceScope: workspaceScope(options) };
 }
 
 function requestCallOptions(options?: SandboxCallOptions | null): CallOptions | undefined {
@@ -759,21 +832,49 @@ export interface Page<T> {
   readonly nextPageToken: string;
 }
 
+const maxConsumedPageTokens = 10_000;
+const maxConsumedPageTokenBytes = 1 << 20;
+
 /** Lazy, single-pass iterator that fetches one RPC page per advance. */
 export class Pager<T> implements AsyncIterable<Page<T>> {
   private nextToken: string | undefined;
+  private readonly consumedTokens = new Set<string>();
+  private consumedTokenBytes = 0;
 
   constructor(
     private readonly fetch: (pageToken: string) => Promise<Page<T>>,
     pageToken = '',
+    private readonly maxConsumedTokens = maxConsumedPageTokens,
+    private readonly maxConsumedTokenBytes = maxConsumedPageTokenBytes,
   ) {
     this.nextToken = pageToken;
+  }
+
+  private validateCurrentTokenBudget(pageToken: string): number {
+    if (pageToken === '') return 0;
+    const tokenBytes = new TextEncoder().encode(pageToken).byteLength;
+    if (
+      this.consumedTokens.size >= this.maxConsumedTokens ||
+      tokenBytes > this.maxConsumedTokenBytes - this.consumedTokenBytes
+    ) {
+      throw new Error('pager continuation token history limit exceeded');
+    }
+    return tokenBytes;
   }
 
   /** Fetch the next page, or return undefined after the final page. */
   async nextPage(): Promise<Page<T> | undefined> {
     if (this.nextToken === undefined) return undefined;
-    const page = await this.fetch(this.nextToken);
+    const pageToken = this.nextToken;
+    const tokenBytes = this.validateCurrentTokenBudget(pageToken);
+    const page = await this.fetch(pageToken);
+    if (pageToken !== '') {
+      this.consumedTokens.add(pageToken);
+      this.consumedTokenBytes += tokenBytes;
+    }
+    if (page.nextPageToken !== '' && this.consumedTokens.has(page.nextPageToken)) {
+      throw new Error('pager received a repeated continuation token');
+    }
     this.nextToken = page.nextPageToken === '' ? undefined : page.nextPageToken;
     return page;
   }
@@ -821,8 +922,8 @@ export class SandboxTemplateClient {
   ): Promise<SandboxWorkloadTemplate> {
     try {
       const resp = await this.grpc.createSandboxTemplate({
-        template,
         workspaceScope: workspaceScope(options),
+        template,
       });
       return sandboxTemplate(resp.template);
     } catch (e) {
@@ -834,8 +935,8 @@ export class SandboxTemplateClient {
     if (name.trim() === '') throw new SdkError('invalid_config', 'template name is required');
     try {
       const resp = await this.grpc.getSandboxTemplate({
-        name,
         workspaceScope: workspaceScope(options),
+        name,
       });
       return sandboxTemplate(resp.template);
     } catch (e) {
@@ -868,9 +969,9 @@ export class SandboxTemplateClient {
     if (name.trim() === '') throw new SdkError('invalid_config', 'template name is required');
     try {
       const resp = await this.grpc.deleteSandboxTemplate({
+        workspaceScope: workspaceScope(options),
         allowMissing: options?.allowMissing ?? false,
         name,
-        workspaceScope: workspaceScope(options),
       });
       return deletionResult(resp);
     } catch (e) {
@@ -927,37 +1028,50 @@ export class SandboxClient {
         policy: spec.policy,
         command: spec.command ?? [],
         tty: spec.tty ?? false,
+        restartPolicy: restartPolicyValue(spec.restartPolicy),
       };
       if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
 
       const resp = await this.grpc.createSandbox({
+        workspaceScope: workspaceScope(spec),
         name: spec.name ?? '',
         labels: spec.labels ?? {},
-        workspaceScope: workspaceScope(spec),
         spec: specInit,
+        serviceExposures:
+          spec.serviceExposures?.map((exposure) => ({
+            service: exposure.service ?? '',
+            targetPort: exposure.targetPort,
+            authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
+          })) ?? [],
       });
-      return sandboxRef(resp.sandbox);
+      return sandboxRef(resp.sandbox, resp.serviceUrls);
     } catch (e) {
       throw fromConnect(e);
     }
   }
 
   async createFromTemplate(spec: SandboxFromTemplateSpec): Promise<SandboxRef> {
-    if (spec.templateName.trim() === '') throw new SdkError('invalid_config', 'templateName is required');
+    if (spec.workloadTemplate.trim() === '') throw new SdkError('invalid_config', 'workloadTemplate is required');
     try {
       const resp = await this.grpc.createSandbox({
+        workspaceScope: workspaceScope(spec),
         name: spec.name ?? '',
         labels: spec.labels ?? {},
-        workspaceScope: workspaceScope(spec),
         spec: {
           providers: spec.providers ?? [],
           command: spec.command ?? [],
           tty: spec.tty ?? false,
           policy: spec.policy,
         },
-        workloadTemplateName: spec.templateName,
+        workloadTemplate: spec.workloadTemplate,
+        serviceExposures:
+          spec.serviceExposures?.map((exposure) => ({
+            service: exposure.service ?? '',
+            targetPort: exposure.targetPort,
+            authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
+          })) ?? [],
       });
-      return sandboxRef(resp.sandbox);
+      return sandboxRef(resp.sandbox, resp.serviceUrls);
     } catch (e) {
       throw fromConnect(e);
     }
@@ -965,10 +1079,7 @@ export class SandboxClient {
 
   async get(name: string, options?: SandboxCallOptions | null): Promise<SandboxRef> {
     try {
-      const resp = await this.grpc.getSandbox(
-        { name, workspaceScope: workspaceScope(options) },
-        requestCallOptions(options),
-      );
+      const resp = await this.grpc.getSandbox({ ...namedTarget(name, options) }, requestCallOptions(options));
       return sandboxRef(resp.sandbox);
     } catch (e) {
       throw fromConnect(e);
@@ -1002,8 +1113,7 @@ export class SandboxClient {
   async delete(name: string, options?: DeleteOptions | null): Promise<DeletionResult> {
     try {
       const resp = await this.grpc.deleteSandbox({
-        name,
-        workspaceScope: workspaceScope(options),
+        ...namedTarget(name, options),
         allowMissing: options?.allowMissing ?? false,
       });
       return deletionResult(resp);
@@ -1075,14 +1185,14 @@ export class SandboxClient {
     options?: ExecOptions | null,
   ): AsyncGenerator<ExecStreamEvent, void, void> {
     try {
-      // Resolve the sandbox id first, exactly like the gateway client.
-      const sandbox = await this.get(name, {
+      // Preserve the existing preflight so lookup failures surface before the stream starts.
+      await this.get(name, {
         workspace: options?.workspace,
         ...(options?.signal ? { signal: options.signal } : {}),
       });
       const stream = this.grpc.execSandbox(
         {
-          sandboxId: sandbox.id,
+          ...sandboxTarget(name, options),
           command,
           workdir: options?.workdir ?? '',
           environment: options?.environment ?? {},
@@ -1151,11 +1261,8 @@ export class SandboxClient {
     command: string[],
     options?: ExecInteractiveOptions | null,
   ): Promise<ExecInteractiveSessionControl> {
-    let sandboxId: string;
     try {
-      sandboxId = (
-        await this.get(name, { workspace: options?.workspace, ...(options?.signal ? { signal: options.signal } : {}) })
-      ).id;
+      await this.get(name, { workspace: options?.workspace, ...(options?.signal ? { signal: options.signal } : {}) });
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
     }
@@ -1165,7 +1272,7 @@ export class SandboxClient {
       payload: {
         case: 'start',
         value: {
-          sandboxId,
+          ...sandboxTarget(name, options),
           command,
           workdir: options?.workdir ?? '',
           environment: options?.environment ?? {},
@@ -1350,7 +1457,15 @@ export class SandboxClient {
       socket.on('error', () => {});
       const controller = new AbortController();
       controllers.add(controller);
-      const task = this.forwardConnection(socket, sandboxId, name, targetHost, targetPort, controller.signal)
+      const task = this.forwardConnection(
+        socket,
+        sandboxId,
+        name,
+        opts.workspace,
+        targetHost,
+        targetPort,
+        controller.signal,
+      )
         .catch((error: unknown) => {
           if (!closing) {
             try {
@@ -1430,6 +1545,7 @@ export class SandboxClient {
     socket: net.Socket,
     sandboxId: string,
     name: string,
+    workspace: string | undefined,
     targetHost: string,
     targetPort: number,
     signal: AbortSignal,
@@ -1438,7 +1554,7 @@ export class SandboxClient {
     const input = new Pushable<MessageInitShape<typeof TcpForwardFrameSchema>>();
     input.onDrain = () => socket.resume();
     try {
-      const session = await this.grpc.createSshSession({ sandboxId }, { signal });
+      const session = await this.grpc.createSshSession({ ...sandboxTarget(name, { workspace }) }, { signal });
       // Defense-in-depth: the token feeds forwardTcp authorization, so hold it
       // to the same trust-boundary contract as createSshSession. A violation
       // tears down this one socket via the catch below.
@@ -1448,7 +1564,7 @@ export class SandboxClient {
         payload: {
           case: 'init',
           value: {
-            sandboxId,
+            ...sandboxTarget(name, { workspace }),
             serviceId: `service-forward:${name}:${targetHost}:${targetPort}`,
             target: {
               case: 'tcp',
@@ -1511,7 +1627,7 @@ export class SandboxClient {
   async createSshSession(name: string, options?: SandboxWorkspaceOptions | null): Promise<SshSession> {
     try {
       const sandbox = await this.get(name, options);
-      const resp = await this.grpc.createSshSession({ sandboxId: sandbox.id });
+      const resp = await this.grpc.createSshSession({ ...sandboxTarget(name, options) });
       // Reject any response outside the proto trust-boundary contract before
       // handing these values to the caller (they feed OpenSSH ProxyCommand).
       validateSshResponse(resp, sandbox.id);
@@ -1545,10 +1661,9 @@ export class SandboxClient {
   ): Promise<ProviderChange> {
     try {
       const resp = await this.grpc.attachSandboxProvider({
-        sandboxName: name,
-        providerName: provider,
+        ...sandboxTarget(name, options),
+        provider,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        workspaceScope: workspaceScope(options),
       });
       return { sandbox: sandboxRef(resp.sandbox), changed: resp.attached };
     } catch (e) {
@@ -1563,10 +1678,9 @@ export class SandboxClient {
   ): Promise<ProviderChange> {
     try {
       const resp = await this.grpc.detachSandboxProvider({
-        sandboxName: name,
-        providerName: provider,
+        ...sandboxTarget(name, options),
+        provider,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        workspaceScope: workspaceScope(options),
       });
       return { sandbox: sandboxRef(resp.sandbox), changed: resp.detached };
     } catch (e) {
@@ -1574,22 +1688,33 @@ export class SandboxClient {
     }
   }
 
-  async listProviders(name: string, options?: SandboxWorkspaceOptions | null): Promise<ProviderRef[]> {
-    try {
-      const resp = await this.grpc.listSandboxProviders({
-        sandboxName: name,
-        workspaceScope: workspaceScope(options),
-      });
-      return resp.providers.map((p) => providerRef(p));
-    } catch (e) {
-      throw fromConnect(e);
-    }
+  listProviders(name: string, options?: SandboxProviderListOptions | null): Pager<ProviderRef> {
+    return new Pager(async (pageToken) => {
+      try {
+        const resp = await this.grpc.listSandboxProviders({
+          ...sandboxTarget(name, options),
+          pageSize: options?.pageSize ?? 0,
+          pageToken,
+        });
+        return {
+          items: resp.providers.map((provider) => providerRef(provider)),
+          nextPageToken: resp.nextPageToken,
+        };
+      } catch (e) {
+        throw fromConnect(e);
+      }
+    }, options?.pageToken ?? '');
+  }
+
+  /** List and collect every provider attached to this sandbox. */
+  async listAllProviders(name: string, options?: SandboxProviderListOptions | null): Promise<ProviderRef[]> {
+    return this.listProviders(name, options).all();
   }
 
   async getConfig(name: string, options?: SandboxCallOptions | null): Promise<SandboxConfig> {
     try {
-      const sandbox = await this.get(name, options);
-      const resp = await this.grpc.getSandboxConfig({ sandboxId: sandbox.id }, requestCallOptions(options));
+      await this.get(name, options);
+      const resp = await this.grpc.getSandboxConfig({ ...namedTarget(name, options) }, requestCallOptions(options));
       return sandboxConfig(resp);
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
@@ -1607,11 +1732,10 @@ export class SandboxClient {
   ): Promise<UpdateConfigResult> {
     try {
       const resp = await this.grpc.updateConfig({
-        name,
+        ...sandboxTarget(name, options),
         policy,
         global: false,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        workspaceScope: workspaceScope(options),
       });
       const result = updateConfigResult(resp);
       if (options?.wait)
@@ -1632,11 +1756,10 @@ export class SandboxClient {
   ): Promise<UpdateConfigResult> {
     try {
       const resp = await this.grpc.updateConfig({
-        name,
+        ...sandboxTarget(name, options),
         settingKey: key,
         settingValue: value,
         global: false,
-        workspaceScope: workspaceScope(options),
       });
       return updateConfigResult(resp);
     } catch (e) {

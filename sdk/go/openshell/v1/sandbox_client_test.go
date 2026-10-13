@@ -25,26 +25,28 @@ import (
 
 type mockSandboxServer struct {
 	pb.UnimplementedOpenShellServer
-	mu                 sync.Mutex
-	sandboxes          map[string]*pb.Sandbox
-	providers          map[string][]*dm.Provider
-	createErr          error
-	getErr             error
-	listErr            error
-	listPages          [][]*pb.Sandbox
-	listRequests       []*pb.ListSandboxesRequest
-	deleteErr          error
-	deleteResponse     *pb.DeleteSandboxResponse
-	deleteRequest      *pb.DeleteSandboxRequest
-	attachErr          error
-	detachErr          error
-	listProvErr        error
-	createRequest      *pb.CreateSandboxRequest
-	watchEvents        []*pb.SandboxStreamEvent
-	watchErr           error
-	watchPostEventsErr error
-	watchKeepOpen      chan struct{}           // if non-nil, WatchSandbox blocks after sending events until closed
-	watchRequest       *pb.WatchSandboxRequest // recorded request
+	mu                   sync.Mutex
+	sandboxes            map[string]*pb.Sandbox
+	providers            map[string][]*dm.Provider
+	createErr            error
+	getErr               error
+	listErr              error
+	listPages            [][]*pb.Sandbox
+	listRequests         []*pb.ListSandboxesRequest
+	listProviderPages    [][]*dm.Provider
+	listProviderRequests []*pb.ListSandboxProvidersRequest
+	deleteErr            error
+	deleteResponse       *pb.DeleteSandboxResponse
+	deleteRequest        *pb.DeleteSandboxRequest
+	attachErr            error
+	detachErr            error
+	listProvErr          error
+	createRequest        *pb.CreateSandboxRequest
+	watchEvents          []*pb.SandboxStreamEvent
+	watchErr             error
+	watchPostEventsErr   error
+	watchKeepOpen        chan struct{}           // if non-nil, WatchSandbox blocks after sending events until closed
+	watchRequest         *pb.WatchSandboxRequest // recorded request
 
 	// GetLogs fields
 	getLogsResp    *pb.GetSandboxLogsResponse
@@ -78,7 +80,11 @@ func (s *mockSandboxServer) CreateSandbox(_ context.Context, req *pb.CreateSandb
 		Status: &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_PROVISIONING},
 	}
 	s.sandboxes[req.GetName()] = sb
-	return &pb.SandboxResponse{Sandbox: sb}, nil
+	serviceURLs := make(map[string]string, len(req.GetServiceExposures()))
+	for _, exposure := range req.GetServiceExposures() {
+		serviceURLs[exposure.GetService()] = "https://" + exposure.GetService() + ".example.test/"
+	}
+	return &pb.SandboxResponse{Sandbox: sb, ServiceUrls: serviceURLs}, nil
 }
 
 func (s *mockSandboxServer) GetSandbox(_ context.Context, req *pb.GetSandboxRequest) (*pb.SandboxResponse, error) {
@@ -87,9 +93,10 @@ func (s *mockSandboxServer) GetSandbox(_ context.Context, req *pb.GetSandboxRequ
 	if s.getErr != nil {
 		return nil, s.getErr
 	}
-	sb, ok := s.sandboxes[req.GetName()]
+	name := req.GetName()
+	sb, ok := s.sandboxes[name]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
 	cloned := proto.Clone(sb).(*pb.Sandbox)
 	return &pb.SandboxResponse{Sandbox: cloned}, nil
@@ -141,20 +148,22 @@ func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandb
 	if s.deleteErr != nil {
 		return nil, s.deleteErr
 	}
-	_, ok := s.sandboxes[req.GetName()]
+	name := req.GetName()
+	_, ok := s.sandboxes[name]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
-	delete(s.sandboxes, req.GetName())
+	delete(s.sandboxes, name)
 	return &pb.DeleteSandboxResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}, nil
 }
 
 func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRequest) (*pb.SandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sb, ok := s.sandboxes[req.GetName()]
+	name := req.GetName()
+	sb, ok := s.sandboxes[name]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
 	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_STOPPED
 	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
@@ -163,9 +172,10 @@ func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRe
 func (s *mockSandboxServer) StartSandbox(_ context.Context, req *pb.StartSandboxRequest) (*pb.SandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sb, ok := s.sandboxes[req.GetName()]
+	name := req.GetName()
+	sb, ok := s.sandboxes[name]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
 	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_STARTING
 	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
@@ -177,11 +187,12 @@ func (s *mockSandboxServer) AttachSandboxProvider(_ context.Context, req *pb.Att
 	if s.attachErr != nil {
 		return nil, s.attachErr
 	}
-	sb, ok := s.sandboxes[req.GetSandboxName()]
+	name := req.GetSandbox()
+	sb, ok := s.sandboxes[name]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetSandboxName())
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
-	sb.Spec.Providers = append(sb.Spec.Providers, req.GetProviderName())
+	sb.Spec.Providers = append(sb.Spec.Providers, req.GetProvider())
 	return &pb.AttachSandboxProviderResponse{Sandbox: sb, Attached: true}, nil
 }
 
@@ -191,18 +202,36 @@ func (s *mockSandboxServer) DetachSandboxProvider(_ context.Context, req *pb.Det
 	if s.detachErr != nil {
 		return nil, s.detachErr
 	}
-	sb, ok := s.sandboxes[req.GetSandboxName()]
+	name := req.GetSandbox()
+	sb, ok := s.sandboxes[name]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetSandboxName())
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
 	return &pb.DetachSandboxProviderResponse{Sandbox: sb, Detached: true}, nil
 }
 
 func (s *mockSandboxServer) ListSandboxProviders(_ context.Context, req *pb.ListSandboxProvidersRequest) (*pb.ListSandboxProvidersResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.listProvErr != nil {
 		return nil, s.listProvErr
 	}
-	provs := s.providers[req.GetSandboxName()]
+	s.listProviderRequests = append(s.listProviderRequests, proto.Clone(req).(*pb.ListSandboxProvidersRequest))
+	if s.listProviderPages != nil {
+		page := 0
+		if req.GetPageToken() == "page-2" {
+			page = 1
+		}
+		nextPageToken := ""
+		if page+1 < len(s.listProviderPages) {
+			nextPageToken = "page-2"
+		}
+		return &pb.ListSandboxProvidersResponse{
+			Providers:     s.listProviderPages[page],
+			NextPageToken: nextPageToken,
+		}, nil
+	}
+	provs := s.providers[req.GetSandbox()]
 	return &pb.ListSandboxProvidersResponse{Providers: provs}, nil
 }
 
@@ -281,7 +310,21 @@ func TestSandboxCreate(t *testing.T) {
 	}
 	labels := map[string]string{"env": "dev"}
 
-	result, err := client.Create(context.Background(), "default", "my-sandbox", spec, labels)
+	result, err := client.Create(
+		context.Background(),
+		"default",
+		"my-sandbox",
+		spec,
+		labels,
+		CreateOptions{ServiceExposures: []ServiceExposure{
+			{TargetPort: 4500},
+			{
+				Service:           "metrics",
+				TargetPort:        9090,
+				AuthorizationMode: ServiceAuthorizationModeBearerPassthrough,
+			},
+		}},
+	)
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -289,6 +332,15 @@ func TestSandboxCreate(t *testing.T) {
 	assert.Equal(t, "sb-my-sandbox", result.ID)
 	assert.Equal(t, map[string]string{"env": "dev"}, result.Labels)
 	assert.Equal(t, SandboxProvisioning, result.Status.Phase)
+	assert.Equal(t, map[string]string{
+		"":        "https://.example.test/",
+		"metrics": "https://metrics.example.test/",
+	}, result.ServiceURLs)
+	require.Len(t, mock.createRequest.GetServiceExposures(), 2)
+	assert.Equal(t, uint32(4500), mock.createRequest.GetServiceExposures()[0].GetTargetPort())
+	assert.Equal(t, pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_STRIP, mock.createRequest.GetServiceExposures()[0].GetAuthorizationMode())
+	assert.Equal(t, "metrics", mock.createRequest.GetServiceExposures()[1].GetService())
+	assert.Equal(t, pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH, mock.createRequest.GetServiceExposures()[1].GetAuthorizationMode())
 }
 
 func TestSandboxCreate_DefaultGPURequest(t *testing.T) {
@@ -364,7 +416,7 @@ func TestSandboxCreateFromTemplateSendsCommandAndTTY(t *testing.T) {
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
 	require.NotNil(t, mock.createRequest)
-	assert.Equal(t, "gpu-kata", mock.createRequest.GetWorkloadTemplateName())
+	assert.Equal(t, "gpu-kata", mock.createRequest.GetWorkloadTemplate())
 	require.NotNil(t, mock.createRequest.GetSpec())
 	assert.Equal(t, []string{"/opt/worker", "--serve"}, mock.createRequest.GetSpec().GetCommand())
 	assert.True(t, mock.createRequest.GetSpec().GetTty())
@@ -634,17 +686,44 @@ func TestSandboxDetachProvider_NotFound(t *testing.T) {
 
 func TestSandboxListProviders(t *testing.T) {
 	mock := newMockSandboxServer()
-	mock.providers["my-sb"] = []*dm.Provider{
+	mock.listProviderPages = [][]*dm.Provider{{
 		{Metadata: &dm.ObjectMeta{Name: "claude-prov"}, Type: "claude"},
+	}, {
 		{Metadata: &dm.ObjectMeta{Name: "github-prov"}, Type: "github"},
-	}
+	}}
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	result, err := client.ListProviders(context.Background(), "default", "my-sb")
+	pager, err := client.ListProviders("default", "my-sb", ListOptions{PageSize: 1})
+
+	require.NoError(t, err)
+	page, err := pager.NextPage(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, page)
+	assert.Len(t, page.Items, 1)
+	assert.Equal(t, "page-2", page.NextPageToken)
+	require.Len(t, mock.listProviderRequests, 1)
+	assert.Equal(t, "", mock.listProviderRequests[0].GetPageToken())
+	assert.Equal(t, int32(1), mock.listProviderRequests[0].GetPageSize())
+}
+
+func TestSandboxListAllProviders(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.listProviderPages = [][]*dm.Provider{{
+		{Metadata: &dm.ObjectMeta{Name: "claude-prov"}, Type: "claude"},
+	}, {
+		{Metadata: &dm.ObjectMeta{Name: "github-prov"}, Type: "github"},
+	}}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	result, err := client.ListAllProviders(context.Background(), "default", "my-sb", ListOptions{PageSize: 1})
 
 	require.NoError(t, err)
 	assert.Len(t, result, 2)
+	require.Len(t, mock.listProviderRequests, 2)
+	assert.Equal(t, "", mock.listProviderRequests[0].GetPageToken())
+	assert.Equal(t, "page-2", mock.listProviderRequests[1].GetPageToken())
 }
 
 func TestSandboxListProviders_Empty(t *testing.T) {
@@ -652,7 +731,7 @@ func TestSandboxListProviders_Empty(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	result, err := client.ListProviders(context.Background(), "default", "empty-sb")
+	result, err := client.ListAllProviders(context.Background(), "default", "empty-sb")
 
 	require.NoError(t, err)
 	assert.Empty(t, result)
@@ -664,7 +743,9 @@ func TestSandboxListProviders_Error(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	_, err := client.ListProviders(context.Background(), "default", "sb")
+	pager, err := client.ListProviders("default", "sb")
+	require.NoError(t, err)
+	_, err = pager.NextPage(context.Background())
 
 	require.Error(t, err)
 	assert.True(t, IsUnavailable(err))
@@ -1005,7 +1086,7 @@ func TestSandboxWatch_MidStreamErrorDeliveredAsStatusError(t *testing.T) {
 
 // --- T016: Watch name-to-ID resolution verification tests ---
 
-func TestSandboxWatch_ResolvesNameToID(t *testing.T) {
+func TestSandboxWatch_UsesName(t *testing.T) {
 	mock := newMockSandboxServer()
 	mock.sandboxes["my-sandbox"] = &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{Id: "resolved-id-123", Name: "my-sandbox"},
@@ -1026,12 +1107,12 @@ func TestSandboxWatch_ResolvesNameToID(t *testing.T) {
 	require.NoError(t, err)
 	defer w.Stop()
 
-	// Verify the WatchSandboxRequest.Id contains the resolved ID, not the name
+	// Verify the WatchSandboxRequest reference contains the resolved ID, not the name.
 	mock.mu.Lock()
 	req := mock.watchRequest
 	mock.mu.Unlock()
 	require.NotNil(t, req)
-	assert.Equal(t, "resolved-id-123", req.GetId(), "Watch should send resolved sandbox ID, not the name")
+	assert.Equal(t, "my-sandbox", req.GetSandbox())
 }
 
 func TestSandboxWatch_ResolutionError(t *testing.T) {
@@ -1242,7 +1323,7 @@ func TestSandboxGetLogs(t *testing.T) {
 
 	// Verify name→id resolution: the proto request should contain the sandbox ID
 	mock.mu.Lock()
-	assert.Equal(t, "sb-id-123", mock.getLogsRequest.GetSandboxId())
+	assert.Equal(t, "log-sb", mock.getLogsRequest.GetSandbox())
 	mock.mu.Unlock()
 }
 
@@ -1276,7 +1357,7 @@ func TestSandboxGetLogs_WithOptions(t *testing.T) {
 	mock.mu.Lock()
 	req := mock.getLogsRequest
 	mock.mu.Unlock()
-	assert.Equal(t, "sb-id-opts", req.GetSandboxId())
+	assert.Equal(t, "opts-sb", req.GetSandbox())
 	assert.Equal(t, uint32(50), req.GetLines())
 	assert.Equal(t, since, req.GetSinceTime().AsTime())
 	assert.Equal(t, []string{"gateway", "sandbox"}, req.GetSources())

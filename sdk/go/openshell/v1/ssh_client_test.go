@@ -52,13 +52,14 @@ func (s *mockSSHServer) CreateSshSession(_ context.Context, req *pb.CreateSshSes
 		return nil, s.createErr
 	}
 
-	token := "tok-" + req.GetSandboxId()
+	sandboxName := req.GetSandbox()
+	token := "tok-" + sandboxName
 	if s.nextToken != "" {
 		token = s.nextToken
 	}
 
 	resp := &pb.CreateSshSessionResponse{
-		SandboxId:          req.GetSandboxId(),
+		SandboxId:          "id-" + sandboxName,
 		Token:              token,
 		GatewayHost:        "gw.example.com",
 		GatewayPort:        2222,
@@ -66,7 +67,7 @@ func (s *mockSSHServer) CreateSshSession(_ context.Context, req *pb.CreateSshSes
 		HostKeyFingerprint: "SHA256:abc123",
 		ExpirationTime:     timestamppb.New(time.UnixMilli(1700000000000)),
 	}
-	s.sessions[req.GetSandboxId()] = resp
+	s.sessions[sandboxName] = resp
 	s.tokens[token] = true
 	return resp, nil
 }
@@ -169,7 +170,10 @@ func (m *mockSandboxResolver) AttachProvider(_ context.Context, _, _, _ string, 
 func (m *mockSandboxResolver) DetachProvider(_ context.Context, _, _, _ string, _ uint64) (*DetachProviderResult, error) {
 	return nil, nil
 }
-func (m *mockSandboxResolver) ListProviders(_ context.Context, _, _ string) ([]*Provider, error) {
+func (m *mockSandboxResolver) ListProviders(_, _ string, _ ...ListOptions) (*Pager[*Provider], error) {
+	return nil, nil
+}
+func (m *mockSandboxResolver) ListAllProviders(_ context.Context, _, _ string, _ ...ListOptions) ([]*Provider, error) {
 	return nil, nil
 }
 func (m *mockSandboxResolver) WaitReady(_ context.Context, _, _ string, _ ...WaitOptions) (*Sandbox, error) {
@@ -230,7 +234,7 @@ func TestSSHCreateSession(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, session)
-	assert.Equal(t, "my-sandbox", session.SandboxID)
+	assert.Equal(t, "id-my-sandbox", session.SandboxID)
 	assert.Equal(t, "tok-my-sandbox", session.Token)
 	assert.Equal(t, "gw.example.com", session.GatewayHost)
 	assert.Equal(t, uint32(2222), session.GatewayPort)
@@ -337,7 +341,7 @@ func TestSSHTunnel_Success(t *testing.T) {
 	mock.mu.Unlock()
 
 	require.NotNil(t, init)
-	assert.Equal(t, "sb-123", init.GetSandboxId())
+	assert.Equal(t, "my-sandbox", init.GetSandbox())
 	assert.NotEmpty(t, init.GetAuthorizationToken())
 	assert.NotNil(t, init.GetSsh(), "target should be SshRelayTarget")
 }

@@ -19,13 +19,11 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverSandbox, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
-    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
+    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    compute_driver_server::ComputeDriver,
 };
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -96,7 +94,6 @@ pub fn authenticate_as_dev_user(mut request: Request<()>) -> Result<Request<()>,
 #[derive(Debug, Clone, PartialEq)]
 pub enum FakeComputeDriverCall {
     GetCapabilities,
-    GetGatewayListenerRequirements,
     ValidateSandboxCreate {
         sandbox: Option<DriverSandbox>,
     },
@@ -131,8 +128,6 @@ pub struct FakeComputeDriver {
 #[derive(Debug)]
 struct FakeComputeDriverState {
     capabilities: GetCapabilitiesResponse,
-    gateway_listener_requirements: Vec<GatewayListenerRequirement>,
-    gateway_listener_requirements_supported: bool,
     sandboxes: HashMap<String, DriverSandbox>,
     calls: Vec<FakeComputeDriverCall>,
     traceparents: Vec<String>,
@@ -150,6 +145,9 @@ impl FakeComputeDriver {
         Self {
             state: Arc::new(Mutex::new(FakeComputeDriverState {
                 capabilities: GetCapabilitiesResponse {
+                    resource_admission_policy:
+                        openshell_core::resource_admission::DriverAdmissionConfig::default()
+                            .acknowledgement(),
                     driver_name: "fake-compute-driver".to_string(),
                     driver_version: "test".to_string(),
                     default_image: "openshell/sandbox:test".to_string(),
@@ -159,9 +157,13 @@ impl FakeComputeDriver {
                     resource_capabilities: None,
                     rootfs_tar_staging_dir: String::new(),
                     rootfs_tar_max_bytes: 0,
+                    extension: Some(openshell_core::extension_protocol::extension_metadata(
+                        openshell_core::extension_protocol::ExtensionFamily::Compute,
+                        "openshell/fake-compute-driver",
+                        "test",
+                        [],
+                    )),
                 },
-                gateway_listener_requirements: Vec::new(),
-                gateway_listener_requirements_supported: true,
                 sandboxes: HashMap::new(),
                 calls: Vec::new(),
                 traceparents: Vec::new(),
@@ -194,29 +196,6 @@ impl FakeComputeDriver {
     }
 
     #[must_use]
-    pub fn with_gateway_listener_requirement(
-        self,
-        bind_address: impl Into<String>,
-        reason: impl Into<String>,
-    ) -> Self {
-        self.with_state(|state| {
-            state
-                .gateway_listener_requirements
-                .push(GatewayListenerRequirement {
-                    reason: reason.into(),
-                    selector: Some(Selector::ExactBindAddress(bind_address.into())),
-                });
-        });
-        self
-    }
-
-    #[must_use]
-    pub fn without_gateway_listener_requirements_api(self) -> Self {
-        self.with_state(|state| state.gateway_listener_requirements_supported = false);
-        self
-    }
-
-    #[must_use]
     pub fn calls(&self) -> Vec<FakeComputeDriverCall> {
         self.with_state(|state| state.calls.clone())
     }
@@ -228,6 +207,10 @@ impl FakeComputeDriver {
 
     pub fn clear_calls(&self) {
         self.with_state(|state| state.calls.clear());
+    }
+
+    pub fn set_admission_acknowledgement(&self, acknowledgement: String) {
+        self.with_state(|state| state.capabilities.resource_admission_policy = acknowledgement);
     }
 
     #[cfg(unix)]
@@ -325,21 +308,16 @@ impl ComputeDriver for FakeComputeDriver {
 
     async fn get_gateway_listener_requirements(
         &self,
-        request: Request<GetGatewayListenerRequirementsRequest>,
-    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        self.record_traceparent(request.metadata());
-        self.with_state(|state| {
-            state
-                .calls
-                .push(FakeComputeDriverCall::GetGatewayListenerRequirements);
-            state
-                .gateway_listener_requirements_supported
-                .then(|| GetGatewayListenerRequirementsResponse {
-                    requirements: state.gateway_listener_requirements.clone(),
-                })
-                .map(Response::new)
-                .ok_or_else(|| Status::unimplemented("listener requirements unsupported"))
-        })
+        _request: Request<
+            openshell_core::proto::compute::v1::GetGatewayListenerRequirementsRequest,
+        >,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::GetGatewayListenerRequirementsResponse>,
+        Status,
+    > {
+        Ok(Response::new(
+            openshell_core::proto::compute::v1::GetGatewayListenerRequirementsResponse::default(),
+        ))
     }
 
     async fn validate_sandbox_create(
@@ -367,15 +345,14 @@ impl ComputeDriver for FakeComputeDriver {
         let sandbox = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::GetSandbox {
                 sandbox_id: request.sandbox_id.clone(),
-                sandbox_name: request.sandbox_name.clone(),
+                sandbox_name: request.name.clone(),
             });
             state
                 .sandboxes
                 .values()
                 .find(|sandbox| {
                     (!request.sandbox_id.is_empty() && sandbox.id == request.sandbox_id)
-                        || (!request.sandbox_name.is_empty()
-                            && sandbox.name == request.sandbox_name)
+                        || (!request.name.is_empty() && sandbox.name == request.name)
                 })
                 .cloned()
         });
@@ -412,7 +389,7 @@ impl ComputeDriver for FakeComputeDriver {
                 .calls
                 .push(FakeComputeDriverCall::CreateSandbox { sandbox });
         });
-        Ok(Response::new(CreateSandboxResponse {}))
+        Ok(Response::new(CreateSandboxResponse::default()))
     }
 
     async fn stop_sandbox(
@@ -424,7 +401,7 @@ impl ComputeDriver for FakeComputeDriver {
         self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::StopSandbox {
                 sandbox_id: request.sandbox_id,
-                sandbox_name: request.sandbox_name,
+                sandbox_name: request.name,
             });
         });
         Ok(Response::new(StopSandboxResponse {}))
@@ -439,10 +416,10 @@ impl ComputeDriver for FakeComputeDriver {
         self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::StartSandbox {
                 sandbox_id: request.sandbox_id,
-                sandbox_name: request.sandbox_name,
+                sandbox_name: request.name,
             });
         });
-        Ok(Response::new(StartSandboxResponse {}))
+        Ok(Response::new(StartSandboxResponse::default()))
     }
 
     async fn delete_sandbox(
@@ -454,13 +431,13 @@ impl ComputeDriver for FakeComputeDriver {
         let deleted = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::DeleteSandbox {
                 sandbox_id: request.sandbox_id.clone(),
-                sandbox_name: request.sandbox_name.clone(),
+                sandbox_name: request.name.clone(),
             });
             if request.sandbox_id.is_empty() {
                 let Some(id) = state
                     .sandboxes
                     .iter()
-                    .find(|(_, sandbox)| sandbox.name == request.sandbox_name)
+                    .find(|(_, sandbox)| sandbox.name == request.name)
                     .map(|(id, _)| id.clone())
                 else {
                     return false;

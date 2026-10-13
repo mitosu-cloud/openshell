@@ -64,6 +64,7 @@ struct SandboxState {
     fail_list_provider_profiles: Arc<AtomicBool>,
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
+    expose_service_requests: Arc<Mutex<Vec<openshell_core::proto::ExposeServiceRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
     vm_error_after_started: Arc<AtomicBool>,
     vm_error_with_observed_exit: Arc<AtomicBool>,
@@ -91,6 +92,27 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn peer_report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_report_endpoint_status(
+        &self,
+        _request: tonic::Request<ReportEndpointStatusRequest>,
+    ) -> Result<Response<ReportEndpointStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn begin_rootfs_tar_staging(
         &self,
         _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
@@ -142,6 +164,16 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<SandboxResponse>, Status> {
         let request = request.into_inner();
         let name = request.name.clone();
+        let service_urls = request
+            .service_exposures
+            .iter()
+            .map(|exposure| {
+                (
+                    exposure.service.clone(),
+                    "https://default--sandbox.openshell.localhost:17670/".to_string(),
+                )
+            })
+            .collect();
         self.state.create_requests.lock().await.push(request);
         let sandbox_name = if name.is_empty() {
             "test-sandbox".to_string()
@@ -165,6 +197,7 @@ impl OpenShell for TestOpenShell {
         sandbox.set_phase(SandboxPhase::Provisioning as i32);
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
+            service_urls,
         }))
     }
 
@@ -186,7 +219,8 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        let name = request.into_inner().name;
+        let request = request.into_inner();
+        let name = request.name;
         let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("id-{name}"),
@@ -203,6 +237,7 @@ impl OpenShell for TestOpenShell {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
+            service_urls: HashMap::new(),
         }))
     }
 
@@ -235,7 +270,7 @@ impl OpenShell for TestOpenShell {
             resource_version: 1,
             annotations: HashMap::new(),
             workspace: selected_workspace(&request.workspace_scope)
-                .unwrap_or("default")
+                .unwrap_or_default()
                 .to_string(),
             deletion_time: None,
         });
@@ -269,7 +304,7 @@ impl OpenShell for TestOpenShell {
                     resource_version: 1,
                     annotations: HashMap::new(),
                     workspace: selected_workspace(&request.workspace_scope)
-                        .unwrap_or("default")
+                        .unwrap_or_default()
                         .to_string(),
                     deletion_time: None,
                 }),
@@ -414,7 +449,8 @@ impl OpenShell for TestOpenShell {
         {
             return Err(Status::failed_precondition("sandbox is not ready"));
         }
-        let sandbox_id = request.into_inner().sandbox_id;
+        let request = request.into_inner();
+        let sandbox_id = format!("id-{}", request.sandbox);
         Ok(Response::new(CreateSshSessionResponse {
             sandbox_id,
             token: "test-token".to_string(),
@@ -427,10 +463,18 @@ impl OpenShell for TestOpenShell {
 
     async fn expose_service(
         &self,
-        _request: tonic::Request<openshell_core::proto::ExposeServiceRequest>,
+        request: tonic::Request<openshell_core::proto::ExposeServiceRequest>,
     ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        self.state
+            .expose_service_requests
+            .lock()
+            .await
+            .push(request.into_inner());
         Ok(Response::new(
-            openshell_core::proto::ServiceEndpointResponse::default(),
+            openshell_core::proto::ServiceEndpointResponse {
+                url: "https://default--sandbox.openshell.localhost:17670/".to_string(),
+                ..Default::default()
+            },
         ))
     }
 
@@ -438,7 +482,12 @@ impl OpenShell for TestOpenShell {
         &self,
         _: tonic::Request<openshell_core::proto::GetServiceRequest>,
     ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
-        Err(Status::unimplemented("unused"))
+        Ok(Response::new(
+            openshell_core::proto::ServiceEndpointResponse {
+                url: "https://default--sandbox.openshell.localhost:17670/".to_string(),
+                ..Default::default()
+            },
+        ))
     }
 
     async fn list_services(
@@ -615,7 +664,8 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<WatchSandboxRequest>,
     ) -> Result<Response<Self::WatchSandboxStream>, Status> {
-        let sandbox_id = request.into_inner().id;
+        let request = request.into_inner();
+        let sandbox_id = format!("id-{}", request.sandbox);
         let (tx, rx) = mpsc::channel(4);
         let vm_error_after_started = self.state.vm_error_after_started.load(Ordering::SeqCst);
         let vm_error_with_observed_exit = self
@@ -656,7 +706,6 @@ impl OpenShell for TestOpenShell {
             provisioning.set_phase(SandboxPhase::Provisioning as i32);
             let mut error = Sandbox {
                 status: Some(SandboxStatus {
-                    sandbox_name: sandbox_id.trim_start_matches("id-").to_string(),
                     conditions: vec![SandboxCondition {
                         r#type: "Ready".to_string(),
                         status: "False".to_string(),
@@ -694,6 +743,7 @@ impl OpenShell for TestOpenShell {
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
                     payload: Some(sandbox_stream_event::Payload::Sandbox(provisioning)),
+                    cursor: String::new(),
                 }))
                 .await;
             if terminal_after_provisional_container_exit
@@ -704,6 +754,7 @@ impl OpenShell for TestOpenShell {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(
                             provisional_container_exit,
                         )),
+                        cursor: String::new(),
                     }))
                     .await;
                 provisional_container_exit_sent.notify_waiters();
@@ -715,6 +766,7 @@ impl OpenShell for TestOpenShell {
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(completed)),
+                        cursor: String::new(),
                     }))
                     .await;
                 return;
@@ -728,11 +780,13 @@ impl OpenShell for TestOpenShell {
                             message: "Started VM launcher".to_string(),
                             ..PlatformEvent::default()
                         })),
+                        cursor: String::new(),
                     }))
                     .await;
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(error)),
+                        cursor: String::new(),
                     }))
                     .await;
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -752,12 +806,14 @@ impl OpenShell for TestOpenShell {
                                 source: "gateway".to_string(),
                                 fields: HashMap::new(),
                             })),
+                            cursor: String::new(),
                         }))
                         .await;
                 }
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                        cursor: String::new(),
                     }))
                     .await;
                 return;
@@ -766,6 +822,7 @@ impl OpenShell for TestOpenShell {
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(completed)),
+                        cursor: String::new(),
                     }))
                     .await;
                 return;
@@ -780,6 +837,7 @@ impl OpenShell for TestOpenShell {
                             message: "Preparing rootfs".to_string(),
                             ..PlatformEvent::default()
                         })),
+                        cursor: String::new(),
                     }))
                     .await;
                 tokio::time::sleep(Duration::from_millis(600)).await;
@@ -791,12 +849,14 @@ impl OpenShell for TestOpenShell {
                             message: "Formatting root disk".to_string(),
                             ..PlatformEvent::default()
                         })),
+                        cursor: String::new(),
                     }))
                     .await;
                 tokio::time::sleep(Duration::from_millis(600)).await;
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                        cursor: String::new(),
                     }))
                     .await;
                 return;
@@ -808,11 +868,13 @@ impl OpenShell for TestOpenShell {
                         message: "Sandbox scheduled".to_string(),
                         ..PlatformEvent::default()
                     })),
+                    cursor: String::new(),
                 }))
                 .await;
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
                     payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                    cursor: String::new(),
                 }))
                 .await;
         });
@@ -995,6 +1057,17 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
     ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type PeerRelayStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::PeerRelayFrame, Status>,
+    >;
+
+    async fn peer_relay(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -1254,7 +1327,9 @@ fn install_fake_forwarding_ssh(dir: &TempDir) -> std::path::PathBuf {
 set -eu
 
 forward=""
-sandbox_id=""
+sandbox_name=""
+workspace=""
+immutable_id=""
 saw_no_command=0
 last_arg=""
 previous=""
@@ -1270,7 +1345,11 @@ for arg in "$@"; do
   if [ "$previous" = "-o" ]; then
     case "$arg" in
       ProxyCommand=*)
-        sandbox_id="$(printf '%s\n' "$arg" | sed -n 's/.*--sandbox-id \([^ ]*\).*/\1/p')"
+        sandbox_name="$(printf '%s\n' "$arg" | sed -n 's/.*--sandbox \([^ ]*\).*/\1/p')"
+        workspace="$(printf '%s\n' "$arg" | sed -n 's/.*--workspace \([^ ]*\).*/\1/p')"
+        ;;
+      SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=*)
+        immutable_id="${arg#SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=}"
         ;;
     esac
     previous=""
@@ -1308,14 +1387,14 @@ case "$first" in
     ;;
 esac
 
-if [ -z "$port" ] || [ -z "$sandbox_id" ]; then
+if [ -z "$port" ] || [ -z "$sandbox_name" ] || [ -z "$workspace" ] || [ -z "$immutable_id" ]; then
   exit 1
 fi
 
 helper='@HELPER_PATH@'
 echo "$$" > '@PID_PATH@'
-printf '%s\n' "ssh -N -o ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway -o ExitOnForwardFailure=yes -L $forward sandbox" > '@COMMAND_PATH@'
-exec env OPENSHELL_FAKE_FORWARD_MODE=listen "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox
+printf '%s\n' "ssh -N -o ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox $sandbox_name --workspace $workspace --token test-token --gateway-name test-gateway -o ExitOnForwardFailure=yes -o SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=$immutable_id -L $forward sandbox" > '@COMMAND_PATH@'
+exec env OPENSHELL_FAKE_FORWARD_MODE=listen "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox $sandbox_name --workspace $workspace --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -o "SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=$immutable_id" -L "$forward" sandbox
 "#
         .replace("@PID_PATH@", &pid_path.display().to_string())
         .replace("@COMMAND_PATH@", &command_path.display().to_string())
@@ -1359,7 +1438,7 @@ for arg in "$@"; do
   if [ "$previous" = "-o" ]; then
     case "$arg" in
       ProxyCommand=*)
-        sandbox_id="$(printf '%s\n' "$arg" | sed -n 's/.*--sandbox-id \([^ ]*\).*/\1/p')"
+        sandbox_id="$(printf '%s\n' "$arg" | sed -n 's/.*--sandbox \([^ ]*\).*/\1/p')"
         ;;
     esac
     previous=""
@@ -1388,7 +1467,7 @@ fi
 
 helper='@HELPER_PATH@'
 echo "$$" > '@PID_PATH@'
-exec env OPENSHELL_FAKE_FORWARD_MODE=sleep "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox >'@LOG_PATH@' 2>&1
+exec env OPENSHELL_FAKE_FORWARD_MODE=sleep "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox >'@LOG_PATH@' 2>&1
 "#
         .replace("@LOG_PATH@", &log_path.display().to_string())
         .replace("@PID_PATH@", &pid_path.display().to_string())
@@ -1434,6 +1513,18 @@ async fn deleted_names(server: &TestServer) -> Vec<Vec<String>> {
 
 async fn create_requests(server: &TestServer) -> Vec<CreateSandboxRequest> {
     server.openshell.state.create_requests.lock().await.clone()
+}
+
+async fn expose_service_requests(
+    server: &TestServer,
+) -> Vec<openshell_core::proto::ExposeServiceRequest> {
+    server
+        .openshell
+        .state
+        .expose_service_requests
+        .lock()
+        .await
+        .clone()
 }
 
 async fn template_create_requests(server: &TestServer) -> Vec<CreateSandboxTemplateRequest> {
@@ -1925,7 +2016,7 @@ async fn sandbox_create_with_template_sends_workload_template_name() {
 
     let requests = create_requests(&server).await;
     let request = requests.first().expect("create request should be recorded");
-    assert_eq!(request.workload_template_name, "gpu-kata");
+    assert_eq!(request.workload_template, "gpu-kata");
     let spec = request
         .spec
         .as_ref()
@@ -2677,11 +2768,76 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
     .expect("sandbox create with forward should succeed");
 
     assert!(deleted_names(&server).await.is_empty());
-    let record = openshell_core::forward::read_forward_pid("persistent-forward", forward_port)
-        .expect("fake forward should be tracked");
+    let record =
+        openshell_core::forward::read_forward_pid("default", "persistent-forward", forward_port)
+            .expect("fake forward should be tracked");
     let _ = std::process::Command::new("kill")
         .arg(record.pid.to_string())
         .status();
+}
+
+#[tokio::test]
+async fn sandbox_create_exposes_service_after_ready_and_keeps_sandbox() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("sandbox"),
+            keep: false,
+            expose: Some(4500),
+            expose_authorization_mode:
+                openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough,
+            detach: true,
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create with service exposure should succeed");
+
+    assert!(deleted_names(&server).await.is_empty());
+    let create_requests = create_requests(&server).await;
+    assert_eq!(create_requests.len(), 1);
+    assert_eq!(create_requests[0].service_exposures.len(), 1);
+    assert_eq!(create_requests[0].service_exposures[0].service, "");
+    assert_eq!(create_requests[0].service_exposures[0].target_port, 4500);
+    assert_eq!(
+        create_requests[0].service_exposures[0].authorization_mode(),
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough
+    );
+    assert!(expose_service_requests(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn service_expose_forwards_bearer_passthrough_mode() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+
+    run::service_expose(
+        &server.endpoint,
+        "sandbox",
+        "codex",
+        4500,
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough,
+        "default",
+        &tls,
+    )
+    .await
+    .expect("service expose should succeed");
+
+    let requests = expose_service_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].authorization_mode(),
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough
+    );
 }
 
 #[tokio::test]
@@ -2708,11 +2864,12 @@ async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails(
     )
     .await
     .expect("background forward should track the owned SSH child without PID discovery");
-    let record = openshell_core::forward::read_forward_pid("owned-forward", forward_port)
-        .expect("owned background forward should write a PID file");
+    let record =
+        openshell_core::forward::read_forward_pid("default", "owned-forward", forward_port)
+            .expect("owned background forward should write a PID file");
 
     assert!(
-        openshell_core::forward::stop_forward("owned-forward", forward_port)
+        openshell_core::forward::stop_forward("default", "owned-forward", forward_port)
             .expect("tracked fake forward should stop"),
         "tracked fake forward should be recognized as alive and stopped",
     );
@@ -2783,7 +2940,8 @@ async fn sandbox_forward_background_terminates_owned_child_when_listener_never_o
         "error should preserve listener startup context, got: {msg}",
     );
     assert!(
-        openshell_core::forward::read_forward_pid("unreachable-forward", forward_port).is_none(),
+        openshell_core::forward::read_forward_pid("default", "unreachable-forward", forward_port)
+            .is_none(),
         "unreachable background forwards must not write a PID file",
     );
     let pid = fs::read_to_string(&fake_forward.pid_path)
@@ -3145,15 +3303,30 @@ async fn sandbox_create_continues_with_unexpired_cached_token_when_refresh_fails
 async fn sandbox_create_json_stdout_is_parseable() {
     let server = run_server().await;
 
-    let result = run_cli_sandbox_create(&server, "json-clean", &["--output=json"]).await;
+    let result = run_cli_sandbox_create(
+        &server,
+        "json-clean",
+        &["--output=json", "--expose=4500", "--detach"],
+    )
+    .await;
     assert!(
         result.status.success(),
         "sandbox create failed:\n{}",
         String::from_utf8_lossy(&result.stderr)
     );
     let stdout = String::from_utf8(result.stdout).expect("stdout should be UTF-8");
-    serde_json::from_str::<serde_json::Value>(&stdout)
+    let value = serde_json::from_str::<serde_json::Value>(&stdout)
         .unwrap_or_else(|err| panic!("stdout should contain only JSON: {err}\n{stdout}"));
+    let gateway_port = url::Url::parse(&server.endpoint)
+        .expect("test gateway endpoint should be a URL")
+        .port()
+        .expect("test gateway endpoint should include a port");
+    assert_eq!(
+        value["service_urls"],
+        serde_json::json!({
+            "": format!("https://default--sandbox.openshell.localhost:{gateway_port}/")
+        })
+    );
 }
 
 #[tokio::test]

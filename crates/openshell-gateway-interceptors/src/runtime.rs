@@ -10,6 +10,7 @@ use std::time::Instant;
 use json_patch::{PatchOperation, patch};
 use metrics::{counter, histogram};
 use openshell_core::config::GatewayInterceptorConfig;
+use openshell_core::extension_protocol::NegotiatedExtension;
 use openshell_core::proto::gateway_interceptor::v1::{
     InterceptorEvaluation, InterceptorResult, JsonPatch, ModifyOperationEvaluation,
     PostCommitEvaluation, ValidateEvaluation, interceptor_evaluation,
@@ -102,6 +103,11 @@ impl GatewayInterceptorRuntime {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.plan.is_empty()
+    }
+
+    #[must_use]
+    pub fn negotiated_extensions(&self) -> &[NegotiatedExtension] {
+        self.plan.negotiated_extensions()
     }
 
     #[must_use]
@@ -765,7 +771,9 @@ mod tests {
                 config: HashMap::from([("region".to_string(), "old".to_string())]),
                 ..Provider::default()
             }),
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
         };
         let json = codec
             .decode_message_to_json("openshell.v1.CreateProviderRequest", &request)
@@ -1011,7 +1019,10 @@ mod tests {
         };
         let request = UpdateConfigRequest {
             request_id: String::new(),
-            name: "demo".to_string(),
+            sandbox: "demo".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             expected_resource_version: u64::MAX - 1,
             annotations: HashMap::from([
                 ("policy-hash".to_string(), "sha256:v2:abc".to_string()),
@@ -1019,7 +1030,6 @@ mod tests {
                 ("policy-signature-kid".to_string(), "kid".to_string()),
                 ("correlation-id".to_string(), "reload-1".to_string()),
             ]),
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             ..UpdateConfigRequest::default()
         };
         let body = GrpcFrame {
@@ -1078,9 +1088,12 @@ mod tests {
             name: "demo".to_string(),
             labels: HashMap::new(),
             annotations: HashMap::new(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             await_main_process_attachment: false,
-            workload_template_name: String::new(),
+            workload_template: String::new(),
+            service_exposures: Vec::new(),
         };
 
         let bytes = request.encode_to_vec();
@@ -1189,7 +1202,10 @@ mod tests {
         let operation = ValidatedOperation::new(
             &codec,
             "openshell.v1.UpdateConfigRequest",
-            json!({"name": "demo", "expectedResourceVersion": "7"}),
+            json!({
+                "workspaceScope": {"workspace": "default"}, "sandbox": "demo",
+                "expectedResourceVersion": "7"
+            }),
         )
         .unwrap();
         let prior = operation.clone();
@@ -1227,7 +1243,10 @@ mod tests {
         let operation = ValidatedOperation::new(
             &codec,
             "openshell.v1.UpdateConfigRequest",
-            json!({"name": "demo", "expectedResourceVersion": "7"}),
+            json!({
+                "workspaceScope": {"workspace": "default"}, "sandbox": "demo",
+                "expectedResourceVersion": "7"
+            }),
         )
         .unwrap();
         let plan = test_modify_plan(FailurePolicy::FailClosed);
@@ -1265,12 +1284,15 @@ mod tests {
         let operation = ValidatedOperation::new(
             &codec,
             "openshell.v1.UpdateConfigRequest",
-            json!({"name": "demo", "expectedResourceVersion": "7"}),
+            json!({
+                "workspaceScope": {"workspace": "default"}, "sandbox": "demo",
+                "expectedResourceVersion": "7"
+            }),
         )
         .unwrap();
         let prior = operation.clone();
         let result = allowed_result(vec![
-            patch("replace", "/name", json!("partially-mutated")),
+            patch("replace", "/sandbox", json!("partially-mutated")),
             patch("replace", "/expectedResourceVersion", json!("not-a-number")),
         ]);
 
@@ -1284,7 +1306,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome, prior);
-        assert_eq!(outcome.json["name"], "demo");
+        assert_eq!(outcome.json["sandbox"], "demo");
     }
 
     #[tokio::test]
@@ -1295,17 +1317,20 @@ mod tests {
         let operation = ValidatedOperation::new(
             &codec,
             "openshell.v1.UpdateConfigRequest",
-            json!({"name": "demo", "expectedResourceVersion": "7"}),
+            json!({
+                "workspaceScope": {"workspace": "default"}, "sandbox": "demo",
+                "expectedResourceVersion": "7"
+            }),
         )
         .unwrap();
         let plan = test_modify_plan(FailurePolicy::FailOpen);
         let invalid_first = allowed_result(vec![
-            patch("replace", "/name", json!("rejected-candidate")),
+            patch("replace", "/sandbox", json!("rejected-candidate")),
             patch("replace", "/expectedResourceVersion", json!("not-a-number")),
         ]);
         let second = allowed_result(vec![
-            patch("test", "/name", json!("demo")),
-            patch("replace", "/name", json!("accepted-candidate")),
+            patch("test", "/sandbox", json!("demo")),
+            patch("replace", "/sandbox", json!("accepted-candidate")),
         ]);
 
         let operation = apply_evaluation_result(
@@ -1325,9 +1350,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(operation.json["name"], "accepted-candidate");
+        assert_eq!(operation.json["sandbox"], "accepted-candidate");
         let decoded = UpdateConfigRequest::decode(operation.encoded.as_slice()).unwrap();
-        assert_eq!(decoded.name, "accepted-candidate");
+        assert_eq!(decoded.sandbox, "accepted-candidate");
         assert_eq!(decoded.expected_resource_version, 7);
     }
 
@@ -1374,10 +1399,13 @@ mod tests {
         let operation = ValidatedOperation::new(
             &codec,
             "openshell.v1.UpdateConfigRequest",
-            json!({"name": "demo", "expectedResourceVersion": "7"}),
+            json!({
+                "workspaceScope": {"workspace": "default"}, "sandbox": "demo",
+                "expectedResourceVersion": "7"
+            }),
         )
         .unwrap();
-        let result = allowed_result(vec![patch("replace", "/name", json!("accepted"))]);
+        let result = allowed_result(vec![patch("replace", "/sandbox", json!("accepted"))]);
         let recorder = TestRecorder::default();
 
         let operation = metrics::with_local_recorder(&recorder, || {
@@ -1392,7 +1420,7 @@ mod tests {
         .unwrap();
 
         let decoded = UpdateConfigRequest::decode(operation.encoded.as_slice()).unwrap();
-        assert_eq!(decoded.name, "accepted");
+        assert_eq!(decoded.sandbox, "accepted");
         assert_eq!(TestRecorder::count(&recorder.evaluations), 1);
         assert_eq!(TestRecorder::count(&recorder.patches), 1);
         assert_eq!(TestRecorder::count(&recorder.fail_open), 0);

@@ -34,8 +34,10 @@ const client = await OpenShellClient.connect({
 })
 
 const sandbox = await client.sandbox.create({
-  image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
+  image: 'registry.example.com/agents/python:latest',
+  serviceExposures: [{ targetPort: 8080 }],
 })
+console.log(sandbox.serviceUrls[''])
 await client.sandbox.waitReady(sandbox.name, 120)
 
 const result = await client.sandbox.exec(sandbox.name, ['/bin/sh', '-c', 'echo hello'])
@@ -199,7 +201,7 @@ const template: SandboxWorkloadTemplate = await client.sandboxTemplates.create(
     metadata: { name: 'python', labels: { team: 'runtime' } },
     spec: {
       workload: {
-        image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
+        image: 'registry.example.com/agents/python:latest',
         environment: { FEATURE_FLAG: 'on' },
         resources: { cpu: '1', memory: '512Mi' },
       },
@@ -210,7 +212,7 @@ const template: SandboxWorkloadTemplate = await client.sandboxTemplates.create(
 )
 
 const sandbox = await client.sandbox.createFromTemplate({
-  templateName: template.metadata!.name,
+  workloadTemplate: template.metadata!.name,
   workspace: 'default',
   providers: ['github'],
   policy: { version: 1, networkPolicies: {} },
@@ -267,7 +269,7 @@ const defaultWorkspace = create(WorkspaceSelectorSchema, {
   selection: { case: 'workspace', value: 'default' },
 })
 const status = await client.raw.getSandboxPolicyStatus({
-  name: 'my-sandbox',
+  sandbox: 'my-sandbox',
   version: 0,
   global: false,
   workspaceScope: defaultWorkspace,

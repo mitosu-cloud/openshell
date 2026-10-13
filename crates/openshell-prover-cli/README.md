@@ -31,4 +31,10 @@ cargo build -p openshell-prover-cli --bin openshell-prover
 cargo test -p openshell-prover-cli
 ```
 
-See the [policy prover reference](../../docs/reference/policy-prover.mdx) for installed usage and interpretation guidance.
+See the [policy prover reference](../../docs/how-it-works/policies/prover.mdx) for installed usage and interpretation guidance.
+
+JSON output uses a numeric `schema_version` for the result contract and a
+`prover_version` for the implementation that produced it. Consumers must inspect
+`coverage.domains` for the machine-readable modeled-domain declaration. A
+passing check compares configuration under the documented assumptions; it does
+not attest that a running sandbox installed its restrictions.

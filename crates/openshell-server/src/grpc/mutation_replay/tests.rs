@@ -6,8 +6,9 @@ use crate::grpc::test_support::{authed_request, test_server_state};
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::open_shell_server::OpenShell;
 use openshell_core::proto::{
-    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, WorkspaceMember,
-    WorkspaceRole, workspace_selector,
+    CreateSandboxRequest, SandboxServiceExposure, SandboxSpec, SandboxWorkloadConfig,
+    SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
+    WorkspaceMember, WorkspaceRole,
 };
 use openshell_core::rpc_error::StatusExt;
 use std::collections::HashMap;
@@ -89,6 +90,62 @@ fn canonical_payload_ignores_map_order_and_id_but_preserves_presence() {
     let absent = fingerprint(&template).unwrap();
     template.template = Some(SandboxWorkloadTemplate::default());
     assert_ne!(absent, fingerprint(&template).unwrap());
+}
+
+#[tokio::test]
+async fn create_sandbox_replay_preserves_service_urls() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = directory.path().join("private-key");
+    std::fs::write(&key, b"test-only stable private fingerprint material").unwrap();
+    let mut state = test_server_state().await;
+    Arc::get_mut(&mut state).unwrap().config.gateway_jwt =
+        Some(openshell_core::config::GatewayJwtConfig {
+            signing_key_path: key,
+            public_key_path: directory.path().join("public"),
+            kid_path: directory.path().join("kid"),
+            gateway_id: "test".into(),
+            ttl_secs: None,
+        });
+    let service = crate::grpc::OpenShellService::new(state);
+    let request = CreateSandboxRequest {
+        name: "replay-services".into(),
+        spec: Some(SandboxSpec::default()),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        service_exposures: vec![SandboxServiceExposure {
+            service: "web".into(),
+            target_port: 8080,
+            authorization_mode: ServiceAuthorizationMode::Strip as i32,
+        }],
+        request_id: uuid::Uuid::new_v4().to_string(),
+        ..Default::default()
+    };
+
+    let original = service
+        .create_sandbox(authed_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let replay = service
+        .create_sandbox(authed_request(request.clone()))
+        .await
+        .unwrap();
+
+    assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+    assert_eq!(replay.get_ref().service_urls, original.service_urls);
+    assert_eq!(replay.into_inner(), original);
+
+    let mut changed_authorization = request;
+    changed_authorization.service_exposures[0].authorization_mode =
+        ServiceAuthorizationMode::BearerPassthrough as i32;
+    assert_eq!(
+        reason(
+            &service
+                .create_sandbox(authed_request(changed_authorization))
+                .await
+                .unwrap_err()
+        ),
+        "REQUEST_ID_PAYLOAD_MISMATCH"
+    );
 }
 
 async fn exercise_backend(url: &str) {
@@ -434,7 +491,7 @@ async fn replays_reauthorize_membership_and_admin_grants() {
     let mut state = test_server_state().await;
     Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".into();
     let req = AddWorkspaceMemberRequest {
-        workspace: "default".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         principal_subject: "member".into(),
         role: WorkspaceRole::Admin.into(),
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -461,7 +518,7 @@ async fn replays_reauthorize_membership_and_admin_grants() {
         Code::PermissionDenied
     );
     let remove = RemoveWorkspaceMemberRequest {
-        workspace: "default".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         principal_subject: "missing".into(),
         allow_missing: true,
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -494,7 +551,9 @@ async fn template_replay_stores_only_reference_and_checks_original_version() {
     // Delete is also routed through the public dispatch adapter.
     let req = DeleteSandboxTemplateRequest {
         name: "missing".into(),
-        workspace_scope: Some(workspace_selector("default")),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         allow_missing: true,
         request_id: uuid::Uuid::new_v4().to_string(),
     };
@@ -528,7 +587,9 @@ async fn template_replay_stores_only_reference_and_checks_original_version() {
                 ..Default::default()
             }),
         }),
-        workspace_scope: Some(workspace_selector("default")),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         request_id: uuid::Uuid::new_v4().to_string(),
     };
     let created = run(&state, authed_request(req.clone()))
@@ -687,6 +748,7 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
         format_version: 1,
         payload_hash: "unused".into(),
         workspace_id: None,
+        target_id: None,
         success: None,
         completed_at_ms: None,
     };
@@ -776,14 +838,18 @@ async fn workspace_replacement_blocks_replay_without_reexecuting_member_removal(
         .await
         .unwrap();
     let member = AddWorkspaceMemberRequest {
-        workspace: workspace_req.name.clone(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            workspace_req.name.clone(),
+        )),
         principal_subject: "member".into(),
         role: WorkspaceRole::User.into(),
         ..Default::default()
     };
     run(&state, authed_request(member.clone())).await.unwrap();
     let remove = RemoveWorkspaceMemberRequest {
-        workspace: workspace_req.name.clone(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            workspace_req.name.clone(),
+        )),
         principal_subject: "member".into(),
         request_id: uuid::Uuid::new_v4().to_string(),
         ..Default::default()
@@ -828,8 +894,8 @@ fn replay_allowlist_remains_outside_interception_and_ids_have_reviewed_wire_tags
         ("DeleteWorkspace", 3),
         ("AddWorkspaceMember", 4),
         ("RemoveWorkspaceMember", 4),
-        ("CreateSandboxTemplate", 4),
-        ("DeleteSandboxTemplate", 5),
+        ("CreateSandboxTemplate", 3),
+        ("DeleteSandboxTemplate", 4),
     ] {
         assert!(!openshell_gateway_interceptors::routes::INTERCEPTABLE_METHODS.contains(&method));
         let descriptor = DESCRIPTORS
@@ -846,7 +912,9 @@ async fn unrelated_oidc_configuration_does_not_reset_mtls_admission_identity() {
     let mut state = test_server_state().await;
     let req = DeleteSandboxTemplateRequest {
         name: "mtls-template".into(),
-        workspace_scope: Some(workspace_selector("default")),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         allow_missing: true,
         request_id: "550e8400-e29b-41d4-a716-446655440000".into(),
     };

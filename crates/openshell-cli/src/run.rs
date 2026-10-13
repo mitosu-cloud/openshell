@@ -26,7 +26,8 @@ pub use crate::commands::provider::{
     ProviderCreateCredentialSource, ProviderCreateOptions, ProviderRefreshConfigInput,
     ProviderUpdateOptions, ensure_required_providers, provider_create,
     provider_create_with_options, provider_delete, provider_get, provider_list,
-    provider_list_profiles, provider_profile_delete, provider_profile_export,
+    provider_list_profiles, provider_list_profiles_text, provider_profile_delete,
+    provider_profile_describe, provider_profile_describe_text, provider_profile_export,
     provider_profile_export_text, provider_profile_import, provider_profile_lint,
     provider_profile_update, provider_refresh_config, provider_refresh_delete,
     provider_refresh_status, provider_rotate, provider_update, sandbox_provider_attach,
@@ -47,22 +48,23 @@ use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
     ClearDraftChunksRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
     CreateSshSessionRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
-    DeleteServiceRequest, DeletionOutcome, EndpointResult, EndpointStatus, ExecSandboxRequest,
-    ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
-    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
-    GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
+    DeleteServiceRequest, DeletionOutcome, EndpointResult, EndpointStatus, ExecMode,
+    ExecSandboxRequest, ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest,
+    GetDraftPolicyRequest, GetGatewayConfigRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
+    GetSandboxRequest, GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
     ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
     RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-    SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate,
-    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
-    ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, WatchSandboxRequest,
-    exec_sandbox_event, tcp_forward_init,
+    SandboxResources, SandboxRestartPolicy, SandboxServiceExposure, SandboxServiceLevel,
+    SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+    SandboxWorkloadTemplateSpec, ServiceAuthorizationMode, ServiceEndpointResponse, SettingScope,
+    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
+use prost::Message;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{ErrorKind, IsTerminal, Read, Write};
@@ -249,8 +251,8 @@ pub fn doctor_check() -> Result<()> {
     Err(miette::miette!("docker info failed: {}", stderr.trim()))
 }
 
-fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>) -> bool {
-    keep || forward.is_some()
+fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>, expose: Option<u16>) -> bool {
+    keep || forward.is_some() || expose.is_some()
 }
 
 fn has_main_process_result(sandbox: &Sandbox) -> bool {
@@ -440,6 +442,8 @@ pub struct SandboxCreateConfig<'a> {
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
+    pub expose: Option<u16>,
+    pub expose_authorization_mode: ServiceAuthorizationMode,
     pub command: &'a [String],
     pub tty_override: Option<bool>,
     pub auto_providers_override: Option<bool>,
@@ -449,6 +453,7 @@ pub struct SandboxCreateConfig<'a> {
     pub output: &'a str,
     pub detach: bool,
     pub suppress_credential_warnings: bool,
+    pub restart_policy: &'a str,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -467,6 +472,8 @@ impl Default for SandboxCreateConfig<'_> {
             providers: &[],
             policy: None,
             forward: None,
+            expose: None,
+            expose_authorization_mode: ServiceAuthorizationMode::Strip,
             command: &[],
             tty_override: None,
             auto_providers_override: None,
@@ -476,6 +483,7 @@ impl Default for SandboxCreateConfig<'_> {
             output: "table",
             detach: false,
             suppress_credential_warnings: false,
+            restart_policy: "never",
         }
     }
 }
@@ -502,6 +510,8 @@ pub async fn sandbox_create(
         providers,
         policy,
         forward,
+        expose,
+        expose_authorization_mode,
         command,
         tty_override,
         auto_providers_override,
@@ -511,6 +521,7 @@ pub async fn sandbox_create(
         output,
         detach,
         suppress_credential_warnings,
+        restart_policy,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -527,6 +538,9 @@ pub async fn sandbox_create(
         return Err(miette::miette!(
             "structured output cannot be combined with an attached trailing command; use table output to stream the command or add --detach"
         ));
+    }
+    if expose == Some(0) {
+        return Err(miette::miette!("--expose port must be in 1..=65535"));
     }
 
     // Check port availability *before* creating the sandbox so we don't
@@ -634,7 +648,7 @@ pub async fn sandbox_create(
     // (bash when present, otherwise /bin/sh on minimal images like Alpine).
     // Baking a shell here would force a shell the image may not ship.
     let main_command = command.to_vec();
-    let persist = sandbox_should_persist(keep, forward.as_ref());
+    let persist = sandbox_should_persist(keep, forward.as_ref(), expose);
     let create_detaches = detach
         || (persist
             && command.is_empty()
@@ -662,14 +676,30 @@ pub async fn sandbox_create(
             template: inline_template,
             command: main_command,
             tty: main_terminal,
+            restart_policy: match restart_policy {
+                "never" => SandboxRestartPolicy::Never as i32,
+                "on-failure" => SandboxRestartPolicy::OnFailure as i32,
+                "always" => SandboxRestartPolicy::Always as i32,
+                value => return Err(miette::miette!("invalid restart policy '{value}'")),
+            },
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
         labels,
         annotations,
-        workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            workspace.to_string(),
+        )),
         await_main_process_attachment,
-        workload_template_name: template.unwrap_or_default().to_string(),
+        workload_template: template.unwrap_or_default().to_string(),
+        service_exposures: expose
+            .map(|target_port| SandboxServiceExposure {
+                service: String::new(),
+                target_port: u32::from(target_port),
+                authorization_mode: expose_authorization_mode as i32,
+            })
+            .into_iter()
+            .collect(),
     };
 
     let response = match client.create_sandbox(request).await {
@@ -682,8 +712,13 @@ pub async fn sandbox_create(
         }
         Err(status) => return Err(miette::miette!(status.to_string())),
     };
+    let response = response.into_inner();
+    let service_urls = response
+        .service_urls
+        .into_iter()
+        .map(|(service, url)| (service, service_url_for_gateway(&url, &effective_server)))
+        .collect::<HashMap<_, _>>();
     let sandbox = response
-        .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
@@ -710,10 +745,12 @@ pub async fn sandbox_create(
         let setting = parse_cli_setting_value(settings::PROPOSAL_APPROVAL_MODE_KEY, approval_mode)?;
         match client
             .update_config(UpdateConfigRequest {
-                name: sandbox_name.clone(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
                 setting_value: Some(setting),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
                 ..Default::default()
             })
             .await
@@ -769,14 +806,14 @@ pub async fn sandbox_create(
     // a newly created sandbox.  Instead we handle termination client-side:
     // we wait until we have observed at least one non-Ready phase followed
     // by Ready (a genuine Provisioning → Ready transition).
-    let sandbox_id = if sandbox.object_id().is_empty() {
-        "unknown".to_string()
-    } else {
-        sandbox.object_id().to_string()
-    };
+    let sandbox_name = sandbox.object_name().to_string();
+    let sandbox_workspace = sandbox.object_workspace().to_string();
     let mut stream = client
         .watch_sandbox(WatchSandboxRequest {
-            id: sandbox_id.clone(),
+            sandbox: sandbox_name.clone(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                sandbox_workspace.clone(),
+            )),
             follow_status: true,
             follow_logs: true,
             follow_events: true,
@@ -786,6 +823,7 @@ pub async fn sandbox_create(
             since_time: None,
             log_sources: vec!["gateway".to_string()],
             log_min_level: String::new(),
+            resume_after_cursor: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -1091,8 +1129,27 @@ pub async fn sandbox_create(
                 );
             }
 
+            if let Some(target_port) = expose
+                && !structured_output
+            {
+                eprintln!(
+                    "  {} Exposed sandbox {sandbox_name} service on 127.0.0.1:{target_port}",
+                    "\u{2713}".green().bold(),
+                );
+                if let Some(url) = service_urls.get("").filter(|url| !url.is_empty()) {
+                    eprintln!(
+                        "  Access at: {}",
+                        service_url_for_gateway(url, &effective_server)
+                    );
+                }
+            }
+
             if structured_output {
-                crate::output::print_output_single(output, &last_sandbox, sandbox_to_json)?;
+                let mut value = sandbox_to_json(&last_sandbox);
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("service_urls".to_string(), serde_json::json!(service_urls));
+                }
+                crate::output::print_output_single(output, &value, Clone::clone)?;
                 return Ok(0);
             }
 
@@ -1231,7 +1288,7 @@ enum ResolvedSource {
 /// 1. Existing file with `.tar`, `.tar.gz`, or `.tgz` extension → rootfs tar archive.
 /// 2. Local Dockerfile and directory paths → an actionable build-and-tag error.
 /// 3. Other explicit local paths → an actionable error.
-/// 4. Full image reference or community sandbox name → resolve as an image.
+/// 4. Any other value is passed through as an explicit image reference.
 fn resolve_from(value: &str) -> Result<ResolvedSource> {
     let path = Path::new(value);
 
@@ -1272,11 +1329,7 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
         ));
     }
 
-    // Full image reference or community sandbox name — delegate to shared
-    // resolution in openshell-core.
-    Ok(ResolvedSource::Image(
-        openshell_core::image::resolve_community_image(value),
-    ))
+    Ok(ResolvedSource::Image(value.to_string()))
 }
 
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // already lowercased
@@ -1345,7 +1398,9 @@ async fn stage_rootfs_tar(
     // archive over its configured limit, before allocating anything.
     let slot = client
         .begin_rootfs_tar_staging(BeginRootfsTarStagingRequest {
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             file_name,
             size_bytes: source_meta.len(),
         })
@@ -1566,7 +1621,9 @@ where
     let response = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -1575,14 +1632,13 @@ where
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
-    let sandbox_id = if sandbox.object_id().is_empty() {
-        return Err(miette::miette!("sandbox missing metadata"));
-    } else {
-        sandbox.object_id().to_string()
-    };
-
     let config_result = client
-        .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
+        .get_sandbox_config(GetSandboxConfigRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
         .await;
     let config = match config_result {
         Ok(response) => response.into_inner(),
@@ -1598,7 +1654,6 @@ where
         }
         Err(error) => return Err(error).into_diagnostic(),
     };
-
     if policy_only {
         let Some(ref policy) = config.policy else {
             return Err(miette::miette!(
@@ -1655,6 +1710,41 @@ where
         "Resource version:".dimmed(),
         sandbox.metadata.as_ref().map_or(0, |m| m.resource_version)
     );
+    println!(
+        "  {} {}",
+        "Restart policy:".dimmed(),
+        sandbox
+            .spec
+            .as_ref()
+            .map_or("never", |spec| { restart_policy_name(spec.restart_policy) })
+    );
+    if let Some(status) = sandbox.status.as_ref() {
+        println!(
+            "  {} {}",
+            "Main process instance:".dimmed(),
+            if status.main_process_instance_id.is_empty() {
+                "-"
+            } else {
+                &status.main_process_instance_id
+            }
+        );
+        println!(
+            "  {} {}",
+            "Last exit code:".dimmed(),
+            status
+                .exit_code
+                .map_or_else(|| "-".to_string(), |code| code.to_string())
+        );
+        println!("  {} {}", "Restart count:".dimmed(), status.restart_count);
+        println!(
+            "  {} {}",
+            "Next restart:".dimmed(),
+            status.next_restart_time.as_ref().map_or_else(
+                || "-".to_string(),
+                |time| format_epoch_ms(proto_timestamp_ms(Some(time))),
+            )
+        );
+    }
 
     // Display labels if present
     if let Some(metadata) = &sandbox.metadata
@@ -1753,15 +1843,14 @@ where
     Ok(())
 }
 
-/// Maximum stdin payload size (4 MiB). Prevents the CLI from reading unbounded
-/// data into memory before the server rejects an oversized message.
-const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
-
 fn local_terminal_size() -> Option<(u32, u32)> {
     crossterm::terminal::size()
         .ok()
         .map(|(cols, rows)| (u32::from(cols), u32::from(rows)))
 }
+
+const MAX_EXEC_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_EXEC_STDIN_BYTES: usize = 4 * 1024 * 1024;
 
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
@@ -1786,7 +1875,9 @@ pub async fn sandbox_exec_grpc(
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -1803,37 +1894,67 @@ pub async fn sandbox_exec_grpc(
         ));
     }
 
-    // Read stdin if piped (not a TTY), using spawn_blocking to avoid blocking
-    // the async runtime. Cap the read at MAX_STDIN_PAYLOAD + 1 so we never
-    // buffer more than the limit into memory.
-    let stdin_payload = if std::io::stdin().is_terminal() {
+    // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
+    let stdin_is_terminal = std::io::stdin().is_terminal();
+    let tty = tty_override.unwrap_or_else(|| stdin_is_terminal && std::io::stdout().is_terminal());
+
+    // Preserve unary exec for small pipes, including older gateways whose
+    // interactive RPC closes the SSH channel when stdin reaches EOF. Retain
+    // the existing 4 MiB input cap because the supervisor's process stdin
+    // queue is unbounded; larger input should use file upload instead.
+    let stdin_prefix = if stdin_is_terminal {
         Vec::new()
     } else {
         tokio::task::spawn_blocking(|| {
-            let limit = (MAX_STDIN_PAYLOAD + 1) as u64;
-            let mut buf = Vec::new();
+            let mut prefix = Vec::new();
             std::io::stdin()
-                .take(limit)
-                .read_to_end(&mut buf)
+                .take((MAX_EXEC_STDIN_BYTES + 1) as u64)
+                .read_to_end(&mut prefix)
                 .into_diagnostic()?;
-            if buf.len() > MAX_STDIN_PAYLOAD {
+            if prefix.len() > MAX_EXEC_STDIN_BYTES {
                 return Err(miette::miette!(
-                    "stdin payload exceeds {} byte limit; pipe smaller inputs or use `sandbox upload`",
-                    MAX_STDIN_PAYLOAD
+                    "piped stdin exceeds the 4 MiB limit; use `sandbox upload` for larger input"
                 ));
             }
-            Ok(buf)
+            Ok::<_, miette::Report>(prefix)
         })
         .await
-        .into_diagnostic()?? // first ? unwraps JoinError, second ? unwraps Result
+        .into_diagnostic()??
     };
 
-    // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
-    let tty = tty_override
-        .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+    let (cols, rows) = if tty {
+        local_terminal_size().unwrap_or((80, 24))
+    } else {
+        (0, 0)
+    };
+    let mut request = ExecSandboxRequest {
+        request_id: String::new(),
+        sandbox: name.to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            workspace.to_string(),
+        )),
+        command: command.to_vec(),
+        workdir: workdir.unwrap_or_default().to_string(),
+        environment: environment.clone(),
+        execution_timeout: proto_execution_timeout(timeout_seconds)?,
+        stdin: stdin_prefix,
+        tty,
+        cols,
+        rows,
+        no_login_shell,
+        exec_mode: ExecMode::LoginShell.into(),
+    };
 
-    if tty && std::io::stdin().is_terminal() {
-        return sandbox_exec_interactive_grpc(
+    let stdin_for_size_check = std::mem::take(&mut request.stdin);
+    let start_request_bytes = request.encoded_len();
+    request.stdin = stdin_for_size_check;
+    if start_request_bytes > MAX_EXEC_REQUEST_BYTES {
+        return Err(miette::miette!(
+            "exec command or environment exceeds the gateway's 1 MiB message limit"
+        ));
+    }
+    if (tty && stdin_is_terminal) || request.encoded_len() > MAX_EXEC_REQUEST_BYTES {
+        return sandbox_exec_streaming_grpc(
             client,
             &sandbox,
             command,
@@ -1841,31 +1962,16 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             environment,
             no_login_shell,
+            tty,
+            stdin_is_terminal,
+            std::mem::take(&mut request.stdin),
         )
         .await;
     }
 
-    let (cols, rows) = if tty {
-        local_terminal_size().unwrap_or_default()
-    } else {
-        (0, 0)
-    };
-
     // Make the streaming gRPC call.
     let mut stream = client
-        .exec_sandbox(ExecSandboxRequest {
-            sandbox_id: sandbox.object_id().to_string(),
-            command: command.to_vec(),
-            workdir: workdir.unwrap_or_default().to_string(),
-            environment: environment.clone(),
-            execution_timeout: proto_execution_timeout(timeout_seconds)?,
-            stdin: stdin_payload,
-            tty,
-            cols,
-            rows,
-            no_login_shell,
-            exec_mode: openshell_core::proto::ExecMode::LoginShell.into(),
-        })
+        .exec_sandbox(request)
         .await
         .into_diagnostic()?
         .into_inner();
@@ -1921,7 +2027,7 @@ pub async fn service_forward_tcp(
     let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
     let mut client = grpc_client(server, tls).await?;
 
-    let sandbox = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+    fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
 
     let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
         .await
@@ -1940,7 +2046,8 @@ pub async fn service_forward_tcp(
         name,
     );
 
-    let sandbox_id = sandbox.object_id().to_string();
+    let sandbox_name = name.to_string();
+    let sandbox_workspace = workspace.to_string();
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::channel::<String>(1);
     let mut health_check = tokio::time::interval(Duration::from_secs(2));
     health_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1960,12 +2067,17 @@ pub async fn service_forward_tcp(
                     .wrap_err("failed to accept local forward connection")?;
                 set_tcp_nodelay_best_effort(&socket);
                 let mut client = client.clone();
-                let sandbox_id = sandbox_id.clone();
+                let sandbox_name = sandbox_name.clone();
+                let sandbox_workspace = sandbox_workspace.clone();
                 let target_host = target_host.to_string();
                 let service_id = format!("service-forward:{name}:{target_host}:{target_port}");
                 let fatal_tx = fatal_tx.clone();
                 tokio::spawn(async move {
-                    let token = match create_forward_session_token(&mut client, &sandbox_id).await {
+                    let token = match create_forward_session_token(
+                        &mut client,
+                        &sandbox_name,
+                        &sandbox_workspace,
+                    ).await {
                         Ok(token) => token,
                         Err(err) => {
                             tracing::warn!(peer = %peer, error = %err, "service forward session creation failed");
@@ -1978,7 +2090,8 @@ pub async fn service_forward_tcp(
                     if let Err(err) = forward_one_tcp_connection(
                         &mut client,
                         socket,
-                        sandbox_id,
+                        sandbox_name,
+                        sandbox_workspace,
                         target_host,
                         target_port,
                         service_id,
@@ -2002,11 +2115,15 @@ pub async fn service_forward_tcp(
 
 async fn create_forward_session_token(
     client: &mut crate::tls::GrpcClient,
-    sandbox_id: &str,
+    sandbox_name: &str,
+    workspace: &str,
 ) -> std::result::Result<String, ForwardTcpConnectionError> {
     let response = client
         .create_ssh_session(CreateSshSessionRequest {
-            sandbox_id: sandbox_id.to_string(),
+            sandbox: sandbox_name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .map_err(ForwardTcpConnectionError::from_status)?;
@@ -2021,7 +2138,9 @@ async fn fetch_ready_sandbox_for_forward(
     let response = match client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
     {
@@ -2103,10 +2222,12 @@ fn parse_tcp_forward_spec(local: Option<&str>, default_port: u16) -> Result<(Str
     Ok(("127.0.0.1".to_string(), port))
 }
 
+#[allow(clippy::too_many_arguments)] // one connection's sandbox, target, and authorization context
 async fn forward_one_tcp_connection(
     client: &mut crate::tls::GrpcClient,
     socket: tokio::net::TcpStream,
-    sandbox_id: String,
+    sandbox_name: String,
+    workspace: String,
     target_host: String,
     target_port: u16,
     service_id: String,
@@ -2119,7 +2240,8 @@ async fn forward_one_tcp_connection(
     tx.send(TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
-                sandbox_id,
+                sandbox: sandbox_name,
+                workspace: workspace.clone(),
                 service_id,
                 target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
                     host: target_host,
@@ -2217,7 +2339,8 @@ impl Drop for TaskGuard {
     }
 }
 
-async fn sandbox_exec_interactive_grpc(
+#[allow(clippy::too_many_arguments)]
+async fn sandbox_exec_streaming_grpc(
     mut client: crate::tls::GrpcClient,
     sandbox: &Sandbox,
     command: &[String],
@@ -2225,31 +2348,42 @@ async fn sandbox_exec_interactive_grpc(
     timeout_seconds: u32,
     environment: &HashMap<String, String>,
     no_login_shell: bool,
+    tty: bool,
+    stdin_is_terminal: bool,
+    stdin_prefix: Vec<u8>,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
     use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
 
-    let (cols, rows) = local_terminal_size().unwrap_or((80, 24));
+    let (cols, rows) = if tty {
+        local_terminal_size().unwrap_or((80, 24))
+    } else {
+        (0, 0)
+    };
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(4096);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
 
     // Send the start message with exec metadata.
     input_tx
         .send(ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
-                sandbox_id: sandbox.object_id().to_string(),
+                request_id: String::new(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (sandbox.object_workspace()).to_string(),
+                )),
                 command: command.to_vec(),
                 workdir: workdir.unwrap_or_default().to_string(),
                 environment: environment.clone(),
                 no_login_shell,
                 execution_timeout: proto_execution_timeout(timeout_seconds)?,
                 stdin: Vec::new(),
-                tty: true,
+                tty,
                 cols,
                 rows,
-                exec_mode: openshell_core::proto::ExecMode::LoginShell.into(),
+                exec_mode: ExecMode::LoginShell.into(),
             })),
         })
         .await
@@ -2261,40 +2395,62 @@ async fn sandbox_exec_interactive_grpc(
         .into_diagnostic()?
         .into_inner();
 
-    // Enable raw mode so keystrokes are forwarded immediately.
-    crossterm::terminal::enable_raw_mode().into_diagnostic()?;
-    let raw_guard = RawModeGuard;
+    // Raw mode is only appropriate for an interactive terminal, not a pipe.
+    let raw_guard = if tty && stdin_is_terminal {
+        crossterm::terminal::enable_raw_mode().into_diagnostic()?;
+        Some(RawModeGuard)
+    } else {
+        None
+    };
 
     // Stdin reader on a detached OS thread. Using std::thread (not
     // spawn_blocking) so the tokio runtime shutdown doesn't wait for a
     // thread blocked on stdin.read(). The thread exits when the channel
     // closes (blocking_send returns Err) or stdin hits EOF.
     let stdin_tx = input_tx.clone();
+    let (stdin_result_tx, mut stdin_result_rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
         let mut buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stdin_tx
-                        .blocking_send(ExecSandboxInput {
-                            payload: Some(exec_sandbox_input::Payload::Stdin(buf[..n].to_vec())),
-                        })
-                        .is_err()
-                    {
-                        break;
+        let result = (|| {
+            for chunk in stdin_prefix.chunks(buf.len()) {
+                if stdin_tx
+                    .blocking_send(ExecSandboxInput {
+                        payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
+                    })
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) => return Ok(()),
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                    Ok(n) => {
+                        if stdin_tx
+                            .blocking_send(ExecSandboxInput {
+                                payload: Some(exec_sandbox_input::Payload::Stdin(
+                                    buf[..n].to_vec(),
+                                )),
+                            })
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
                     }
                 }
             }
-        }
+        })();
+        let _ = stdin_result_tx.send(result);
     });
 
     // SIGWINCH handler: forward terminal resize events.
     #[cfg(unix)]
-    let resize_task = {
+    let resize_task = if tty && stdin_is_terminal {
         let resize_tx = input_tx.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut sig =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                     .expect("failed to register SIGWINCH handler");
@@ -2310,17 +2466,56 @@ async fn sandbox_exec_interactive_grpc(
                     }
                 }
             }
-        })
+        }))
+    } else {
+        None
     };
     #[cfg(unix)]
-    let _resize_guard = TaskGuard(resize_task);
+    let _resize_guard = resize_task.map(TaskGuard);
+
+    // Keep a sender until the reader confirms clean EOF. On a read error,
+    // cancel the response stream before the gateway can treat channel EOF as
+    // successful completion of a partial command.
+    let mut pipe_input_tx = Some(input_tx);
 
     let mut exit_code = 0i32;
     let mut exit_seen = false;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
 
-    while let Some(event) = stream.next().await {
+    let mut stdin_reader_done = false;
+    loop {
+        let event = tokio::select! {
+            result = &mut stdin_result_rx, if !stdin_reader_done => {
+                stdin_reader_done = true;
+                match result.into_diagnostic()? {
+                    Ok(()) => {
+                        let sender = pipe_input_tx.take().expect("stdin sender is held until EOF");
+                        drop(sender);
+                    }
+                    Err(error) => {
+                        let sender = pipe_input_tx.take().expect("stdin sender is held until EOF");
+                        // A clean request EOF would make the gateway execute
+                        // the truncated input. An invalid frame makes the
+                        // gateway abort the command instead.
+                        let abort = ExecSandboxInput { payload: None };
+                        if tokio::time::timeout(Duration::from_secs(5), sender.send(abort))
+                            .await
+                            .is_err()
+                        {
+                            // Keep the request body open if a blocked remote
+                            // stdin prevents delivery of the abort frame.
+                            std::mem::forget(sender);
+                        }
+                        drop(stream);
+                        return Err(error).into_diagnostic();
+                    }
+                }
+                continue;
+            }
+            event = stream.next() => event,
+        };
+        let Some(event) = event else { break };
         let event = event.into_diagnostic()?;
         match event.payload {
             Some(exec_sandbox_event::Payload::Stdout(out)) => {
@@ -2342,10 +2537,12 @@ async fn sandbox_exec_interactive_grpc(
         }
     }
 
-    drop(input_tx);
-
     // Drop the raw mode guard to restore the terminal before returning.
     drop(raw_guard);
+
+    if !stdin_reader_done && let Ok(result) = stdin_result_rx.try_recv() {
+        result.into_diagnostic()?;
+    }
 
     // A stream that closes without an Exit event means we never observed the
     // command's outcome. Treat it as a relay failure rather than reporting a
@@ -2699,6 +2896,14 @@ fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
     ]
 }
 
+fn restart_policy_name(policy: i32) -> &'static str {
+    match SandboxRestartPolicy::try_from(policy) {
+        Ok(SandboxRestartPolicy::OnFailure) => "on-failure",
+        Ok(SandboxRestartPolicy::Always) => "always",
+        Ok(SandboxRestartPolicy::Unspecified | SandboxRestartPolicy::Never) | Err(_) => "never",
+    }
+}
+
 fn sandbox_detail_to_json(
     sandbox: &Sandbox,
     config: &GetSandboxConfigResponse,
@@ -2707,6 +2912,33 @@ fn sandbox_detail_to_json(
     let obj = value
         .as_object_mut()
         .expect("sandbox_to_json returns object");
+
+    let restart_policy = sandbox
+        .spec
+        .as_ref()
+        .map_or("never", |spec| restart_policy_name(spec.restart_policy));
+    obj.insert("restart_policy".into(), serde_json::json!(restart_policy));
+    if let Some(status) = sandbox.status.as_ref() {
+        obj.insert(
+            "main_process_instance_id".into(),
+            serde_json::json!(status.main_process_instance_id),
+        );
+        obj.insert("exit_code".into(), serde_json::json!(status.exit_code));
+        obj.insert(
+            "restart_count".into(),
+            serde_json::json!(status.restart_count),
+        );
+        obj.insert(
+            "next_restart_at_ms".into(),
+            serde_json::json!(proto_timestamp_ms(status.next_restart_time.as_ref())),
+        );
+        obj.insert(
+            "main_process_started_at_ms".into(),
+            serde_json::json!(proto_timestamp_ms(
+                status.main_process_started_time.as_ref()
+            )),
+        );
+    }
 
     let policy_source = if config.policy_source == PolicySource::Global as i32 {
         "global"
@@ -2809,7 +3041,9 @@ pub async fn sandbox_template_create(
                     desired_service_level,
                 }),
             }),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -2874,7 +3108,9 @@ pub async fn sandbox_template_get(
     let response = client
         .get_sandbox_template(GetSandboxTemplateRequest {
             name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -2978,7 +3214,9 @@ pub async fn sandbox_template_delete(
                 request_id: String::new(),
                 allow_missing: true,
                 name: name.clone(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
             })
             .await
             .into_diagnostic()?;
@@ -3393,7 +3631,7 @@ pub async fn sandbox_delete(
     let mut failures = Vec::new();
     for name in &names_to_delete {
         // Stop any background port forwards for this sandbox before deleting.
-        if let Ok(stopped) = stop_forwards_for_sandbox(name) {
+        if let Ok(stopped) = stop_forwards_for_sandbox(workspace, name) {
             for port in stopped {
                 eprintln!(
                     "{} Stopped forward of port {port} for sandbox {name}",
@@ -3407,7 +3645,9 @@ pub async fn sandbox_delete(
                 request_id: String::new(),
                 allow_missing: true,
                 name: name.clone(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
             })
             .await
         {
@@ -3453,7 +3693,7 @@ pub async fn sandbox_stop(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    if let Ok(stopped) = stop_forwards_for_sandbox(name) {
+    if let Ok(stopped) = stop_forwards_for_sandbox(workspace, name) {
         for port in stopped {
             eprintln!(
                 "{} Stopped forward of port {port} for sandbox {name}",
@@ -3467,7 +3707,9 @@ pub async fn sandbox_stop(
         .stop_sandbox(StopSandboxRequest {
             request_id: String::new(),
             name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -3491,7 +3733,9 @@ pub async fn sandbox_start(
         .start_sandbox(StartSandboxRequest {
             request_id: String::new(),
             name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -3524,10 +3768,12 @@ async fn wait_for_lifecycle_phase(
             .and_then(|value| value.parse().ok())
             .unwrap_or(300),
     );
-    let sandbox_id = sandbox.object_id().to_string();
+    let sandbox_name = sandbox.object_name().to_string();
+    let workspace = sandbox.object_workspace().to_string();
     let mut stream = client
         .watch_sandbox(WatchSandboxRequest {
-            id: sandbox_id,
+            sandbox: sandbox_name,
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
             follow_status: true,
             follow_logs: false,
             follow_events: false,
@@ -3537,6 +3783,7 @@ async fn wait_for_lifecycle_phase(
             since_time: None,
             log_sources: Vec::new(),
             log_min_level: String::new(),
+            resume_after_cursor: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -3582,22 +3829,20 @@ pub async fn service_expose(
     sandbox: &str,
     service: &str,
     target_port: u16,
+    authorization_mode: ServiceAuthorizationMode,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .expose_service(ExposeServiceRequest {
-            request_id: String::new(),
-            sandbox: sandbox.to_string(),
-            service: service.to_string(),
-            target_port: u32::from(target_port),
-            domain: true,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
-        })
-        .await
-        .map_err(service_expose_status_error)?
-        .into_inner();
+    let response = expose_service_endpoint(
+        server,
+        sandbox,
+        service,
+        target_port,
+        authorization_mode,
+        workspace,
+        tls,
+    )
+    .await?;
 
     if service.is_empty() {
         println!(
@@ -3620,6 +3865,33 @@ pub async fn service_expose(
         println!("  URL: {}", url.cyan());
     }
     Ok(())
+}
+
+async fn expose_service_endpoint(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    target_port: u16,
+    authorization_mode: ServiceAuthorizationMode,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<ServiceEndpointResponse> {
+    let mut client = grpc_client(server, tls).await?;
+    client
+        .expose_service(ExposeServiceRequest {
+            request_id: String::new(),
+            sandbox: sandbox.to_string(),
+            name: service.to_string(),
+            target_port: u32::from(target_port),
+            domain: true,
+            authorization_mode: authorization_mode as i32,
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .map_err(service_expose_status_error)
+        .map(tonic::Response::into_inner)
 }
 
 fn service_expose_status_error(status: Status) -> miette::Report {
@@ -3693,9 +3965,11 @@ pub async fn service_get(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .get_service(GetServiceRequest {
-            sandbox: sandbox.to_string(),
-            service: service.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            sandbox: (sandbox).to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            name: service.to_string(),
         })
         .await
         .map_err(|status| service_status_error("get service", "sandbox:read", status))?
@@ -3718,8 +3992,10 @@ pub async fn service_delete(
             request_id: String::new(),
             allow_missing: false,
             sandbox: sandbox.to_string(),
-            service: service.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            name: service.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .map_err(|status| service_status_error("delete service", "sandbox:write", status))?
@@ -3779,8 +4055,9 @@ fn print_service_endpoint_table(
                 .metadata
                 .as_ref()
                 .map_or("", |m| m.workspace.as_str());
-            let service = service_display_name(&endpoint.service_name).to_string();
+            let service = service_display_name(&endpoint.name).to_string();
             let target = format!("127.0.0.1:{}", endpoint.target_port);
+            let authorization = service_authorization_mode_name(endpoint.authorization_mode);
             let url = if response.url.is_empty() {
                 String::new()
             } else {
@@ -3788,9 +4065,10 @@ fn print_service_endpoint_table(
             };
             Some((
                 workspace.to_string(),
-                endpoint.sandbox_name.clone(),
+                endpoint.sandbox.clone(),
                 service,
                 target,
+                authorization,
                 url,
             ))
         })
@@ -3802,7 +4080,7 @@ fn print_service_endpoint_table(
 
     let ws_width = if all_workspaces {
         rows.iter()
-            .map(|(ws, _, _, _, _)| ws.len())
+            .map(|(ws, _, _, _, _, _)| ws.len())
             .max()
             .unwrap_or(9)
             .max(9)
@@ -3811,50 +4089,52 @@ fn print_service_endpoint_table(
     };
     let sandbox_width = rows
         .iter()
-        .map(|(_, sandbox, _, _, _)| sandbox.len())
+        .map(|(_, sandbox, _, _, _, _)| sandbox.len())
         .max()
         .unwrap_or(7)
         .max(7);
     let service_width = rows
         .iter()
-        .map(|(_, _, service, _, _)| service.len())
+        .map(|(_, _, service, _, _, _)| service.len())
         .max()
         .unwrap_or(7)
         .max(7);
     let target_width = rows
         .iter()
-        .map(|(_, _, _, target, _)| target.len())
+        .map(|(_, _, _, target, _, _)| target.len())
         .max()
         .unwrap_or(6)
         .max(6);
 
     if all_workspaces {
         println!(
-            "{:<ws_width$}  {:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {}",
+            "{:<ws_width$}  {:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
             "WORKSPACE".bold(),
             "SANDBOX".bold(),
             "SERVICE".bold(),
             "TARGET".bold(),
+            "AUTHORIZATION".bold(),
             "URL".bold(),
         );
     } else {
         println!(
-            "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {}",
+            "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
             "SANDBOX".bold(),
             "SERVICE".bold(),
             "TARGET".bold(),
+            "AUTHORIZATION".bold(),
             "URL".bold(),
         );
     }
 
-    for (workspace, sandbox, service, target, url) in rows {
+    for (workspace, sandbox, service, target, authorization, url) in rows {
         if all_workspaces {
             println!(
-                "{workspace:<ws_width$}  {sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {url}"
+                "{workspace:<ws_width$}  {sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
             );
         } else {
             println!(
-                "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {url}"
+                "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
             );
         }
     }
@@ -3877,15 +4157,23 @@ fn service_endpoint_to_json(
 
     Some(serde_json::json!({
         "workspace": workspace,
-        "sandbox": endpoint.sandbox_name,
-        "service": endpoint.service_name,
+        "sandbox": endpoint.sandbox,
+        "service": endpoint.name,
         "target_port": endpoint.target_port,
+        "authorization_mode": service_authorization_mode_name(endpoint.authorization_mode),
         "url": url,
     }))
 }
 
 fn service_display_name(service: &str) -> &str {
     if service.is_empty() { "-" } else { service }
+}
+
+fn service_authorization_mode_name(mode: i32) -> &'static str {
+    match ServiceAuthorizationMode::try_from(mode).unwrap_or(ServiceAuthorizationMode::Strip) {
+        ServiceAuthorizationMode::BearerPassthrough => "bearer_passthrough",
+        ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip => "strip",
+    }
 }
 
 /// Read gcloud Application Default Credentials from disk.
@@ -4130,7 +4418,9 @@ pub async fn workspace_member_add(
     let response = client
         .add_workspace_member(AddWorkspaceMemberRequest {
             request_id: String::new(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             principal_subject: subject.to_string(),
             role: role_val.into(),
         })
@@ -4166,7 +4456,9 @@ pub async fn workspace_member_remove(
         .remove_workspace_member(RemoveWorkspaceMemberRequest {
             request_id: String::new(),
             allow_missing: true,
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             principal_subject: subject.to_string(),
         })
         .await
@@ -4204,7 +4496,9 @@ pub async fn workspace_member_list(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_workspace_members(ListWorkspaceMembersRequest {
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             page_size,
             page_token: page_token.to_string(),
         })
@@ -4540,7 +4834,6 @@ pub async fn sandbox_policy_set_global(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .update_config(UpdateConfigRequest {
-            name: String::new(),
             policy: Some(policy),
             global: true,
             ..Default::default()
@@ -4570,20 +4863,12 @@ pub async fn sandbox_settings_get(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
-
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox.object_id().to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -4740,7 +5025,6 @@ pub async fn gateway_setting_set(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .update_config(UpdateConfigRequest {
-            name: String::new(),
             setting_key: key.to_string(),
             setting_value: Some(setting_value),
             global: true,
@@ -4773,10 +5057,12 @@ pub async fn sandbox_setting_set(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .update_config(UpdateConfigRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             setting_key: key.to_string(),
             setting_value: Some(setting_value),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             ..Default::default()
         })
         .await
@@ -4806,7 +5092,6 @@ pub async fn gateway_setting_delete(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .update_config(UpdateConfigRequest {
-            name: String::new(),
             setting_key: key.to_string(),
             delete_setting: true,
             global: true,
@@ -4839,10 +5124,12 @@ pub async fn sandbox_setting_delete(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .update_config(UpdateConfigRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             setting_key: key.to_string(),
             delete_setting: true,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             ..Default::default()
         })
         .await
@@ -4885,10 +5172,12 @@ pub async fn sandbox_policy_set(
     // Get current version so we can detect no-ops.
     let current_version = client
         .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             version: 0,
             global: false,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .ok()
@@ -4897,9 +5186,11 @@ pub async fn sandbox_policy_set(
 
     let response = client
         .update_config(UpdateConfigRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             policy: Some(policy),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             ..Default::default()
         })
         .await
@@ -4944,10 +5235,12 @@ pub async fn sandbox_policy_set(
 
         let status_resp = client
             .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-                name: name.to_string(),
+                sandbox: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 version: resp.version,
                 global: false,
-                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
             .into_diagnostic()?;
@@ -5026,25 +5319,13 @@ pub async fn sandbox_policy_update(
     )?;
 
     let mut client = grpc_client(server, tls).await?;
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette!("sandbox not found"))?;
-
-    let sandbox_id = if sandbox.object_id().is_empty() {
-        return Err(miette!("sandbox missing metadata"));
-    } else {
-        sandbox.object_id().to_string()
-    };
-
     let current = client
-        .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
+        .get_sandbox_config(GetSandboxConfigRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
         .await
         .into_diagnostic()?
         .into_inner();
@@ -5076,9 +5357,11 @@ pub async fn sandbox_policy_update(
     let current_hash = current.policy_hash.clone();
     let response = client
         .update_config(UpdateConfigRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             merge_operations: plan.merge_operations,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             ..Default::default()
         })
         .await
@@ -5123,10 +5406,12 @@ pub async fn sandbox_policy_update(
 
         let status_resp = client
             .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-                name: name.to_string(),
+                sandbox: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 version: response.version,
                 global: false,
-                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
             .into_diagnostic()?;
@@ -5231,10 +5516,12 @@ where
 
     let status_resp = client
         .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             version,
             global: false,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -5323,24 +5610,12 @@ where
     let (stdout, _stderr) = writers;
     let mut client = grpc_client(server, tls).await?;
 
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette!("sandbox missing from response"))?;
-    let sandbox_id = sandbox.object_id();
-    if sandbox_id.is_empty() {
-        return Err(miette!("sandbox missing metadata"));
-    }
-
     let config = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox_id.to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -5435,9 +5710,9 @@ pub async fn sandbox_policy_get_global(
 
     let status_resp = client
         .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-            name: String::new(),
             version,
             global: true,
+            sandbox: String::new(),
             workspace_scope: None,
         })
         .await
@@ -5579,11 +5854,13 @@ pub async fn sandbox_policy_list(
 
     let resp = client
         .list_sandbox_policies(ListSandboxPoliciesRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
             page_size,
             page_token: page_token.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             global: false,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -5624,10 +5901,10 @@ pub async fn sandbox_policy_list_global(
 
     let resp = client
         .list_sandbox_policies(ListSandboxPoliciesRequest {
-            name: String::new(),
             page_size,
             page_token: page_token.to_string(),
             global: true,
+            sandbox: String::new(),
             workspace_scope: None,
         })
         .await
@@ -5692,7 +5969,7 @@ fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicy
             &rev.policy_hash
         };
         let error_short = if rev.load_error.len() > 40 {
-            format!("{}...", &rev.load_error[..40])
+            truncate_status_field(&rev.load_error, 40)
         } else {
             rev.load_error.clone()
         };
@@ -5725,18 +6002,6 @@ pub async fn sandbox_logs(
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
-    // Resolve sandbox name to id.
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
-
     // Normalize "all" to empty list (server treats empty as "no filter").
     let source_filter: Vec<String> = sources
         .iter()
@@ -5762,7 +6027,10 @@ pub async fn sandbox_logs(
         // Streaming mode: use WatchSandbox.
         let mut stream = client
             .watch_sandbox(WatchSandboxRequest {
-                id: sandbox.object_id().to_string(),
+                sandbox: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 follow_status: false,
                 follow_logs: true,
                 follow_events: false,
@@ -5773,6 +6041,7 @@ pub async fn sandbox_logs(
                     .into_diagnostic()?,
                 log_sources: source_filter,
                 log_min_level: level.to_uppercase(),
+                resume_after_cursor: String::new(),
             })
             .await
             .into_diagnostic()?
@@ -5790,13 +6059,15 @@ pub async fn sandbox_logs(
         // One-shot mode: use GetSandboxLogs.
         let resp = client
             .get_sandbox_logs(GetSandboxLogsRequest {
-                sandbox_id: sandbox.object_id().to_string(),
+                sandbox: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 lines,
                 since_time: openshell_core::time::optional_timestamp_from_legacy_millis(since_ms)
                     .into_diagnostic()?,
                 sources: source_filter,
                 min_level: level.to_uppercase(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
             .into_diagnostic()?;
@@ -5871,9 +6142,11 @@ pub async fn sandbox_draft_get(
 
     let response = client
         .get_draft_policy(GetDraftPolicyRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             status_filter: status_filter.unwrap_or("").to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -5979,9 +6252,11 @@ pub async fn sandbox_draft_approve(
     let mut client = grpc_client(server, tls).await?;
     let review_token = client
         .get_draft_policy(GetDraftPolicyRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             status_filter: String::new(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -5995,9 +6270,11 @@ pub async fn sandbox_draft_approve(
     let response = client
         .approve_draft_chunk(ApproveDraftChunkRequest {
             request_id: String::new(),
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             chunk_id: chunk_id.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             review_token,
         })
         .await
@@ -6028,10 +6305,12 @@ pub async fn sandbox_draft_reject(
     client
         .reject_draft_chunk(RejectDraftChunkRequest {
             request_id: String::new(),
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             chunk_id: chunk_id.to_string(),
             reason: reason.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -6052,9 +6331,11 @@ pub async fn sandbox_draft_approve_all(
     let mut client = grpc_client(server, tls).await?;
     let approvals = client
         .get_draft_policy(GetDraftPolicyRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             status_filter: "pending".to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -6070,9 +6351,11 @@ pub async fn sandbox_draft_approve_all(
     let response = client
         .approve_all_draft_chunks(ApproveAllDraftChunksRequest {
             request_id: String::new(),
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             include_security_flagged,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             approvals,
         })
         .await
@@ -6102,8 +6385,10 @@ pub async fn sandbox_draft_clear(
     let response = client
         .clear_draft_chunks(ClearDraftChunksRequest {
             request_id: String::new(),
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -6129,8 +6414,10 @@ pub async fn sandbox_draft_history(
 
     let response = client
         .get_draft_history(GetDraftHistoryRequest {
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -6196,8 +6483,11 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
     };
     tags.push(layer_tag.to_string());
 
-    if !endpoint.access.is_empty() {
-        tags.push(format!("access={}", endpoint.access));
+    if endpoint.access != 0 {
+        tags.push(format!(
+            "access={}",
+            openshell_policy::network_access_preset_to_str(endpoint.access).unwrap_or("unknown")
+        ));
     }
 
     for r in &endpoint.rules {
@@ -6258,10 +6548,11 @@ mod tests {
     use openshell_core::proto::{
         EndpointResult, EndpointStatus, GetSandboxConfigResponse, GpuResourceRequirements,
         PolicySource, PolicyStatus, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
-        SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxStatus,
-        SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
-        SandboxWorkloadTemplateSpec, ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember,
-        WorkspaceRole, datamodel::v1::ObjectMeta,
+        SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxRestartPolicy, SandboxSpec,
+        SandboxStatus, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+        SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
+        ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember, WorkspaceRole,
+        datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -6345,6 +6636,29 @@ mod tests {
     }
 
     #[test]
+    fn policy_revision_table_handles_unicode_load_errors() {
+        // Stored diagnostics can contain Unicode paths. Byte 40 splits the
+        // character in the 40-scalar case; longer errors must also remain safe.
+        let revisions = [
+            String::new(),
+            "a".repeat(40),
+            "a".repeat(41),
+            format!("{}é", "a".repeat(39)),
+            format!("{}éz", "a".repeat(39)),
+        ]
+        .into_iter()
+        .map(|load_error| SandboxPolicyRevision {
+            version: 1,
+            status: PolicyStatus::Failed as i32,
+            load_error,
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+
+        super::print_policy_revision_table(&revisions);
+    }
+
+    #[test]
     fn service_endpoint_json_has_raw_fields_and_normalized_url() {
         let response = ServiceEndpointResponse {
             endpoint: Some(ServiceEndpoint {
@@ -6352,9 +6666,10 @@ mod tests {
                     workspace: "team-a".to_string(),
                     ..Default::default()
                 }),
-                sandbox_name: "api".to_string(),
-                service_name: String::new(),
+                sandbox: "api".to_string(),
+                name: String::new(),
                 target_port: 8080,
+                authorization_mode: ServiceAuthorizationMode::BearerPassthrough as i32,
                 ..Default::default()
             }),
             url: "https://api.openshell.localhost:3000/".to_string(),
@@ -6369,6 +6684,7 @@ mod tests {
                 "sandbox": "api",
                 "service": "",
                 "target_port": 8080,
+                "authorization_mode": "bearer_passthrough",
                 "url": "https://api.openshell.localhost:17670/",
             })
         );
@@ -6696,18 +7012,23 @@ mod tests {
 
     #[test]
     fn sandbox_should_persist_defaults_to_persistent() {
-        assert!(sandbox_should_persist(true, None));
+        assert!(sandbox_should_persist(true, None, None));
     }
 
     #[test]
     fn sandbox_should_not_persist_when_no_keep_is_set() {
-        assert!(!sandbox_should_persist(false, None));
+        assert!(!sandbox_should_persist(false, None, None));
     }
 
     #[test]
     fn sandbox_should_persist_when_forward_is_requested() {
         let spec = openshell_core::forward::ForwardSpec::new(8080);
-        assert!(sandbox_should_persist(false, Some(&spec)));
+        assert!(sandbox_should_persist(false, Some(&spec), None));
+    }
+
+    #[test]
+    fn sandbox_should_persist_when_service_exposure_is_requested() {
+        assert!(sandbox_should_persist(false, None, Some(8080)));
     }
 
     #[test]
@@ -6803,7 +7124,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_from_keeps_bare_community_name_when_local_directory_matches() {
+    fn resolve_from_keeps_bare_image_reference_when_local_directory_matches() {
         let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6815,11 +7136,8 @@ mod tests {
         let result = resolve_from("python");
 
         std::env::set_current_dir(original_dir).expect("restore current directory");
-        match result.expect("bare community name should not be a local path") {
-            super::ResolvedSource::Image(image) => assert_eq!(
-                image,
-                "ghcr.io/nvidia/openshell-community/sandboxes/python:latest"
-            ),
+        match result.expect("bare image reference should not be a local path") {
+            super::ResolvedSource::Image(image) => assert_eq!(image, "python"),
             other @ super::ResolvedSource::RootfsTar { .. } => {
                 panic!("expected image source, got {other:?}");
             }
@@ -7117,7 +7435,6 @@ mod tests {
     #[test]
     fn ready_false_condition_message_prefers_reason_and_message() {
         let status = SandboxStatus {
-            sandbox_name: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
@@ -7138,7 +7455,6 @@ mod tests {
     #[test]
     fn ready_false_condition_message_ignores_non_ready_conditions() {
         let status = SandboxStatus {
-            sandbox_name: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
                 r#type: "Scheduled".to_string(),
@@ -7354,7 +7670,7 @@ mod tests {
             host: "host.example.test".to_string(),
             port: 443,
             protocol: "rest".to_string(),
-            access: "read-only".to_string(),
+            access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
             ..Default::default()
         };
         assert_eq!(
@@ -7535,6 +7851,22 @@ mod tests {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(2);
+        sandbox.spec = Some(SandboxSpec {
+            restart_policy: SandboxRestartPolicy::OnFailure as i32,
+            ..Default::default()
+        });
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Starting as i32,
+            main_process_instance_id: "main-2".to_string(),
+            exit_code: Some(9),
+            restart_count: 2,
+            next_restart_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+            main_process_started_time: openshell_core::time::timestamp_from_millis(
+                1_699_999_000_000,
+            )
+            .ok(),
+            ..Default::default()
+        });
 
         let config = GetSandboxConfigResponse {
             policy_source: PolicySource::Global as i32,
@@ -7546,7 +7878,13 @@ mod tests {
 
         assert_eq!(json["id"], "sb-123");
         assert_eq!(json["name"], "test-sb");
-        assert_eq!(json["phase"], "Ready");
+        assert_eq!(json["phase"], "Starting");
+        assert_eq!(json["restart_policy"], "on-failure");
+        assert_eq!(json["main_process_instance_id"], "main-2");
+        assert_eq!(json["exit_code"], 9);
+        assert_eq!(json["restart_count"], 2);
+        assert_eq!(json["next_restart_at_ms"], 1_700_000_000_000_i64);
+        assert_eq!(json["main_process_started_at_ms"], 1_699_999_000_000_i64);
         assert_eq!(json["policy_source"], "global");
         assert_eq!(json["revision"], 3);
         assert!(json["policy"].is_null());

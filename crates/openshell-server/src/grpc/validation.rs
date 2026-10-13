@@ -10,7 +10,7 @@
 
 use openshell_core::proto::{
     CredentialHandle, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
-    SandboxSpec, SandboxTemplate,
+    SandboxRestartPolicy, SandboxSpec, SandboxTemplate,
 };
 use openshell_core::rpc_error::invalid_argument;
 use prost::Message;
@@ -44,6 +44,9 @@ pub(super) const MAX_MAIN_PROCESS_ARGV_SIZE: usize = 256 * 1024;
 /// Command arguments only reject NUL (newlines are valid for inline scripts).
 /// Environment values and workdir reject both NUL and newlines.
 pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(), Status> {
+    if req.sandbox.is_empty() {
+        return Err(Status::invalid_argument("sandbox is required"));
+    }
     if req.command.len() > MAX_EXEC_COMMAND_ARGS {
         return Err(invalid_argument(
             "command",
@@ -203,6 +206,7 @@ pub(super) fn validate_sandbox_spec(name: &str, spec: &SandboxSpec) -> Result<()
     if !spec.command.is_empty() {
         validate_main_process_command(&spec.command)?;
     }
+    validate_restart_policy(spec)?;
 
     // --- spec.policy serialized size ---
     validate_sandbox_policy_size(spec)?;
@@ -219,7 +223,18 @@ pub(super) fn validate_sandbox_governance_spec(
     if !spec.command.is_empty() {
         validate_main_process_command(&spec.command)?;
     }
+    validate_restart_policy(spec)?;
     validate_sandbox_policy_size(spec)?;
+    Ok(())
+}
+
+fn validate_restart_policy(spec: &SandboxSpec) -> Result<(), Status> {
+    SandboxRestartPolicy::try_from(spec.restart_policy).map_err(|_| {
+        invalid_argument(
+            "spec.restart_policy",
+            format!("unknown restart_policy value: {}", spec.restart_policy),
+        )
+    })?;
     Ok(())
 }
 
@@ -1147,6 +1162,7 @@ mod tests {
             ),
             (
                 validate_exec_request_fields(&ExecSandboxRequest {
+                    sandbox: "sandbox".into(),
                     command: vec!["a\0b".into()],
                     ..Default::default()
                 })
@@ -1221,6 +1237,17 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_empty_defaults() {
         assert!(validate_sandbox_spec("", &default_spec()).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_unknown_restart_policy() {
+        let spec = SandboxSpec {
+            restart_policy: 99,
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("restart_policy"));
     }
 
     #[test]
@@ -1472,7 +1499,8 @@ mod tests {
     #[test]
     fn validate_exec_request_rejects_reserved_env_key() {
         let req = ExecSandboxRequest {
-            sandbox_id: "id".to_string(),
+            sandbox: "id".to_string(),
+            workspace_scope: None,
             command: vec!["echo".to_string()],
             environment: std::iter::once(("OPENSHELL_SANDBOX_ID".to_string(), "evil".to_string()))
                 .collect(),
@@ -1489,7 +1517,8 @@ mod tests {
     #[test]
     fn validate_exec_request_allows_pyfunc_helper_key() {
         let req = ExecSandboxRequest {
-            sandbox_id: "id".to_string(),
+            sandbox: "id".to_string(),
+            workspace_scope: None,
             command: vec!["python".to_string()],
             environment: std::iter::once(("OPENSHELL_PYFUNC_B64".to_string(), "data".to_string()))
                 .collect(),
@@ -2153,6 +2182,34 @@ mod tests {
     }
 
     #[test]
+    fn validate_policy_safety_reports_unknown_enforcement() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "github_api".into(),
+            NetworkPolicyRule {
+                name: "github-api-readonly".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.github.com".into(),
+                    port: 443,
+                    protocol: "rest".into(),
+                    enforcement: 99,
+                    access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let err = validate_policy_safety(&policy).unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("endpoint 0"));
+        assert!(err.message().contains("unknown enforcement enum value 99"));
+    }
+
+    #[test]
     fn validate_policy_safety_rejects_invalid_middleware_before_acceptance() {
         use openshell_core::proto::{MiddlewareEndpointSelector, NetworkMiddlewareConfig};
 
@@ -2367,7 +2424,8 @@ mod tests {
     #[test]
     fn validate_exec_allows_newlines_in_command_args() {
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox: "test".to_string(),
+            workspace_scope: None,
             command: vec![
                 "python3".to_string(),
                 "-c".to_string(),
@@ -2381,7 +2439,8 @@ mod tests {
     #[test]
     fn validate_exec_still_rejects_null_bytes_in_command_args() {
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox: "test".to_string(),
+            workspace_scope: None,
             command: vec!["echo".to_string(), "hello\x00world".to_string()],
             ..Default::default()
         };
@@ -2392,7 +2451,8 @@ mod tests {
     #[test]
     fn validate_exec_still_rejects_newlines_in_workdir() {
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox: "test".to_string(),
+            workspace_scope: None,
             command: vec!["ls".to_string()],
             workdir: "/tmp\nmalicious".to_string(),
             ..Default::default()
@@ -2404,7 +2464,8 @@ mod tests {
     #[test]
     fn validate_exec_still_rejects_newlines_in_env_values() {
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox: "test".to_string(),
+            workspace_scope: None,
             command: vec!["ls".to_string()],
             environment: std::iter::once(("VAR".to_string(), "val\nmalicious".to_string()))
                 .collect(),

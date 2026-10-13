@@ -14,6 +14,7 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Subscriber;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
+use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
 
@@ -75,13 +76,16 @@ where
         },
     );
     let (jsonl_layer, jsonl_dir) = build_ocsf_jsonl_layer(gateway.compute_driver());
+    let diagnostic_filter = env_filter.clone().or(filter_fn(|metadata| {
+        metadata.target() == openshell_ocsf::OCSF_TARGET
+    }));
 
-    // Keep the audit sink independent from the operator's diagnostic log
-    // level. An explicit JSONL opt-in must keep every OCSF event even when the
-    // console and routed diagnostic logs are restricted to `warn` or `error`.
+    // OCSF events always reach audit sinks even when the diagnostic level is
+    // more restrictive. The JSONL opt-in remains independent of console logs.
     let layer = tracing_subscriber::fmt::layer()
+        .event_format(GatewayEventFormat)
         .with_filter(env_filter.clone())
-        .and_then(tracing_log_bus.layer().with_filter(env_filter.clone()))
+        .and_then(tracing_log_bus.layer().with_filter(diagnostic_filter))
         .and_then(jsonl_layer)
         .and_then(
             tracer_provider
@@ -111,16 +115,60 @@ where
     )
 }
 
+fn filter_from(directives: &str) -> EnvFilter {
+    EnvFilter::try_new(directives).unwrap_or_else(|_| EnvFilter::new("info"))
+}
+
+struct GatewayEventFormat;
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for GatewayEventFormat
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        context: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        if event.metadata().target() == openshell_ocsf::OCSF_TARGET
+            && let Some(ocsf) = openshell_ocsf::clone_current_event()
+        {
+            return writeln!(
+                writer,
+                "{} OCSF {}",
+                chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+                ocsf.format_shorthand()
+            );
+        }
+        tracing_subscriber::fmt::format().format_event(context, writer, event)
+    }
+}
+
 pub fn install(
-    env_filter: EnvFilter,
+    filter_directives: &str,
     tracing_log_bus: &TracingLogBus,
+    ocsf_log: Option<&crate::ocsf_log::OcsfLog>,
     otlp_config: Option<&OtlpConfig>,
     driver: Option<openshell_otel::ComputeDriverTracing>,
     gateway: GatewayResourceAttributes<'_>,
 ) -> (TracingHandle, Option<SetupError>) {
-    let (layer, handle, setup_error) =
-        layers(env_filter, tracing_log_bus, otlp_config, driver, gateway);
-    tracing_subscriber::registry().with(layer).init();
+    let subscriber = tracing_subscriber::registry().with(
+        ocsf_log
+            .map(crate::ocsf_log::OcsfLog::layer)
+            .with_filter(filter_fn(|metadata| {
+                metadata.target() == openshell_ocsf::OCSF_TARGET
+            })),
+    );
+    let (layer, handle, setup_error) = layers(
+        filter_from(filter_directives),
+        tracing_log_bus,
+        otlp_config,
+        driver,
+        gateway,
+    );
+    subscriber.with(layer).init();
 
     if let Some(dir) = &handle.ocsf_jsonl_dir {
         tracing::info!(
@@ -277,6 +325,7 @@ mod tests {
             product_version: openshell_core::VERSION.into(),
             proxy_ip: "127.0.0.1".parse().unwrap(),
             proxy_port: 0,
+            origin: openshell_ocsf::EventOrigin::Supervisor,
         };
 
         tracing::subscriber::with_default(subscriber, || {
@@ -338,5 +387,43 @@ mod tests {
         ] {
             assert!(!mxc_ocsf_jsonl_requested(driver, Some("1")));
         }
+    }
+}
+
+#[cfg(test)]
+mod gateway_format_tests {
+    use std::io::{Read, Seek};
+
+    use super::*;
+
+    #[test]
+    fn gateway_ocsf_console_preserves_details_without_jsonl() {
+        let file = tempfile::tempfile().unwrap();
+        let reader = file.try_clone().unwrap();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .event_format(GatewayEventFormat)
+                .with_ansi(false)
+                .with_writer(std::sync::Arc::new(file))
+                .with_filter(filter_from("info")),
+        );
+        let event =
+            openshell_ocsf::ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context("", ""))
+                .message("TLS certificate config reloaded successfully")
+                .build();
+        let expected = event.format_shorthand();
+        tracing::subscriber::with_default(subscriber, || {
+            openshell_ocsf::ocsf_emit!(event);
+            tracing::info!(answer = 42, "ordinary diagnostic");
+        });
+        let mut reader = reader;
+        reader.rewind().unwrap();
+        let mut output = String::new();
+        reader.read_to_string(&mut output).unwrap();
+        assert!(output.contains(&expected), "missing OCSF details: {output}");
+        assert!(!output.contains("ocsf_event"));
+        assert!(output.contains("ordinary diagnostic"));
+        assert!(output.contains("answer=42"));
+        assert_eq!(output.lines().count(), 2);
     }
 }

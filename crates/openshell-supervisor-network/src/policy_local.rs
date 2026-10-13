@@ -1131,6 +1131,14 @@ fn network_endpoint_from_json(
     {
         return Err(reason.to_string());
     }
+    let mode_errors = openshell_policy::validate_endpoint_modes(
+        &endpoint.tls,
+        &endpoint.enforcement,
+        &endpoint.access,
+    );
+    if !mode_errors.is_empty() {
+        return Err(mode_errors.join("; "));
+    }
 
     let mut ports = endpoint.ports;
     if ports.is_empty() && endpoint.port > 0 {
@@ -1186,9 +1194,14 @@ fn network_endpoint_from_json(
         host: endpoint.host,
         port,
         protocol: endpoint.protocol,
-        tls: endpoint.tls,
-        enforcement: endpoint.enforcement,
-        access: endpoint.access,
+        tls: openshell_policy::network_tls_mode_from_str(&endpoint.tls)
+            .ok_or_else(|| format!("unknown tls value '{}'", endpoint.tls))? as i32,
+        enforcement: openshell_policy::network_enforcement_mode_from_str(&endpoint.enforcement)
+            .ok_or_else(|| format!("unknown enforcement value '{}'", endpoint.enforcement))?
+            as i32,
+        access: openshell_policy::network_access_preset_from_str(&endpoint.access)
+            .ok_or_else(|| format!("unknown access value '{}'", endpoint.access))?
+            as i32,
         rules,
         allowed_ips: endpoint.allowed_ips,
         ports,
@@ -1424,7 +1437,6 @@ mod tests {
                                     "host": "api.github.com",
                                     "port": 443,
                                     "protocol": "rest",
-                                    "tls": "terminate",
                                     "enforcement": "enforce",
                                     "rules": [
                                         {
@@ -1523,6 +1535,28 @@ mod tests {
     }
 
     #[test]
+    fn proposal_chunks_from_body_rejects_removed_tls_values() {
+        for tls in ["terminate", "passthrough"] {
+            let body = format!(
+                r#"{{
+                    "operations": [{{
+                        "addRule": {{
+                            "ruleName": "bad_mode",
+                            "rule": {{"endpoints": [{{"host":"api.example.com","port":443,"tls":"{tls}"}}]}}
+                        }}
+                    }}]
+                }}"#
+            );
+
+            let error = proposal_chunks_from_body(body.as_bytes()).unwrap_err();
+            assert!(
+                error.contains(&format!("unknown tls value '{tls}'")),
+                "tls: {tls} unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn proposal_chunks_from_body_accepts_omitted_protocol_with_default_tls() {
         let body = br#"{
             "operations": [{
@@ -1538,7 +1572,10 @@ mod tests {
         let chunks = proposal_chunks_from_body(body).unwrap();
         let endpoint = &chunks[0].proposed_rule.as_ref().unwrap().endpoints[0];
         assert!(endpoint.protocol.is_empty());
-        assert!(endpoint.tls.is_empty());
+        assert_eq!(
+            endpoint.tls,
+            openshell_core::proto::NetworkTlsMode::Unspecified as i32
+        );
     }
 
     #[test]

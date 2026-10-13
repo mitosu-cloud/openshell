@@ -22,10 +22,14 @@ mod network_broker;
 pub mod perf;
 #[cfg(unix)]
 pub mod process;
+#[cfg(target_os = "linux")]
+mod provider_files;
 #[cfg(unix)]
 mod provision_file;
 mod pty;
 pub mod sandbox;
+#[cfg(target_os = "linux")]
+pub mod sftp;
 
 /// Results of actively qualifying the admitted workload runtime before the
 /// sandbox consumes protected bootstrap material.
@@ -36,7 +40,7 @@ pub mod sandbox;
     reason = "qualification preserves independently exercised security results"
 )]
 pub struct RuntimeQualification {
-    pub seccomp: openshell_isolation_interface::contract::SeccompEvidence,
+    pub seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence,
     pub landlock_abi: u32,
     pub landlock_allow_deny: bool,
     pub udp_dns_round_trip: bool,
