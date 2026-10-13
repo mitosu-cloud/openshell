@@ -8,6 +8,18 @@
 # narrow.
 
 misconfigurations:
+  # The supervisor image is a portable binary carrier used by several compute
+  # drivers. Docker, Podman, and Kubernetes always override its runtime user
+  # with the resolved non-root sandbox identity; the VM driver extracts the
+  # binary and launches it as a host process. Keeping a neutral root image
+  # default lets those drivers select UIDs that do not exist in the image.
+  - id: DS-0002
+    paths:
+      - "**/Dockerfile.supervisor"
+    statement: >-
+      Every container launch path sets an explicit non-root UID and GID; the
+      VM path extracts the binary instead of running the image entrypoint.
+
   # The namespace comes from `helm install -n`, not the rendered workload.
   - id: KSV-0110
     paths:
