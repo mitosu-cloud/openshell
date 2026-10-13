@@ -4,8 +4,10 @@
 use flate2::read::MultiGzDecoder;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
+use std::fs::OpenOptions;
 #[cfg(test)]
 use std::io::BufWriter;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
@@ -13,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::driver::DEFAULT_SANDBOX_UID;
 
@@ -32,6 +36,81 @@ const ROOTFS_IMAGE_MIN_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const ROOTFS_IMAGE_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 const EXT4_IMAGE_MIN_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
 static INJECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
+const ROOTFS_IMAGE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const ROOTFS_IMAGE_LOCK_RETRY: Duration = Duration::from_millis(10);
+
+/// Hold an exclusive host-side lock for a writable guest disk. The descriptor
+/// deliberately survives `fork` and `exec`, so the libkrun worker or QEMU
+/// process keeps the lock if its launcher is killed before the parent-death
+/// cascade reaches the VM process.
+pub fn lock_rootfs_image(image_path: &Path) -> Result<File, String> {
+    lock_rootfs_image_with_timeout(image_path, ROOTFS_IMAGE_LOCK_TIMEOUT)
+}
+
+fn lock_rootfs_image_with_timeout(image_path: &Path, timeout: Duration) -> Result<File, String> {
+    let mut lock_path = OsString::from(image_path.as_os_str());
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock = options
+        .open(&lock_path)
+        .map_err(|error| format!("open rootfs image lock {}: {error}", lock_path.display()))?;
+    if !lock
+        .metadata()
+        .map_err(|error| format!("inspect rootfs image lock {}: {error}", lock_path.display()))?
+        .is_file()
+    {
+        return Err(format!(
+            "rootfs image lock is not a regular file: {}",
+            lock_path.display()
+        ));
+    }
+
+    let started = Instant::now();
+    loop {
+        match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => break,
+            Err(error)
+                if error == rustix::io::Errno::INTR
+                    || error == rustix::io::Errno::AGAIN
+                    || error == rustix::io::Errno::WOULDBLOCK =>
+            {
+                if started.elapsed() >= timeout {
+                    return Err(format!(
+                        "timed out after {} ms waiting for rootfs image lock {}",
+                        timeout.as_millis(),
+                        lock_path.display()
+                    ));
+                }
+                thread::sleep(
+                    ROOTFS_IMAGE_LOCK_RETRY.min(timeout.saturating_sub(started.elapsed())),
+                );
+            }
+            Err(error) => {
+                return Err(format!(
+                    "lock rootfs image {}: {error}",
+                    lock_path.display()
+                ));
+            }
+        }
+    }
+    Ok(lock)
+}
+
+pub fn make_rootfs_image_lock_inheritable(lock: &File, image_path: &Path) -> Result<(), String> {
+    rustix::io::fcntl_setfd(lock, rustix::io::FdFlags::empty()).map_err(|error| {
+        format!(
+            "make rootfs image lock inheritable {}: {error}",
+            image_path.display()
+        )
+    })
+}
 
 pub const fn sandbox_guest_init_path() -> &'static str {
     SANDBOX_GUEST_INIT_PATH
@@ -142,7 +221,7 @@ fn install_host_supervisor_atomically(path: &Path, bytes: &[u8]) -> Result<(), S
         INJECTION_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| {
-        let mut options = fs::OpenOptions::new();
+        let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
         {
@@ -417,6 +496,37 @@ pub fn write_rootfs_image_file(
     result
 }
 
+/// Read one regular file from an ext4 guest image for exact post-injection
+/// verification. `debugfs dump` writes to a private host-side temporary file;
+/// no guest path is interpreted by a shell.
+pub fn read_rootfs_image_file(image_path: &Path, guest_path: &str) -> Result<Vec<u8>, String> {
+    let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
+        return Err(format!("invalid debugfs guest path '{guest_path}'"));
+    };
+    let tmp_path = temporary_injection_path(image_path);
+    let Some(quoted_tmp_path) = debugfs_quote_argument(&tmp_path.to_string_lossy()) else {
+        return Err(format!(
+            "invalid debugfs extraction path '{}'",
+            tmp_path.display()
+        ));
+    };
+    let result = (|| {
+        run_debugfs(
+            image_path,
+            &format!("dump -p {quoted_guest_path} {quoted_tmp_path}"),
+        )?;
+        fs::read(&tmp_path).map_err(|error| {
+            format!(
+                "read extracted rootfs file {} from {}: {error}",
+                guest_path,
+                image_path.display()
+            )
+        })
+    })();
+    let _ = fs::remove_file(&tmp_path);
+    result
+}
+
 pub fn remove_rootfs_image_file(image_path: &Path, guest_path: &str) -> Result<(), String> {
     let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
         return Err(format!("invalid debugfs guest path '{guest_path}'"));
@@ -439,11 +549,21 @@ pub fn set_rootfs_image_file_mode(
     )
 }
 
-/// Replay the ext4 journal and repair automatically correctable filesystem
-/// state before the driver mutates a preserved guest disk offline. Check a
-/// sparse copy: e2fsck can partially change an image even when it returns an
-/// error, and the original must remain available for manual recovery.
+/// Replay the ext4 journal and repair filesystem state before the driver
+/// mutates a preserved guest disk offline. Preen first, then allow a bounded
+/// number of affirmative repair passes until a read-only forced check reports
+/// clean. Check a sparse copy: e2fsck can partially change an image even when
+/// it returns an error, and the original must remain available for manual
+/// recovery.
 pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
+    // A parent-death cascade is asynchronous. Wait until the former VM worker
+    // releases its inherited lock before copying or repairing the overlay.
+    // Closing the former worker's disk descriptor does not itself wait for
+    // buffered writes already accepted by the host kernel. Flush the source
+    // after taking exclusive ownership so the recovery copy cannot race those
+    // writes and certify a stale snapshot as clean.
+    let _image_lock = lock_rootfs_image(image_path)?;
+    sync_rootfs_image(image_path)?;
     let parent = image_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -466,14 +586,74 @@ pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
             .arg(&staged)
             .output()
             .map_err(|error| format!("run {}: {error}", path.display()))?;
-        if !matches!(output.status.code(), Some(0..=2)) {
-            return Err(format!(
-                "{} failed with status {}\nstdout: {}\nstderr: {}",
+        let mut diagnostics = vec![format!(
+            "{} preen status {}\nstdout: {}\nstderr: {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )];
+        let Some(mut code) = output.status.code() else {
+            return Err(diagnostics.join("\n"));
+        };
+        if code & !7 != 0 {
+            return Err(diagnostics.join("\n"));
+        }
+        for pass in 1..=4 {
+            if code == 0 {
+                break;
+            }
+            let repaired = Command::new(&path)
+                .arg("-y")
+                .arg("-f")
+                .arg(&staged)
+                .output()
+                .map_err(|error| {
+                    format!(
+                        "{}\nrun {} automatic repair pass {pass}: {error}",
+                        diagnostics.join("\n"),
+                        path.display()
+                    )
+                })?;
+            diagnostics.push(format!(
+                "{} automatic repair pass {pass} status {}\nstdout: {}\nstderr: {}",
                 path.display(),
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                repaired.status,
+                String::from_utf8_lossy(&repaired.stdout),
+                String::from_utf8_lossy(&repaired.stderr)
             ));
+            let Some(next) = repaired.status.code() else {
+                return Err(diagnostics.join("\n"));
+            };
+            code = next;
+            if code & !7 != 0 {
+                break;
+            }
+        }
+        if code != 0 {
+            return Err(diagnostics.join("\n"));
+        }
+        let verified = Command::new(&path)
+            .arg("-n")
+            .arg("-f")
+            .arg(&staged)
+            .output()
+            .map_err(|error| {
+                format!(
+                    "{}\nrun {} read-only verification: {error}",
+                    diagnostics.join("\n"),
+                    path.display()
+                )
+            })?;
+        if verified.status.code() != Some(0) {
+            diagnostics.push(format!(
+                "{} read-only verification failed with status {}\nstdout: {}\nstderr: {}",
+                path.display(),
+                verified.status,
+                String::from_utf8_lossy(&verified.stdout),
+                String::from_utf8_lossy(&verified.stderr)
+            ));
+            return Err(diagnostics.join("\n"));
         }
         File::open(&staged)
             .and_then(|file| file.sync_all())
@@ -493,6 +673,15 @@ pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
         let _ = fs::remove_file(&staged);
     }
     result
+}
+
+/// Make all completed offline mutations to a guest disk durable before it is
+/// handed to a VM process. Besides improving crash durability, this provides a
+/// writeback barrier between `debugfs` injection and libkrun opening the image.
+pub fn sync_rootfs_image(image_path: &Path) -> Result<(), String> {
+    File::open(image_path)
+        .and_then(|image| image.sync_all())
+        .map_err(|error| format!("sync rootfs image {}: {error}", image_path.display()))
 }
 
 #[cfg(target_os = "macos")]
@@ -1746,6 +1935,36 @@ mod tests {
     }
 
     #[test]
+    fn rootfs_image_file_write_can_be_verified_byte_for_byte() {
+        if e2fs_command("debugfs").is_err() {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        let image = dir.join("overlay.ext4");
+        fs::create_dir_all(source.join("upper")).expect("create source upperdir");
+        fs::create_dir_all(source.join("work")).expect("create source workdir");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create ext4 image");
+
+        let expected = br#"{"generation":"g1","value":42}"#;
+        write_rootfs_image_file(
+            &image,
+            "/upper/.openshell/state/bootstrap-g1.json",
+            expected,
+        )
+        .expect("inject file");
+        assert_eq!(
+            read_rootfs_image_file(&image, "/upper/.openshell/state/bootstrap-g1.json")
+                .expect("read injected file"),
+            expected
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ext4_image_has_directory_distinguishes_directories_files_and_missing_paths() {
         if e2fs_command("debugfs").is_err() {
             return;
@@ -1772,7 +1991,51 @@ mod tests {
     }
 
     #[test]
-    fn recover_rootfs_image_preserves_original_when_fsck_cannot_repair() {
+    fn rootfs_image_lock_excludes_a_second_owner_and_releases_on_drop() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("create temp directory");
+        let image = dir.join("overlay.ext4");
+        fs::write(&image, b"test image").expect("create image");
+
+        let first = lock_rootfs_image_with_timeout(&image, Duration::from_millis(50))
+            .expect("take first rootfs lock");
+        let error = lock_rootfs_image_with_timeout(&image, Duration::from_millis(25))
+            .expect_err("second rootfs lock should time out");
+        assert!(error.contains("timed out"), "{error}");
+
+        drop(first);
+        lock_rootfs_image_with_timeout(&image, Duration::from_millis(50))
+            .expect("retake released rootfs lock");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rootfs_image_lock_survives_exec_until_the_child_exits() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("create temp directory");
+        let image = dir.join("overlay.ext4");
+        fs::write(&image, b"test image").expect("create image");
+
+        let lock = lock_rootfs_image_with_timeout(&image, Duration::from_millis(50))
+            .expect("take rootfs lock");
+        make_rootfs_image_lock_inheritable(&lock, &image).expect("make rootfs lock inheritable");
+        let mut child = Command::new("sleep")
+            .arg("0.2")
+            .spawn()
+            .expect("spawn lock-inheriting child");
+        drop(lock);
+
+        let error = lock_rootfs_image_with_timeout(&image, Duration::from_millis(25))
+            .expect_err("child should retain inherited rootfs lock");
+        assert!(error.contains("timed out"), "{error}");
+        assert!(child.wait().expect("wait for child").success());
+        lock_rootfs_image_with_timeout(&image, Duration::from_millis(50))
+            .expect("retake rootfs lock after child exit");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_rootfs_image_repairs_unconnected_directory() {
         if e2fs_command("e2fsck").is_err() {
             return;
         }
@@ -1786,12 +2049,47 @@ mod tests {
             .expect("create ext4 image");
         run_debugfs(&image, "mkdir /upper/orphan").expect("create orphan directory");
         run_debugfs(&image, "unlink /upper/orphan").expect("unlink orphan directory");
-        let before = sha256_reader(File::open(&image).expect("open image")).expect("hash image");
+        recover_rootfs_image(&image).expect("repair unconnected directory");
+        let check = e2fs_command("e2fsck")
+            .expect("resolve e2fsck")
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .expect("check repaired image");
+        assert!(
+            matches!(check.status.code(), Some(0..=2)),
+            "{}",
+            String::from_utf8_lossy(&check.stdout)
+        );
+        assert_eq!(
+            fs::read_dir(&dir)
+                .expect("read test directory")
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".openshell-overlay-recovery-"))
+                .count(),
+            0,
+            "failed recovery left a staging image"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
-        let error = recover_rootfs_image(&image).expect_err("orphan directory needs manual repair");
-        assert!(error.contains("UNEXPECTED INCONSISTENCY"), "{error}");
-        let after = sha256_reader(File::open(&image).expect("reopen image")).expect("hash image");
-        assert_eq!(after, before, "failed recovery changed original image");
+    #[test]
+    fn recover_rootfs_image_preserves_original_when_fsck_cannot_repair() {
+        if e2fs_command("e2fsck").is_err() {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("create temp directory");
+        let image = dir.join("overlay.ext4");
+        fs::write(&image, b"not an ext4 filesystem").expect("write invalid image");
+        let before = fs::read(&image).expect("read original image");
+
+        recover_rootfs_image(&image).expect_err("invalid image cannot be repaired");
+        assert_eq!(fs::read(&image).expect("read preserved image"), before);
         assert_eq!(
             fs::read_dir(&dir)
                 .expect("read test directory")
@@ -1927,6 +2225,8 @@ mod tests {
         if let Some(directory) = std::env::var_os("OPENSHELL_ROOTFS_TOOL_TEST_ROOT") {
             let directory = PathBuf::from(directory);
             let path = directory.join("e2fsck");
+            let overlay = directory.join("overlay.ext4");
+            fs::write(&overlay, b"rootfs recovery fixture").expect("overlay fixture");
             for (script, expected) in [
                 (
                     "#!/nonexistent/e2fsprogs-interpreter\n",
@@ -1939,8 +2239,7 @@ mod tests {
             ] {
                 fs::write(&path, script).expect("recovery tool");
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable");
-                let error = recover_rootfs_image(&directory.join("overlay.ext4"))
-                    .expect_err("recovery failure");
+                let error = recover_rootfs_image(&overlay).expect_err("recovery failure");
                 assert!(
                     error.contains(path.canonicalize().unwrap().to_str().unwrap()),
                     "{error}"
