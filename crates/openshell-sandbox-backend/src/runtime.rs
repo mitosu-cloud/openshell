@@ -515,13 +515,16 @@ async fn open_process_attachment(
     let (stdin, stdin_pump) = tokio::io::duplex(64 * 1024);
     let (stdout, stdout_pump) = tokio::io::duplex(64 * 1024);
     let (stderr, stderr_pump) = tokio::io::duplex(64 * 1024);
-    tokio::spawn(pump_exec_input(stdin_pump, network_writer));
-    tokio::spawn(pump_process_responses(
-        network_reader,
-        stdout_pump,
-        stderr_pump,
-        None,
+    let (output_finished_tx, output_finished_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(pump_exec_input(
+        stdin_pump,
+        network_writer,
+        output_finished_rx,
     ));
+    tokio::spawn(async move {
+        pump_process_responses(network_reader, stdout_pump, stderr_pump, None).await;
+        let _ = output_finished_tx.send(());
+    });
     let terminal: Option<Arc<dyn BoundaryTerminal>> = if has_terminal {
         let terminal: Arc<dyn BoundaryTerminal> = Arc::new(RemoteTerminal { client, process_id });
         Some(terminal)
@@ -780,13 +783,22 @@ async fn open_exec_session(
     let (stdout, stdout_pump) = tokio::io::duplex(64 * 1024);
     let (stderr, stderr_pump) = tokio::io::duplex(64 * 1024);
     let (output_status_tx, output_status_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(pump_exec_input(stdin_pump, network_writer));
-    tokio::spawn(pump_process_responses(
-        network_reader,
-        stdout_pump,
-        stderr_pump,
-        Some(output_status_tx),
+    let (output_finished_tx, output_finished_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(pump_exec_input(
+        stdin_pump,
+        network_writer,
+        output_finished_rx,
     ));
+    tokio::spawn(async move {
+        pump_process_responses(
+            network_reader,
+            stdout_pump,
+            stderr_pump,
+            Some(output_status_tx),
+        )
+        .await;
+        let _ = output_finished_tx.send(());
+    });
 
     let process: Arc<dyn BoundaryProcess> = Arc::new(RemoteExecProcess {
         client: client.clone(),
@@ -813,12 +825,25 @@ async fn open_exec_session(
 async fn pump_exec_input(
     mut input: tokio::io::DuplexStream,
     mut network: tokio::io::WriteHalf<BoundaryDuplexStream>,
+    mut output_finished: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut buffer = vec![0; 16 * 1024];
     loop {
-        match input.read(&mut buffer).await {
+        let read = tokio::select! {
+            _ = &mut output_finished => return,
+            read = input.read(&mut buffer) => read,
+        };
+        match read {
             Ok(0) => {
-                let _ = write_stream_frame(&mut network, STREAM_STDIN_CLOSED, &[]).await;
+                if write_stream_frame(&mut network, STREAM_STDIN_CLOSED, &[])
+                    .await
+                    .is_ok()
+                {
+                    // The request stream is bidirectional. Keep its write half
+                    // alive after the explicit stdin-close frame so the guest
+                    // can still deliver stdout, stderr, and the exit status.
+                    let _ = output_finished.await;
+                }
                 return;
             }
             Ok(read) => {
@@ -2851,6 +2876,47 @@ mod tests {
         assert_eq!(&bytes, b"hello");
         assert_eq!(completion_rx.await.unwrap(), BoundaryExitStatus::Exited(74));
         pump.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_input_half_close_waits_for_output_completion() {
+        let (network, mut peer) = tokio::io::duplex(1024);
+        let network: BoundaryDuplexStream = Box::new(network);
+        let (network_reader, network_writer) = tokio::io::split(network);
+        let (stdin, stdin_pump) = tokio::io::duplex(1024);
+        let (output_finished_tx, output_finished_rx) = tokio::sync::oneshot::channel();
+        let pump = tokio::spawn(pump_exec_input(
+            stdin_pump,
+            network_writer,
+            output_finished_rx,
+        ));
+
+        drop(stdin);
+        let frame = read_stream_frame(&mut peer)
+            .await
+            .expect("read stdin-close frame")
+            .expect("stdin-close frame");
+        assert_eq!(frame, (STREAM_STDIN_CLOSED, Vec::new()));
+
+        let mut byte = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), peer.read(&mut byte))
+                .await
+                .is_err(),
+            "network write half must remain open while process output is pending"
+        );
+        assert!(
+            !pump.is_finished(),
+            "input pump returned before output finished"
+        );
+
+        output_finished_tx.send(()).expect("finish output pump");
+        tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("input pump did not finish with output")
+            .expect("join input pump");
+        drop(network_reader);
+        assert_eq!(peer.read(&mut byte).await.expect("read network EOF"), 0);
     }
 
     struct TestTlsIo(BoundaryDuplexStream);
