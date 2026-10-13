@@ -309,12 +309,19 @@ jobs:
           subject-digest: ${{ steps.report.outputs.sandbox_digest }}
           push-to-registry: true
 
-      - name: Make runtime image packages public
+      - name: Verify runtime image packages are public
+        env:
+          REPORT_PATH: ${{ steps.report.outputs.path }}
         run: |
-          for package in openshell-supervisor openshell-sandbox; do
-            gh api --method PATCH \
-              "orgs/$GITHUB_REPOSITORY_OWNER/packages/container/$package" \
-              -f visibility=public >/dev/null
+          # GITHUB_TOKEN can publish package versions but cannot administer an
+          # organization package's visibility. A maintainer performs that
+          # one-time package bootstrap outside CI. Prove the release is usable
+          # without credentials before publishing its immutable report.
+          docker logout ghcr.io >/dev/null
+          for component in supervisor sandbox; do
+            reference=$(jq -er --arg component "$component" \
+              '.images[$component].index_reference' "$REPORT_PATH")
+            docker buildx imagetools inspect "$reference" >/dev/null
           done
 
       - name: Verify provenance and finalize report
