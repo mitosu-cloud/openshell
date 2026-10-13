@@ -251,6 +251,106 @@ async fn interactive_exec_drains_stdout_and_stderr_after_input_eof() {
 }
 
 #[tokio::test]
+async fn interactive_exec_explicit_stdin_eof_preserves_later_output() {
+    let fixture = Fixture::new().await;
+    let (input_tx, input_rx) = mpsc::channel(2);
+    let (output_tx, mut output_rx) = mpsc::channel(2);
+    let exec = run_interactive_exec_with_russh(
+        fixture.port,
+        "test",
+        ReceiverStream::new(input_rx),
+        false,
+        ExecMode::LoginShell,
+        0,
+        0,
+        output_tx,
+    );
+    let exercise = async {
+        ready(&mut output_rx).await;
+        input_tx
+            .send(Ok(ExecSandboxInput {
+                payload: Some(exec_sandbox_input::Payload::StdinEof(
+                    openshell_core::proto::ExecSandboxStdinEof {},
+                )),
+            }))
+            .await
+            .unwrap();
+        while !fixture.eof.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        fixture.release_output.notify_one();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        while let Some(event) = output_rx.recv().await {
+            match event.unwrap().payload.unwrap() {
+                exec_sandbox_event::Payload::Stdout(s) => stdout.extend(s.data),
+                exec_sandbox_event::Payload::Stderr(s) => stderr.extend(s.data),
+                other @ exec_sandbox_event::Payload::Exit(_) => {
+                    panic!("unexpected event: {other:?}")
+                }
+            }
+        }
+        assert_eq!(stdout, b"after eof");
+        assert_eq!(stderr, b"stderr after eof");
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(exec, exercise)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap(), 7);
+    assert!(input_tx.is_closed());
+}
+
+#[tokio::test]
+async fn interactive_exec_rejects_stdin_after_explicit_eof() {
+    let fixture = Fixture::new().await;
+    let (input_tx, input_rx) = mpsc::channel(2);
+    let (output_tx, mut output_rx) = mpsc::channel(2);
+    let exec = run_interactive_exec_with_russh(
+        fixture.port,
+        "test",
+        ReceiverStream::new(input_rx),
+        false,
+        ExecMode::LoginShell,
+        0,
+        0,
+        output_tx,
+    );
+    let exercise = async {
+        ready(&mut output_rx).await;
+        input_tx
+            .send(Ok(ExecSandboxInput {
+                payload: Some(exec_sandbox_input::Payload::StdinEof(
+                    openshell_core::proto::ExecSandboxStdinEof {},
+                )),
+            }))
+            .await
+            .unwrap();
+        while !fixture.eof.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        input_tx
+            .send(Ok(ExecSandboxInput {
+                payload: Some(exec_sandbox_input::Payload::Stdin(b"late".to_vec())),
+            }))
+            .await
+            .unwrap();
+        while !input_tx.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(exec, exercise)
+    })
+    .await
+    .unwrap();
+    let result = result.unwrap_err();
+    assert_eq!(result.code(), tonic::Code::InvalidArgument);
+    assert!(fixture.eof.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn interactive_exec_makes_progress_in_both_directions_before_eof() {
     const CHUNKS: usize = 128;
     const CHUNK_SIZE: usize = 64 * 1024;
