@@ -129,7 +129,9 @@ jobs:
           [[ "$supervisor_version" == openshell-supervisor\ * ]]
           [[ "$sandbox_version" == openshell-sandbox\ * ]]
           [[ "$supervisor_description" == *"dynamically linked"* ]]
-          [[ "$sandbox_description" == *"statically linked"* ]]
+          [[ "$sandbox_description" != *"dynamically linked"* ]]
+          [[ "$sandbox_description" == *"statically linked"* \
+            || "$sandbox_description" == *"static-pie linked"* ]]
           install -Dm0555 "$supervisor" \
             "deploy/docker/.build/prebuilt-binaries/$ARCHITECTURE/openshell-supervisor"
           install -Dm0555 "$sandbox" \
