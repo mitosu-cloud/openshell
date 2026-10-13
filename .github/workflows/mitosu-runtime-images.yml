@@ -1,0 +1,360 @@
+name: Mitosu runtime control images
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character OpenShell source revision to publish
+        required: true
+        type: string
+      release_tag:
+        description: Immutable lowercase image tag component
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mitosu-runtime-control-images
+  cancel-in-progress: false
+
+env:
+  SUPERVISOR_REPOSITORY: ghcr.io/mitosu-cloud/openshell-supervisor
+  SANDBOX_REPOSITORY: ghcr.io/mitosu-cloud/openshell-sandbox
+
+jobs:
+  build:
+    name: Build linux/${{ matrix.architecture }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    environment: runtime-release
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            gnu_target: x86_64-unknown-linux-gnu
+            musl_target: x86_64-unknown-linux-musl
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            gnu_target: aarch64-unknown-linux-gnu
+            musl_target: aarch64-unknown-linux-musl
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: /tmp/openshell-target
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OPENSHELL_IMAGE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Validate immutable inputs
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$RELEASE_TAG" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Verify source revision belongs to a release branch
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            +refs/heads/dual-mode-p2:refs/remotes/origin/dual-mode-p2
+          if ! git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main \
+              && ! git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/dual-mode-p2; then
+            echo "source revision is not on main or dual-mode-p2" >&2
+            exit 1
+          fi
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential ca-certificates cmake file musl-tools pkg-config
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup target add --toolchain 1.95.0 \
+            "${{ matrix.gnu_target }}" "${{ matrix.musl_target }}"
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mitosu-runtime-${{ matrix.architecture }}
+          cache-on-failure: "true"
+          cache-workspace-crates: "true"
+          cache-bin: "false"
+
+      - name: Build exact runtime binaries
+        env:
+          GNU_TARGET: ${{ matrix.gnu_target }}
+          MUSL_TARGET: ${{ matrix.musl_target }}
+        run: |
+          musl_linker_env="CARGO_TARGET_${MUSL_TARGET^^}_LINKER"
+          musl_linker_env=${musl_linker_env//-/_}
+          musl_cc_env="CC_${MUSL_TARGET//-/_}"
+          export "$musl_linker_env=musl-gcc"
+          export "$musl_cc_env=musl-gcc"
+          GIT_DIR=/nonexistent cargo +1.95.0 build --locked --release \
+            --target "$GNU_TARGET" \
+            --package openshell-supervisor --bin openshell-supervisor
+          GIT_DIR=/nonexistent cargo +1.95.0 build --locked --release \
+            --target "$MUSL_TARGET" \
+            --package openshell-sandbox --bin openshell-sandbox
+
+      - name: Verify and stage runtime binaries
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          GNU_TARGET: ${{ matrix.gnu_target }}
+          MUSL_TARGET: ${{ matrix.musl_target }}
+        run: |
+          supervisor="$CARGO_TARGET_DIR/$GNU_TARGET/release/openshell-supervisor"
+          sandbox="$CARGO_TARGET_DIR/$MUSL_TARGET/release/openshell-sandbox"
+          "$supervisor" --version | grep -q '^openshell-supervisor '
+          "$sandbox" --version | grep -q '^openshell-sandbox '
+          file "$supervisor" | grep -q 'dynamically linked'
+          file "$sandbox" | grep -q 'statically linked'
+          install -Dm0555 "$supervisor" \
+            "deploy/docker/.build/prebuilt-binaries/$ARCHITECTURE/openshell-supervisor"
+          install -Dm0555 "$sandbox" \
+            "deploy/docker/.build/prebuilt-binaries/$ARCHITECTURE/openshell-sandbox"
+          sha256sum "$supervisor" "$sandbox"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse existing architecture tags
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          for repository in "$SUPERVISOR_REPOSITORY" "$SANDBOX_REPOSITORY"; do
+            reference="$repository:$RELEASE_TAG-$ARCHITECTURE"
+            if docker buildx imagetools inspect "$reference" >/dev/null 2>&1; then
+              echo "refusing to overwrite $reference" >&2
+              exit 1
+            fi
+          done
+
+      - name: Build and push architecture images
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          for component in supervisor sandbox; do
+            case "$component" in
+              supervisor) repository="$SUPERVISOR_REPOSITORY" ;;
+              sandbox) repository="$SANDBOX_REPOSITORY" ;;
+            esac
+            reference="$repository:$RELEASE_TAG-$ARCHITECTURE"
+            metadata="$RUNNER_TEMP/$component-metadata.json"
+            docker buildx build \
+              --platform "linux/$ARCHITECTURE" \
+              --file "deploy/docker/Dockerfile.$component" \
+              --target "$component" \
+              --label org.opencontainers.image.source="https://github.com/$GITHUB_REPOSITORY" \
+              --label org.opencontainers.image.revision="$SOURCE_SHA" \
+              --tag "$reference" \
+              --cache-from "type=gha,scope=mitosu-$component-$ARCHITECTURE" \
+              --cache-to "type=gha,mode=max,scope=mitosu-$component-$ARCHITECTURE" \
+              --provenance=false \
+              --metadata-file "$metadata" \
+              --push \
+              .
+            digest=$(jq -er '.["containerimage.digest"]' "$metadata")
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+            docker buildx imagetools inspect "$repository@$digest" >/dev/null
+          done
+
+      - name: Run architecture image smoke checks
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          docker run --rm --platform "linux/$ARCHITECTURE" \
+            "$SUPERVISOR_REPOSITORY:$RELEASE_TAG-$ARCHITECTURE" --version \
+            | grep -q '^openshell-supervisor '
+          docker run --rm --platform "linux/$ARCHITECTURE" \
+            "$SANDBOX_REPOSITORY:$RELEASE_TAG-$ARCHITECTURE" --version \
+            | grep -q '^openshell-sandbox '
+
+  publish-index:
+    name: Publish immutable multi-architecture indexes
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: runtime-release
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Validate immutable inputs
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$RELEASE_TAG" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish immutable indexes and report
+        id: report
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          report="$RUNNER_TEMP/openshell-runtime-images.json"
+          images='{}'
+          for component in supervisor sandbox; do
+            case "$component" in
+              supervisor) repository="$SUPERVISOR_REPOSITORY" ;;
+              sandbox) repository="$SANDBOX_REPOSITORY" ;;
+            esac
+            final_reference="$repository:$RELEASE_TAG"
+            if docker buildx imagetools inspect "$final_reference" >/dev/null 2>&1; then
+              echo "refusing to overwrite $final_reference" >&2
+              exit 1
+            fi
+            amd64_reference="$repository:$RELEASE_TAG-amd64"
+            arm64_reference="$repository:$RELEASE_TAG-arm64"
+            amd64_digest=$(docker buildx imagetools inspect \
+              --format '{{json .Manifest}}' "$amd64_reference" | jq -er '.digest')
+            arm64_digest=$(docker buildx imagetools inspect \
+              --format '{{json .Manifest}}' "$arm64_reference" | jq -er '.digest')
+            docker buildx imagetools create \
+              --tag "$final_reference" \
+              "$amd64_reference" "$arm64_reference"
+            index_digest=$(docker buildx imagetools inspect \
+              --format '{{json .Manifest}}' "$final_reference" | jq -er '.digest')
+            [[ "$index_digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+            docker buildx imagetools inspect "$repository@$index_digest" >/dev/null
+            images=$(jq -c \
+              --arg component "$component" \
+              --arg repository "$repository" \
+              --arg index_digest "$index_digest" \
+              --arg amd64_digest "$amd64_digest" \
+              --arg arm64_digest "$arm64_digest" \
+              '. + {($component): {
+                repository: $repository,
+                index_reference: ($repository + "@" + $index_digest),
+                index_digest: $index_digest,
+                manifests: {amd64: $amd64_digest, arm64: $arm64_digest}
+              }}' <<<"$images")
+          done
+          jq -S -n \
+            --arg source_revision "$SOURCE_SHA" \
+            --arg release_tag "$RELEASE_TAG" \
+            --argjson images "$images" \
+            '{
+              schema_version: 1,
+              source_revision: $source_revision,
+              release_tag: $release_tag,
+              images: $images
+            }' > "$report"
+          chmod 0444 "$report"
+          printf 'path=%s\n' "$report" >> "$GITHUB_OUTPUT"
+          printf 'supervisor_digest=%s\n' "$(jq -er '.images.supervisor.index_digest' "$report")" >> "$GITHUB_OUTPUT"
+          printf 'sandbox_digest=%s\n' "$(jq -er '.images.sandbox.index_digest' "$report")" >> "$GITHUB_OUTPUT"
+
+      - name: Attest supervisor image provenance
+        id: supervisor-provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ${{ env.SUPERVISOR_REPOSITORY }}
+          subject-digest: ${{ steps.report.outputs.supervisor_digest }}
+          push-to-registry: true
+
+      - name: Attest sandbox image provenance
+        id: sandbox-provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ${{ env.SANDBOX_REPOSITORY }}
+          subject-digest: ${{ steps.report.outputs.sandbox_digest }}
+          push-to-registry: true
+
+      - name: Make runtime image packages public
+        run: |
+          for package in openshell-supervisor openshell-sandbox; do
+            gh api --method PATCH \
+              "orgs/$GITHUB_REPOSITORY_OWNER/packages/container/$package" \
+              -f visibility=public >/dev/null
+          done
+
+      - name: Verify provenance and finalize report
+        env:
+          REPORT_PATH: ${{ steps.report.outputs.path }}
+          SUPERVISOR_ATTESTATION_ID: ${{ steps.supervisor-provenance.outputs.attestation-id }}
+          SUPERVISOR_ATTESTATION_URL: ${{ steps.supervisor-provenance.outputs.attestation-url }}
+          SANDBOX_ATTESTATION_ID: ${{ steps.sandbox-provenance.outputs.attestation-id }}
+          SANDBOX_ATTESTATION_URL: ${{ steps.sandbox-provenance.outputs.attestation-url }}
+        run: |
+          test -n "$SUPERVISOR_ATTESTATION_ID"
+          test -n "$SANDBOX_ATTESTATION_ID"
+          for component in supervisor sandbox; do
+            reference=$(jq -er --arg component "$component" '.images[$component].index_reference' "$REPORT_PATH")
+            gh attestation verify "oci://$reference" --owner "$GITHUB_REPOSITORY_OWNER"
+          done
+          chmod u+w "$REPORT_PATH"
+          jq -S \
+            --arg supervisor_id "$SUPERVISOR_ATTESTATION_ID" \
+            --arg supervisor_url "$SUPERVISOR_ATTESTATION_URL" \
+            --arg sandbox_id "$SANDBOX_ATTESTATION_ID" \
+            --arg sandbox_url "$SANDBOX_ATTESTATION_URL" \
+            '.images.supervisor.provenance = {
+                type: "github-build-provenance",
+                attestation_id: $supervisor_id,
+                url: $supervisor_url
+              }
+              | .images.sandbox.provenance = {
+                type: "github-build-provenance",
+                attestation_id: $sandbox_id,
+                url: $sandbox_url
+              }' "$REPORT_PATH" > "$REPORT_PATH.tmp"
+          mv "$REPORT_PATH.tmp" "$REPORT_PATH"
+          chmod 0444 "$REPORT_PATH"
+          jq -e '
+            (.images.supervisor.index_digest | test("^sha256:[a-f0-9]{64}$"))
+            and (.images.sandbox.index_digest | test("^sha256:[a-f0-9]{64}$"))
+            and ([.images[].manifests[] | test("^sha256:[a-f0-9]{64}$")] | all)
+            and ([.images[].provenance.attestation_id | length > 0] | all)
+          ' "$REPORT_PATH" >/dev/null
+          {
+            printf '### Published OpenShell runtime images\n\n'
+            jq -r '.images | to_entries[] | "- `\(.key)`: `\(.value.index_reference)`"' "$REPORT_PATH"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload immutable release report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-runtime-images-${{ inputs.release_tag }}-release-report
+          path: ${{ steps.report.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
