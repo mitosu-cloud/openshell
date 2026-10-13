@@ -39,7 +39,26 @@
 /// that needs to drain state; we are a VM launcher / gRPC driver whose
 /// entire job is tied to the parent's lifetime.
 pub fn die_with_parent() -> Result<(), String> {
-    die_with_parent_cleanup(|| ())
+    #[cfg(target_os = "linux")]
+    {
+        install_linux_pdeathsig(nix::sys::signal::Signal::SIGKILL)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        die_with_parent_cleanup(|| ())
+    }
+}
+
+/// Arrange for Linux to deliver a catchable `SIGTERM` when the parent dies.
+///
+/// A launcher that owns a child process can install its normal SIGTERM
+/// forwarding handler and remain alive in `waitpid` until the child exits.
+/// This is stronger than a SIGKILL cascade when the launcher also owns a file
+/// lock: the lock cannot be released before the child has stopped writing.
+#[cfg(target_os = "linux")]
+pub fn die_with_parent_term() -> Result<(), String> {
+    install_linux_pdeathsig(nix::sys::signal::Signal::SIGTERM)
 }
 
 /// Like [`die_with_parent`], but run `cleanup` before terminating.
@@ -65,7 +84,7 @@ where
         // children (so the kernel cascades) or rely on process-group
         // killpg from a signal handler in the parent.
         let _ = cleanup; // intentionally dropped
-        install_linux_pdeathsig()
+        install_linux_pdeathsig(nix::sys::signal::Signal::SIGKILL)
     }
 
     #[cfg(any(
@@ -96,8 +115,7 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn install_linux_pdeathsig() -> Result<(), String> {
-    use nix::sys::signal::Signal;
+fn install_linux_pdeathsig(signal: nix::sys::signal::Signal) -> Result<(), String> {
     use nix::unistd::getppid;
 
     // Race: if the parent already died between fork/exec and this call,
@@ -108,7 +126,7 @@ fn install_linux_pdeathsig() -> Result<(), String> {
         return Err("process was already orphaned before procguard armed".to_string());
     }
 
-    nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
+    nix::sys::prctl::set_pdeathsig(signal)
         .map_err(|err| format!("prctl(PR_SET_PDEATHSIG) failed: {err}"))?;
 
     // Re-check after arming: the parent may have died between getppid()
