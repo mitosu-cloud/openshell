@@ -119,10 +119,17 @@ jobs:
         run: |
           supervisor="$CARGO_TARGET_DIR/$GNU_TARGET/release/openshell-supervisor"
           sandbox="$CARGO_TARGET_DIR/$MUSL_TARGET/release/openshell-sandbox"
-          "$supervisor" --version | grep -q '^openshell-supervisor '
-          "$sandbox" --version | grep -q '^openshell-sandbox '
-          file "$supervisor" | grep -q 'dynamically linked'
-          file "$sandbox" | grep -q 'statically linked'
+          supervisor_version=$("$supervisor" --version)
+          sandbox_version=$("$sandbox" --version)
+          supervisor_description=$(file -b "$supervisor")
+          sandbox_description=$(file -b "$sandbox")
+          printf '%s\n' "$supervisor_version" "$sandbox_version"
+          printf '%s: %s\n' "$supervisor" "$supervisor_description"
+          printf '%s: %s\n' "$sandbox" "$sandbox_description"
+          [[ "$supervisor_version" == openshell-supervisor\ * ]]
+          [[ "$sandbox_version" == openshell-sandbox\ * ]]
+          [[ "$supervisor_description" == *"dynamically linked"* ]]
+          [[ "$sandbox_description" == *"statically linked"* ]]
           install -Dm0555 "$supervisor" \
             "deploy/docker/.build/prebuilt-binaries/$ARCHITECTURE/openshell-supervisor"
           install -Dm0555 "$sandbox" \
