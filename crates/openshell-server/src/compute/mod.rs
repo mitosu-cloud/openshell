@@ -4412,11 +4412,14 @@ impl ComputeRuntime {
 
         let terminal_container_snapshot = driver_snapshot_confirms_stopped(&incoming)
             || driver_snapshot_reports_runtime_restart(&incoming);
+        let failed_snapshot = derive_phase(incoming.status.as_ref()) == SandboxPhase::Error
+            && !driver_snapshot_reports_runtime_restart(&incoming);
         if existing_phase != SandboxPhase::Starting
             && !(matches!(
                 existing_phase,
                 SandboxPhase::Ready | SandboxPhase::Provisioning
-            ) && terminal_container_snapshot)
+            ) && (terminal_container_snapshot || failed_snapshot))
+            && !(existing_phase == SandboxPhase::Stopping && failed_snapshot)
         {
             return self.apply_sandbox_update_locked(incoming, existing).await;
         }
@@ -4429,7 +4432,11 @@ impl ComputeRuntime {
         // and then reread both the driver and store before applying an
         // authoritative observation. Revalidate terminal container events
         // after promotion too: the replacement supervisor can reach Ready
-        // before an old exit event leaves the queue. Other stable-phase watch
+        // before an old exit event leaves the queue. Failed provisioning events
+        // can also remain queued across restart or explicit stop. Revalidate
+        // those after the lifecycle owner finishes instead of regressing its
+        // committed state while the driver operation is still in progress.
+        // Other stable-phase watch
         // events do not wait behind slow lifecycle operations.
         let existing_name = existing_sandbox.as_ref().map_or_else(
             || incoming.name.clone(),
@@ -10987,6 +10994,101 @@ mod tests {
         .await
         .expect("detached stop worker did not persist Stopped");
         assert_eq!(driver.stop_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_provisioning_failure_during_stop_is_revalidated() {
+        let driver = ControlledDriver::new();
+        driver.block_stop();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record(
+            "sb-stop-stale-error",
+            "stop-stale-error",
+            SandboxPhase::Ready,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let stop_runtime = runtime.clone();
+        let stop = tokio::spawn(async move {
+            stop_runtime
+                .stop_sandbox("default", "stop-stale-error")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.stop_started.notified())
+            .await
+            .unwrap();
+
+        let mut stale = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        stale.status = Some(make_driver_status(make_driver_condition(
+            "ProvisioningFailed",
+            "previous-generation boundary injection failed",
+        )));
+        let watch_runtime = runtime.clone();
+        let mut watch =
+            tokio::spawn(async move { watch_runtime.apply_sandbox_update(stale).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut watch)
+                .await
+                .is_err(),
+            "the failure watch must wait for the stop lifecycle owner"
+        );
+        let mut stopped = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        stopped.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "driver confirmed the explicit stop",
+        )));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(stopped)));
+        driver.release_stop();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), stop)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .phase(),
+            SandboxPhase::Stopped as i32
+        );
+        tokio::time::timeout(Duration::from_secs(1), watch)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
+        assert_ne!(
+            stored.status.unwrap().conditions[0].reason,
+            "ProvisioningFailed"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_provisioning_failure_is_still_applied() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-current-error", "current-error", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mut failed = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        failed.status = Some(make_driver_status(make_driver_condition(
+            "ProvisioningFailed",
+            "current driver generation failed",
+        )));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(failed.clone())));
+        runtime.apply_sandbox_update(failed).await.unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        assert_eq!(
+            stored.status.unwrap().conditions[0].reason,
+            "ProvisioningFailed"
+        );
     }
 
     #[tokio::test]
