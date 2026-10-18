@@ -68,6 +68,11 @@ pub struct VmComputeConfig {
     /// Working directory for VM driver sandbox state.
     pub state_dir: PathBuf,
 
+    /// Keep child runtime extraction, caches and temporary files beneath
+    /// `state_dir`, ignoring inherited runtime/supervisor overrides. Required
+    /// when the caller binds VM persistence to a kernel storage quota.
+    pub isolate_storage: bool,
+
     /// Directory to search for compute-driver binaries before the gateway
     /// falls back to its conventional install paths and sibling binary.
     pub driver_dir: Option<PathBuf>,
@@ -166,6 +171,11 @@ impl VmComputeConfig {
     /// state directories, spawning a process, or connecting a socket.
     pub fn validate_configuration(&self) -> Result<()> {
         self.resource_admission.validate().map_err(Error::config)?;
+        if self.isolate_storage && !self.state_dir.is_absolute() {
+            return Err(Error::config(
+                "isolated VM storage requires an absolute state_dir",
+            ));
+        }
         if self.grpc_endpoint.trim().is_empty() {
             return Err(Error::config(
                 "grpc_endpoint is required when using the vm compute driver",
@@ -238,6 +248,7 @@ impl Default for VmComputeConfig {
     fn default() -> Self {
         Self {
             state_dir: Self::default_state_dir(),
+            isolate_storage: false,
             allow_driver_config: false,
             resource_admission:
                 openshell_core::resource_admission::ResourceAdmissionConfig::default(),
@@ -543,6 +554,7 @@ pub async fn spawn(
     command.stdin(Stdio::null());
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
+    configure_private_storage(&mut command, vm_config)?;
     command.arg("--bind-socket").arg(&socket_path);
     command.arg("--admission-config-json").arg(
         serde_json::to_string(&openshell_core::resource_admission::DriverAdmissionConfig {
@@ -595,6 +607,38 @@ pub async fn spawn(
     Ok(AcquiredRemoteDriverEndpoint::managed(
         "vm", channel, process,
     ))
+}
+
+#[cfg(unix)]
+fn configure_private_storage(command: &mut Command, config: &VmComputeConfig) -> Result<()> {
+    if !config.isolate_storage {
+        return Ok(());
+    }
+    if !config.state_dir.is_absolute() {
+        return Err(Error::config(
+            "isolated VM storage requires an absolute state_dir",
+        ));
+    }
+    let uid = current_euid();
+    prepare_vm_state_dir(&config.state_dir, uid)?;
+    for (key, leaf) in [
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_STATE_HOME", "state"),
+        ("TMPDIR", "tmp"),
+        ("TMP", "tmp"),
+        ("TEMP", "tmp"),
+    ] {
+        let path = config.state_dir.join(leaf);
+        prepare_vm_state_dir(&path, uid)?;
+        command.env(key, path);
+    }
+    // These overrides bypass embedded artifact extraction. A quota-bound
+    // launch must use the signed driver bytes instead of inherited host paths.
+    command.env_remove("OPENSHELL_VM_RUNTIME_DIR");
+    command.env_remove("OPENSHELL_VM_SUPERVISOR_BIN");
+    Ok(())
 }
 
 fn validate_vm_sandbox_identity(config: &VmComputeConfig) -> Result<()> {
@@ -777,9 +821,9 @@ mod tests {
     use super::{
         VmComputeConfig, append_otlp_args, append_vm_identity_args,
         append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, compute_driver_guest_tls_paths,
-        compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
-        prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
-        validate_vm_sandbox_identity,
+        compute_driver_socket_path, configure_private_storage, current_euid,
+        prepare_compute_driver_socket_path, prepare_vm_state_dir, resolve_compute_driver_bin,
+        resolve_driver_search_dirs, validate_vm_sandbox_identity,
     };
     use openshell_core::UpstreamProxyConfig;
     use openshell_server::config_file::{
@@ -789,6 +833,76 @@ mod tests {
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn isolated_vm_child_writes_only_to_its_private_storage() {
+        let root = tempdir().unwrap();
+        let state = root.path().join("vm");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let config = VmComputeConfig {
+            state_dir: state.clone(),
+            isolate_storage: true,
+            ..Default::default()
+        };
+        let mut command = tokio::process::Command::new("/bin/sh");
+        for key in [
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+        ] {
+            command.env(key, &outside);
+        }
+        command.env("OPENSHELL_VM_RUNTIME_DIR", &outside);
+        command.env("OPENSHELL_VM_SUPERVISOR_BIN", outside.join("supervisor"));
+        configure_private_storage(&mut command, &config).unwrap();
+        command.args(["-c", "set -eu; test -z \"${OPENSHELL_VM_RUNTIME_DIR+x}\"; test -z \"${OPENSHELL_VM_SUPERVISOR_BIN+x}\"; for p in \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_STATE_HOME\" \"$TMPDIR\" \"$TMP\" \"$TEMP\"; do printf private > \"$p/probe\"; done"]);
+        assert!(command.as_std_mut().status().unwrap().success());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        for leaf in ["data", "cache", "config", "state", "tmp"] {
+            let path = state.join(leaf);
+            assert_eq!(std::fs::read(path.join("probe")).unwrap(), b"private");
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_vm_storage_rejects_symlinks_and_relative_roots() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        for leaf in ["data", "cache", "config", "state", "tmp"] {
+            let state = root.path().join(leaf);
+            std::fs::create_dir(&state).unwrap();
+            std::os::unix::fs::symlink(outside.path(), state.join(leaf)).unwrap();
+            let config = VmComputeConfig {
+                state_dir: state,
+                isolate_storage: true,
+                ..Default::default()
+            };
+            let mut command = tokio::process::Command::new("/bin/sh");
+            assert!(configure_private_storage(&mut command, &config).is_err());
+        }
+        let config = VmComputeConfig {
+            state_dir: PathBuf::from("relative-vm-state"),
+            isolate_storage: true,
+            ..Default::default()
+        };
+        assert!(
+            config
+                .validate_configuration()
+                .unwrap_err()
+                .to_string()
+                .contains("absolute state_dir")
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn vm_uses_nvidia_ubuntu_default_image() {
