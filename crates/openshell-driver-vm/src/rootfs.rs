@@ -1671,7 +1671,7 @@ mod tests {
     #[test]
     #[ignore = "owned subprocess of guest executable directory umask regression"]
     fn guest_executable_directory_umask_child() {
-        let mask = u32::from_str_radix(
+        let mask = libc::mode_t::from_str_radix(
             &std::env::var("OPENSHELL_TEST_GUEST_DIRECTORY_UMASK").expect("owned umask child"),
             8,
         )
