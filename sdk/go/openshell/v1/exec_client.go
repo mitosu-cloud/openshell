@@ -105,6 +105,20 @@ func (e *execClient) Interactive(ctx context.Context, workspace, sandboxName str
 	if sendErr := stream.Send(&pb.ExecSandboxInput{
 		Payload: &pb.ExecSandboxInput_Start{Start: startReq},
 	}); sendErr != nil {
+		// Send reports EOF when the server has already closed the stream.
+		// Receive its final status before cancellation can mask the RPC error.
+		if sendErr == io.EOF {
+			for {
+				_, recvErr := stream.Recv()
+				if recvErr != nil {
+					sendErr = recvErr
+					break
+				}
+			}
+			if sendErr == io.EOF {
+				sendErr = &StatusError{Code: ErrorInternal, Message: "stream ended before interactive start"}
+			}
+		}
 		cancel()
 		return nil, converter.FromGRPCError(sendErr)
 	}

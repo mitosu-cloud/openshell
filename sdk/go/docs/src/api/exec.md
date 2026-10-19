@@ -101,6 +101,8 @@ fmt.Println("Exited with:", exitCode)
 ```
 
 The SDK wraps the bidirectional stream as an `InteractiveSession` with `Read`/`Write`/`Resize` methods.
+If the server rejects the session during startup, `Interactive` or the first
+`Read` returns the typed RPC error, including permission or authentication failures.
 
 ## ExecStream
 

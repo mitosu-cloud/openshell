@@ -6,6 +6,15 @@ Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) fo
 
 The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest sandbox, and the custom kernel runtime. Each sandbox boots from a cached immutable bootstrap ext4 root disk plus a per-sandbox writable overlay disk. Image conversion preserves the verified OCI numeric UID/GID records independently of the extracting host user; injected runtime files remain root-owned. Ownership changes invalidate the prepared-image cache. A preserved overlay is journal-checked on a sparse copy before restart; only a successful check replaces the original disk. An unrecoverable overlay stays intact for manual recovery. When the requested sandbox image differs from the bootstrap image, the driver prepares a read-only image ext4 disk inside a bootstrap VM and mounts that unpacked rootfs as the sandbox lowerdir.
 
+Injected guest executable ancestors (`/opt`, `/opt/openshell`,
+`/opt/openshell/bin`, and `/srv`) use mode `0755` independently of the host
+caller's umask. Preparation opens directory handles without following symlinks;
+an image that replaces one of those directories with a symlink is refused.
+Private host staging, control records and guest secrets keep their existing
+permissions. Updated bootstrap/prepared cache identities build fresh images;
+older derived images are neither adopted nor repaired in place. The
+unprivileged Landlock startup probe remains required under restrictive masks.
+
 ## How it fits together
 
 Caller driver config is disabled by default, including upload workflows
