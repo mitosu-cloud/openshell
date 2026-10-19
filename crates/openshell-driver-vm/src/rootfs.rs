@@ -877,6 +877,11 @@ fn prepare_sandbox_rootfs(
     sandbox_uid: Option<u32>,
     sandbox_gid: Option<u32>,
 ) -> Result<(), String> {
+    // These root-owned guest paths must be traversable after the sandbox drops
+    // privileges, regardless of the extracting host's umask. Keep the private
+    // staging root and every other image path at their original permissions.
+    ensure_guest_executable_directory(rootfs, "opt/openshell/bin")?;
+    ensure_guest_executable_directory(rootfs, "srv")?;
     for relative in ["opt/openshell/.initialized", "opt/openshell/.rootfs-type"] {
         remove_rootfs_path(rootfs, relative)?;
     }
@@ -913,6 +918,30 @@ fn prepare_sandbox_rootfs(
     create_sandbox_mountpoint(&rootfs.join("overlay"))?;
     create_sandbox_mountpoint(&rootfs.join("newroot"))?;
 
+    Ok(())
+}
+
+fn ensure_guest_executable_directory(rootfs: &Path, relative: &str) -> Result<(), String> {
+    use rustix::fs::{Mode, OFlags};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory = rustix::fs::open(rootfs, flags, Mode::empty())
+        .map_err(|error| format!("open guest root {}: {error}", rootfs.display()))?;
+    for component in Path::new(relative).components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(format!("invalid guest executable directory: {relative}"));
+        };
+        match rustix::fs::mkdirat(&directory, name, Mode::from_raw_mode(0o755)) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(format!("create guest directory {relative}: {error}")),
+        }
+        // Resolve and chmod the opened directory, never an image-controlled
+        // symlink. Preparation runs in an exclusively owned staging tree.
+        directory = rustix::fs::openat(&directory, name, flags, Mode::empty())
+            .map_err(|error| format!("open guest executable directory {relative}: {error}"))?;
+        rustix::fs::fchmod(&directory, Mode::from_raw_mode(0o755))
+            .map_err(|error| format!("chmod guest executable directory {relative}: {error}"))?;
+    }
     Ok(())
 }
 
@@ -1738,6 +1767,138 @@ mod tests {
                 .to_string_lossy()
                 .contains(".tmp-")
         }));
+    }
+
+    #[test]
+    fn guest_executable_directories_ignore_caller_umask() {
+        for mask in ["0022", "0077"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rootfs::tests::guest_executable_directory_umask_child",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("OPENSHELL_TEST_GUEST_DIRECTORY_UMASK", mask)
+                .output()
+                .expect("run isolated umask test");
+            assert!(
+                output.status.success(),
+                "umask {mask}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        }
+    }
+
+    #[test]
+    #[ignore = "owned subprocess of guest executable directory umask regression"]
+    fn guest_executable_directory_umask_child() {
+        let mask = u32::from_str_radix(
+            &std::env::var("OPENSHELL_TEST_GUEST_DIRECTORY_UMASK").expect("owned umask child"),
+            8,
+        )
+        .unwrap();
+        // This process runs exactly one test. Never mutate the parent test
+        // runner's global umask while unrelated tests may be creating files.
+        nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(mask));
+        let private = tempfile::tempdir().unwrap();
+        fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let rootfs = private.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        fs::set_permissions(&rootfs, fs::Permissions::from_mode(0o700)).unwrap();
+        let private_control = private.path().join("control");
+        fs::write(&private_control, b"private host control").unwrap();
+        fs::set_permissions(&private_control, fs::Permissions::from_mode(0o600)).unwrap();
+
+        // New directories must be normalized even though mkdir honors umask.
+        ensure_guest_executable_directory(&rootfs, "opt/openshell/bin").unwrap();
+        // Full preparation must also normalize pre-existing restrictive paths.
+        for relative in ["opt", "opt/openshell", "opt/openshell/bin"] {
+            fs::set_permissions(rootfs.join(relative), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let guest_private = rootfs.join("opt/openshell/private");
+        fs::create_dir(&guest_private).unwrap();
+        fs::set_permissions(&guest_private, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(guest_private.join("secret"), b"private guest bytes").unwrap();
+        fs::set_permissions(
+            guest_private.join("secret"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        write_fake_runtime_binaries(&rootfs);
+        prepare_sandbox_rootfs(&rootfs, Some(1000), Some(1000)).unwrap();
+        for relative in ["opt", "opt/openshell", "opt/openshell/bin", "srv"] {
+            assert_eq!(
+                fs::metadata(rootfs.join(relative))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o755,
+                "{relative} under {mask:04o}"
+            );
+        }
+        for (path, expected) in [
+            (private.path().to_path_buf(), 0o700),
+            (rootfs.clone(), 0o700),
+            (private_control, 0o600),
+            (guest_private.clone(), 0o700),
+            (guest_private.join("secret"), 0o600),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                expected
+            );
+        }
+        // Execute through the normalized ancestors as the ordinary test owner.
+        // Native VM qualification separately verifies root-owned guest paths
+        // after the real supervisor drops to the sandbox's unprivileged UID.
+        let executable = rootfs.join("opt/openshell/bin/umask-exec-probe");
+        fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(Command::new(&executable).status().unwrap().success());
+        assert_eq!(
+            nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(mask)).bits(),
+            mask
+        );
+    }
+
+    #[test]
+    fn guest_executable_directories_refuse_image_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for relative in ["opt", "opt/openshell", "opt/openshell/bin", "srv"] {
+            let private = tempfile::tempdir().unwrap();
+            let rootfs = private.path().join("rootfs");
+            let outside = private.path().join("outside");
+            fs::create_dir(&rootfs).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(outside.join("sentinel"), b"unchanged outside image").unwrap();
+            let destination = rootfs.join(relative);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            symlink(&outside, &destination).unwrap();
+            assert!(prepare_sandbox_rootfs(&rootfs, Some(1000), Some(1000)).is_err());
+            assert_eq!(
+                fs::metadata(&outside).unwrap().permissions().mode() & 0o7777,
+                0o700
+            );
+            assert_eq!(
+                fs::read(outside.join("sentinel")).unwrap(),
+                b"unchanged outside image"
+            );
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        }
+        let private = tempfile::tempdir().unwrap();
+        let root = private.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let link = private.path().join("root-link");
+        symlink(&root, &link).unwrap();
+        assert!(ensure_guest_executable_directory(&link, "opt/openshell/bin").is_err());
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
     }
 
     #[test]
