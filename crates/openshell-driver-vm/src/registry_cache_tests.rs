@@ -218,13 +218,13 @@ async fn rejects_unbound_manifest(bootstrap: bool) {
     // An upgrade must not silently reuse an entry populated by older code.
     let legacy_identity = if bootstrap {
         format!(
-            "sandbox-bootstrap-rootfs-ext4-v5:openshell-{}:guest-{}:{trusted_digest}",
+            "sandbox-bootstrap-rootfs-ext4-v6:openshell-{}:guest-{}:{trusted_digest}",
             openshell_core::VERSION,
             sandbox_guest_runtime_identity(),
         )
     } else {
         format!(
-            "sandbox-prepared-rootfs-ext4-umoci-v3:openshell-{}:image-account:{trusted_digest}",
+            "sandbox-prepared-rootfs-ext4-umoci-v4:openshell-{}:image-account:{trusted_digest}",
             openshell_core::VERSION,
         )
     };

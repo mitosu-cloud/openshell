@@ -247,9 +247,11 @@ const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
-// Older registry cache entries were not bound to the downloaded manifest.
-const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v6";
-const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v4";
+// Older registry cache entries were not bound to the downloaded manifest, and
+// older derived images had host-umask-dependent guest executable ancestors.
+// Never adopt or repair either cache layout in place.
+const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v7";
+const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v5";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
 const IMAGE_PREP_INIT_MODE: &str = "image-prep";
@@ -12027,7 +12029,7 @@ mod tests {
         assert_eq!(
             image_account,
             format!(
-                "sandbox-prepared-rootfs-ext4-umoci-v4:openshell-{}:image-account:{image_hash}",
+                "sandbox-prepared-rootfs-ext4-umoci-v5:openshell-{}:image-account:{image_hash}",
                 openshell_core::VERSION
             )
         );
@@ -12069,7 +12071,7 @@ mod tests {
     fn bootstrap_image_cache_identity_includes_rootfs_layout_version_and_guest_runtime() {
         let identity = bootstrap_image_cache_identity("sha256:bootstrap-image");
         assert!(identity.starts_with(&format!(
-            "sandbox-bootstrap-rootfs-ext4-v6:openshell-{}:guest-",
+            "sandbox-bootstrap-rootfs-ext4-v7:openshell-{}:guest-",
             openshell_core::VERSION
         )));
         assert!(identity.ends_with(&compute_bytes_sha256_hex(b"sha256:bootstrap-image")));
