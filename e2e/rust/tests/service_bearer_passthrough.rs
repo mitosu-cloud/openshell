@@ -20,7 +20,7 @@ use hyper::client::conn::http1;
 use hyper::{Request, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard};
+use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard, unique_sandbox_name};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use serde_json::Value;
@@ -279,7 +279,7 @@ async fn wait_for_authorization(url: &str, expected: &str) -> Result<(), String>
 
 #[tokio::test]
 async fn service_bearer_passthrough_preserves_authorization_header() {
-    let sandbox_name = format!("service-auth-{}", std::process::id());
+    let sandbox_name = unique_sandbox_name();
     let create = run_cli(&[
         "sandbox",
         "create",

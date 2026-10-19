@@ -548,14 +548,68 @@ func TestExecInteractive_ServerError(t *testing.T) {
 	client, cleanup := setupExecTest(t, mock)
 	defer cleanup()
 
-	session, err := client.Interactive(context.Background(), "default", "test-sandbox", []string{"/bin/sh"}, 80, 24)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	session, err := client.Interactive(ctx, "default", "test-sandbox", []string{"/bin/sh"}, 80, 24)
 	if err != nil {
-		assert.True(t, IsPermissionDenied(err), "expected permission denied, got: %v", err)
+		require.True(t, IsPermissionDenied(err), "expected permission denied, got: %v", err)
 		return
 	}
+	defer func() { _ = session.Close() }()
 	buf := make([]byte, 1024)
 	_, err = session.Read(buf)
-	require.Error(t, err)
+	require.True(t, IsPermissionDenied(err), "expected permission denied, got: %v", err)
+}
+
+// Force the Send EOF path independently of server/client scheduling.
+type closedExecConn struct {
+	grpc.ClientConnInterface
+	stream *closedExecStream
+}
+
+func (c *closedExecConn) NewStream(ctx context.Context, _ *grpc.StreamDesc, _ string, _ ...grpc.CallOption) (grpc.ClientStream, error) {
+	c.stream.ctx = ctx
+	return c.stream, nil
+}
+
+type closedExecStream struct {
+	grpc.ClientStream
+	ctx     context.Context
+	recvErr error
+}
+
+func (s *closedExecStream) SendMsg(any) error { return io.EOF }
+
+func (s *closedExecStream) RecvMsg(any) error {
+	if err := s.ctx.Err(); err != nil {
+		return status.FromContextError(err).Err()
+	}
+	return s.recvErr
+}
+
+func TestExecInteractive_StartSendEOF(t *testing.T) {
+	for _, code := range []codes.Code{codes.PermissionDenied, codes.Unauthenticated, codes.Unavailable, codes.Canceled, codes.OK} {
+		t.Run(code.String(), func(t *testing.T) {
+			recvErr := status.Error(code, "server rejected start")
+			if code == codes.OK {
+				recvErr = io.EOF
+			}
+			stream := &closedExecStream{recvErr: recvErr}
+			client := newExecClient(&closedExecConn{stream: stream}, &stubSandboxResolver{})
+			session, err := client.Interactive(context.Background(), "default", "test-sandbox", []string{"sh"}, 80, 24)
+			require.Nil(t, session)
+			var sdkErr *StatusError
+			require.ErrorAs(t, err, &sdkErr)
+			if code == codes.OK {
+				require.Equal(t, ErrorInternal, sdkErr.Code)
+				require.ErrorContains(t, err, "before interactive start")
+			} else {
+				require.Equal(t, code, status.Code(sdkErr.Cause))
+				require.Equal(t, "server rejected start", sdkErr.Message)
+			}
+			require.ErrorIs(t, stream.ctx.Err(), context.Canceled)
+		})
+	}
 }
 
 func TestExecInteractive_ExitCode(t *testing.T) {
