@@ -7,7 +7,7 @@
 //! is dropped, replacing the `trap cleanup EXIT` pattern from the bash tests.
 
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,7 +45,7 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
 /// workspace initialization, and sandbox startup.
 const SANDBOX_READY_TIMEOUT: Duration = Duration::from_mins(10);
 
-static NEXT_SANDBOX_NAME: AtomicU64 = AtomicU64::new(1);
+static NEXT_SANDBOX_NAME: AtomicU32 = AtomicU32::new(1);
 
 fn has_explicit_sandbox_name(args: &[&str]) -> bool {
     args.iter()
@@ -67,13 +67,19 @@ fn add_test_image_if_missing(command: &mut tokio::process::Command, args: &[&str
     }
 }
 
-/// Generate a sandbox name that is unique within and across test processes.
+fn sandbox_name_for(process_id: u32, sequence: u32) -> String {
+    format!("e2e{process_id:08x}{sequence:08x}")
+}
+
+/// Generate a name within the 19-character limit, unique within a test process
+/// and across concurrently running test processes even at the maximum PID.
 pub fn unique_sandbox_name() -> String {
-    format!(
-        "e2e-{}-{}",
-        std::process::id(),
-        NEXT_SANDBOX_NAME.fetch_add(1, Ordering::Relaxed)
-    )
+    let sequence = NEXT_SANDBOX_NAME
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .expect("test process exhausted its sandbox name sequence");
+    sandbox_name_for(std::process::id(), sequence)
 }
 
 fn add_unique_name_if_missing(command: &mut tokio::process::Command, args: &[&str]) {
@@ -720,7 +726,23 @@ impl Drop for SandboxGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_explicit_sandbox_name, has_explicit_sandbox_workload};
+    use super::{has_explicit_sandbox_name, has_explicit_sandbox_workload, sandbox_name_for};
+
+    #[test]
+    fn sandbox_names_fit_limit_at_maximum_pid_and_sequence() {
+        let mut names = std::collections::HashSet::new();
+        for process_id in [1, 1_066_034, u32::MAX] {
+            for sequence in [1, 0xff, 0x100, u32::MAX] {
+                let name = sandbox_name_for(process_id, sequence);
+                assert!(name.len() <= 19, "sandbox name is too long: {name}");
+                assert!(
+                    name.bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                );
+                assert!(names.insert(name), "sandbox names must not collide");
+            }
+        }
+    }
 
     #[test]
     fn detects_explicit_sandbox_names() {
