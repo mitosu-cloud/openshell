@@ -16,9 +16,10 @@
 //! regardless of runtime success.
 
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::sandbox::unique_sandbox_name;
 use tokio::process::Child;
 
 async fn kubectl(args: &[&str]) -> Result<String, String> {
@@ -75,14 +76,6 @@ async fn set_user_namespaces(enable: bool) -> Result<(), String> {
 
 async fn delete_sandbox(name: &str) {
     let _ = kubectl(&["delete", "sandbox", name, "-n", "openshell"]).await;
-}
-
-fn unique_sandbox_name() -> String {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("userns-e2e-{suffix}")
 }
 
 async fn stop_child(child: &mut Child) {
