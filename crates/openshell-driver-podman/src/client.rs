@@ -480,13 +480,25 @@ impl PodmanClient {
         content_type: &str,
         body: Bytes,
     ) -> Result<(hyper::StatusCode, Bytes), PodmanApiError> {
+        self.request_raw_with_timeout(method, path, content_type, body, API_TIMEOUT)
+            .await
+    }
+
+    async fn request_raw_with_timeout(
+        &self,
+        method: hyper::Method,
+        path: &str,
+        content_type: &str,
+        body: Bytes,
+        timeout: Duration,
+    ) -> Result<(hyper::StatusCode, Bytes), PodmanApiError> {
         let req = Self::build_request(
             method,
             &format!("/{API_VERSION}{path}"),
             Full::new(body),
             Some(content_type),
         );
-        self.send_request(req, API_TIMEOUT).await
+        self.send_request(req, timeout).await
     }
 
     /// POST a JSON body and ignore 409 Conflict (resource already exists).
@@ -512,6 +524,15 @@ impl PodmanClient {
         &self,
         spec: &(impl serde::Serialize + Sync),
     ) -> Result<String, PodmanApiError> {
+        self.create_typed_container_with_timeout(spec, API_TIMEOUT)
+            .await
+    }
+
+    pub(crate) async fn create_typed_container_with_timeout(
+        &self,
+        spec: &(impl serde::Serialize + Sync),
+        timeout: Duration,
+    ) -> Result<String, PodmanApiError> {
         #[derive(serde::Deserialize)]
         struct Created {
             #[serde(rename = "Id", alias = "ID")]
@@ -520,11 +541,12 @@ impl PodmanClient {
         let body =
             serde_json::to_vec(spec).map_err(|error| PodmanApiError::Json(error.to_string()))?;
         let (status, bytes) = self
-            .request_raw(
+            .request_raw_with_timeout(
                 hyper::Method::POST,
                 "/libpod/containers/create",
                 "application/json",
                 body.into(),
+                timeout,
             )
             .await?;
         if !status.is_success() {
