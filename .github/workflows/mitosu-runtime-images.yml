@@ -70,10 +70,10 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           git fetch --no-tags origin \
             +refs/heads/main:refs/remotes/origin/main \
-            +refs/heads/dual-mode-p2:refs/remotes/origin/dual-mode-p2
+            +refs/heads/mitosu-main:refs/remotes/origin/mitosu-main
           if ! git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main \
-              && ! git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/dual-mode-p2; then
-            echo "source revision is not on main or dual-mode-p2" >&2
+              && ! git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/mitosu-main; then
+            echo "source revision is not on main or mitosu-main" >&2
             exit 1
           fi
 
