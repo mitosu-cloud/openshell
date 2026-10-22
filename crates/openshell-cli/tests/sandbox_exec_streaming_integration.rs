@@ -224,6 +224,7 @@ mock_gateway! {
         get_gateway_info(proto::GetGatewayInfoRequest) -> proto::GetGatewayInfoResponse;
         create_sandbox(proto::CreateSandboxRequest) -> proto::SandboxResponse;
         begin_rootfs_tar_staging(proto::BeginRootfsTarStagingRequest) -> proto::BeginRootfsTarStagingResponse;
+        provision_sandbox_file(proto::ProvisionSandboxFileRequest) -> proto::ProvisionSandboxFileResponse;
         list_sandboxes(proto::ListSandboxesRequest) -> proto::ListSandboxesResponse;
         create_sandbox_template(proto::CreateSandboxTemplateRequest) -> proto::SandboxTemplateResponse;
         get_sandbox_template(proto::GetSandboxTemplateRequest) -> proto::SandboxTemplateResponse;
