@@ -2363,6 +2363,19 @@ impl VmDriver {
                 continue;
             }
 
+            // Active persisted sandboxes are published for the gateway's
+            // authenticated startup sweep, but an untrusted saved launch
+            // bundle must not create an observable registry record first.
+            if let Err(error) = decode_launch_authentication(
+                sandbox
+                    .spec
+                    .as_ref()
+                    .map_or(&[], |spec| spec.launch_authentication.as_slice()),
+            ) {
+                warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM recovery denied by launch authentication");
+                continue;
+            }
+
             // The gateway owns the per-launch authentication bundle and will
             // issue StartSandbox during its startup sweep. Register the
             // durable record, but never begin restoring compute here. If the
