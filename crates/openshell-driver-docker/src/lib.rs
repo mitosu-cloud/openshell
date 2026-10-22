@@ -2088,6 +2088,7 @@ impl DockerComputeDriver {
         for name in [
             docker_channel_volume_name_by_id(sandbox_id, &self.config),
             docker_supervisor_volume_name_by_id(sandbox_id, &self.config),
+            docker_control_volume_name_by_id(sandbox_id, &self.config),
         ] {
             for attempt in 0..3 {
                 match self
@@ -5486,9 +5487,9 @@ async fn poll_docker_supervisor_ready(
                 Status::internal(format!("inspect Docker sandbox container: {error}"))
             })?;
         if sandbox.state.unwrap_or_default().running == Some(false) {
-            return Err(Status::unavailable(
-                "Docker sandbox exited before supervisor became ready",
-            ));
+            let log_tail = docker_container_log_tail(docker, workload_container_id).await;
+            warn!(sandbox_id, sandbox_logs = %log_tail, "Docker sandbox exited before supervisor became ready");
+            return Err(workload_exit_before_supervisor_ready_status(&log_tail));
         }
         let inspected = docker
             .inspect_container(supervisor_id, None)
@@ -5518,6 +5519,13 @@ async fn poll_docker_supervisor_ready(
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
+}
+
+fn workload_exit_before_supervisor_ready_status(log_tail: &str) -> Status {
+    Status::unavailable(format!(
+        "Docker sandbox exited before supervisor became ready{}",
+        format_log_tail(log_tail)
+    ))
 }
 
 /// Bollard reports nonzero Docker wait statuses as errors, not successful
