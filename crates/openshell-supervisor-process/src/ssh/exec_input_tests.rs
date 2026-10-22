@@ -197,7 +197,28 @@ async fn exec_start_failure_keeps_ssh_session_usable() {
 
         let mut rejected = client.channel_open_session().await.unwrap();
         rejected.exec(true, "first").await.unwrap();
-        assert!(matches!(rejected.wait().await, Some(ChannelMsg::Failure)));
+        let mut request_succeeded = false;
+        let mut stderr = Vec::new();
+        let mut exit_status = None;
+        let mut close_seen = false;
+        while let Some(message) = rejected.wait().await {
+            match message {
+                ChannelMsg::Success => request_succeeded = true,
+                ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
+                ChannelMsg::ExitStatus {
+                    exit_status: status,
+                } => exit_status = Some(status),
+                ChannelMsg::Close => {
+                    close_seen = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(request_succeeded);
+        assert_eq!(stderr, b"openshell: command could not be started\n");
+        assert_eq!(exit_status, Some(126));
+        assert!(close_seen);
 
         let mut channel = start_exec(&client).await;
         control.stdout.shutdown().await.unwrap();
