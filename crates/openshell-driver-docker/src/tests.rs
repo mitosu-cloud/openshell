@@ -758,6 +758,14 @@ async fn volume_cleanup_rescans_late_stager_only_for_the_exact_sandbox() {
         .map(|(_, path)| path.split('?').next().unwrap().rsplit('/').next().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(deletions, ["owned-supervisor", "late-stage"]);
+    for volume in [
+        docker_channel_volume_name_by_id("owned", &runtime_config()),
+        docker_control_volume_name_by_id("owned", &runtime_config()),
+    ] {
+        assert!(requests.iter().any(|(method, path)| {
+            method == "DELETE" && path.split('?').next().unwrap().ends_with(&volume)
+        }));
+    }
     let supervisor_volume = docker_supervisor_volume_name_by_id("owned", &runtime_config());
     assert_eq!(
         requests
@@ -4649,6 +4657,16 @@ fn supervisor_workspace_validation_exit_is_reported_explicitly() {
         })))
         .0,
         "ControlSupervisorExited"
+    );
+}
+
+#[test]
+fn workload_startup_failure_preserves_log_tail() {
+    let status = workload_exit_before_supervisor_ready_status("sandbox runtime: permission denied");
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert_eq!(
+        status.message(),
+        "Docker sandbox exited before supervisor became ready; log tail: sandbox runtime: permission denied"
     );
 }
 
