@@ -33,6 +33,9 @@ use tracing::{Instrument as _, debug, info, warn};
 const STOP_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_COMPLETION_TIMEOUT_HEADROOM: Duration = Duration::from_secs(5);
 const SANDBOX_BINARY_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(120);
+// Cold rootless stores may need to create an ID-mapped copy of the image before
+// Podman can return from container creation.
+const CONTAINER_CREATE_TIMEOUT: Duration = Duration::from_secs(120);
 const POLICY_DNS_RESOLV_CONF: &[u8] = b"nameserver 127.0.0.53\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1249,7 +1252,13 @@ impl PodmanComputeDriver {
                     self.client
                         .create_owned_volume(&control_volume, &sandbox.id, &sandbox.workspace, None)
                         .await?;
-                    let workload_id = self.client.create_typed_container(&specs.workload).await?;
+                    let workload_id = self
+                        .client
+                        .create_typed_container_with_timeout(
+                            &specs.workload,
+                            CONTAINER_CREATE_TIMEOUT,
+                        )
+                        .await?;
                     created_workload = Some(workload_id.clone());
                     self.client.verify_isolation_fence(&workload_id).await?;
                     self.admit_container_resources(&workload_id).await?;
@@ -1309,7 +1318,10 @@ impl PodmanComputeDriver {
                         .await?;
                     let supervisor_id = self
                         .client
-                        .create_typed_container(&specs.supervisor)
+                        .create_typed_container_with_timeout(
+                            &specs.supervisor,
+                            CONTAINER_CREATE_TIMEOUT,
+                        )
                         .await?;
                     created_supervisor = Some(supervisor_id.clone());
                     self.client
@@ -4022,6 +4034,47 @@ mod tests {
             StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
             StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor start
         ]
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn create_sandbox_allows_slow_cold_container_creation() {
+        let sandbox_id = "sandbox-cold-create";
+        let mut launch_responses = create_launch_responses();
+        launch_responses[0] = created_response("workload").with_delay(Duration::from_secs(31));
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "slow-cold-container-create",
+            create_setup_responses(false, sandbox_id)
+                .into_iter()
+                .chain(launch_responses)
+                .collect(),
+        );
+        let mut sandbox = plain_sandbox(sandbox_id, "demo");
+        sandbox.spec = Some(DriverSandboxSpec {
+            launch_authentication: encoded_launch_authentication(),
+            ..DriverSandboxSpec::default()
+        });
+        let driver = test_driver(socket_path.clone());
+        let creation = tokio::spawn(async move { driver.create_sandbox(&sandbox).await });
+
+        while request_log
+            .lock()
+            .expect("request log")
+            .iter()
+            .filter(|request| request.contains("/libpod/containers/create"))
+            .count()
+            < 3
+        {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        creation
+            .await
+            .expect("creation task")
+            .expect("cold container creation should use its extended timeout");
+        handle.await.expect("stub task");
+        let _ = fs::remove_file(socket_path);
     }
 
     fn channel_archive_members() -> &'static [&'static str] {
