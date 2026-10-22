@@ -4423,7 +4423,8 @@ mod linux {
                 .expect("exit frame");
             assert_eq!(exit.0, STREAM_EXIT);
             assert_eq!(
-                serde_json::from_slice::<ExitStatusWire>(&exit.1).expect("decode exit status"),
+                openshell_sandbox_backend::protobuf::decode::<ExitStatusWire>(&exit.1)
+                    .expect("decode exit status"),
                 ExitStatusWire::Exited(0)
             );
             bridge
