@@ -674,6 +674,20 @@ impl PodmanClient {
         name: &str,
         path: &str,
     ) -> Result<Bytes, PodmanApiError> {
+        self.copy_from_container_with_timeout(name, path, API_TIMEOUT)
+            .await
+    }
+
+    /// Download a container path with a caller-selected bounded timeout.
+    ///
+    /// Large image-backed archives can require more time than ordinary API
+    /// metadata calls while Podman prepares and streams the response.
+    pub(crate) async fn copy_from_container_with_timeout(
+        &self,
+        name: &str,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<Bytes, PodmanApiError> {
         validate_name(name)?;
         let encoded_path = url_encode(path);
         let (status, bytes) = self
@@ -681,7 +695,7 @@ impl PodmanClient {
                 hyper::Method::GET,
                 &format!("/libpod/containers/{name}/archive?path={encoded_path}"),
                 None,
-                API_TIMEOUT,
+                timeout,
             )
             .await?;
         if status.is_success() {

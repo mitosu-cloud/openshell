@@ -32,6 +32,7 @@ use tracing::{Instrument as _, debug, info, warn};
 
 const STOP_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_COMPLETION_TIMEOUT_HEADROOM: Duration = Duration::from_secs(5);
+const SANDBOX_BINARY_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(120);
 const POLICY_DNS_RESOLV_CONF: &[u8] = b"nameserver 127.0.0.53\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2106,7 +2107,11 @@ async fn extract_binary_from_container(
     cache_path: &Path,
 ) -> Result<PathBuf, ComputeDriverError> {
     let tar_bytes = client
-        .copy_from_container(container_name, SANDBOX_RUNTIME_IMAGE_BINARY_PATH)
+        .copy_from_container_with_timeout(
+            container_name,
+            SANDBOX_RUNTIME_IMAGE_BINARY_PATH,
+            SANDBOX_BINARY_EXTRACTION_TIMEOUT,
+        )
         .await
         .map_err(ComputeDriverError::from)?;
 
@@ -3893,6 +3898,42 @@ mod tests {
             builder.finish().unwrap();
         }
         StubResponse::new(StatusCode::OK, archive)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sandbox_binary_extraction_allows_slow_archive_download() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "slow-sandbox-binary-extraction",
+            vec![sandbox_binary_archive_response().with_delay(Duration::from_secs(31))],
+        );
+        let cache_dir = tempfile::tempdir().expect("cache directory");
+        let cache_path = cache_dir.path().join("openshell-sandbox");
+        let client = PodmanClient::new(socket_path.clone());
+        let expected_path = cache_path.clone();
+        let extraction = tokio::spawn(async move {
+            extract_binary_from_container(&client, "extractor", &cache_path).await
+        });
+
+        while request_log.lock().expect("request log").is_empty() {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        assert_eq!(
+            extraction
+                .await
+                .expect("extraction task")
+                .expect("slow extraction should use its extended timeout"),
+            expected_path
+        );
+        assert!(fs::read(&expected_path).unwrap().starts_with(b"\x7fELF"));
+        handle.await.expect("stub task");
+        assert_eq!(
+            request_log.lock().expect("request log").as_slice(),
+            ["GET /v5.0.0/libpod/containers/extractor/archive?path=%2Fopenshell-sandbox"]
+        );
+        let _ = fs::remove_file(socket_path);
     }
 
     fn create_setup_responses(proxy_secret: bool, sandbox_id: &str) -> Vec<StubResponse> {
